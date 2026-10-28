@@ -35,7 +35,8 @@ use serde_json::{json, Map, Value};
 
 use crate::cmdline::bale_call;
 use crate::install::{
-    backup_key, backup_path, json_uninstall_steps, read_config, reformat_text, Plan, Step,
+    backup_key, backup_path, json_uninstall_steps, read_config, reformat_text, repoint_note, Plan,
+    Step,
 };
 use crate::{display_path, remove_tree, Tool};
 
@@ -468,10 +469,11 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 continue;
             }
             ours = true;
-            if bale_hook_path(cmd, kind).is_some() {
+            if let Some(old) = bale_hook_path(cmd, kind) {
                 if cmd != want {
                     // bale's own entry from another binary path or the old
                     // name: point it here.
+                    notes.push(repoint_note(&path, &format!("{event} hook"), &old, exe));
                     h["command"] = Value::String(want.clone());
                     changed = true;
                 }

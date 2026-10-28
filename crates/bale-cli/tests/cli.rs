@@ -2165,11 +2165,21 @@ fn install_cursor_repoints_and_guards_bales_entry() {
             format!("if [ -x {q} ]; then {q} hook cursor setup; fi"),
         )
     };
-    for old in [bare.clone(), "'/old/bale' hook cursor setup".to_string()] {
+    for (old, note) in [
+        (
+            bare.clone(),
+            format!("rewrote bale's setup-worktree entry for bale at {exe}"),
+        ),
+        (
+            "'/old/bale' hook cursor setup".to_string(),
+            format!("bale's setup-worktree entry now runs bale at {exe} instead of /old/bale"),
+        ),
+    ] {
         let text = serde_json::json!({"setup-worktree": ["npm i", old]}).to_string();
         fs::write(&path, &text).unwrap();
         let out = install(&env, "cursor", true);
         assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+        assert!(stdout(&out).contains(&note), "{}", stdout(&out));
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             v["setup-worktree"],
@@ -2358,6 +2368,13 @@ fn install_conductor_repoints_bales_own_chained_command() {
     .unwrap();
     let out = install(&env, "conductor", true);
     assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    for kind in ["setup", "archive"] {
+        let note = format!(
+            "scripts.{kind} now runs bale at {} instead of /old/bale",
+            env!("CARGO_BIN_EXE_bale")
+        );
+        assert!(stdout(&out).contains(&note), "{}", stdout(&out));
+    }
     let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
@@ -3068,6 +3085,13 @@ fn claude_repoint_prints_the_reformat_note() {
         text.contains("note: settings.json is reformatted (2-space JSON)"),
         "{text}"
     );
+    for event in ["WorktreeCreate", "WorktreeRemove"] {
+        let note = format!(
+            "{event} hook now runs bale at {} instead of /old/bale",
+            env!("CARGO_BIN_EXE_bale")
+        );
+        assert!(text.contains(&note), "{text}");
+    }
     assert!(backups(&env).is_empty());
 }
 

@@ -264,6 +264,25 @@ fn retired_backup_path(backup: &Path) -> PathBuf {
     backup.with_file_name(name)
 }
 
+/// The note for an entry install rewrote to run this exe: `what` in `file`
+/// now runs `new` instead of `old`. A file teammates share flips to the last
+/// installer's path, so the note says who loses it.
+pub(crate) fn repoint_note(file: &Path, what: &str, old: &str, new: &Path) -> Step {
+    let new = display_path(new);
+    Step::Note(if old == new {
+        format!(
+            "note: {}: rewrote {what} for bale at {new}",
+            display_path(file)
+        )
+    } else {
+        format!(
+            "note: {}: {what} now runs bale at {new} instead of {old}; where bale is only \
+             at {old}, the entry is skipped",
+            display_path(file)
+        )
+    })
+}
+
 /// Where a config's original is kept: in `backups` (bale's
 /// `$BALE_HOME/backups`), named for the sha256 of `key` (from
 /// [`backup_key`], or else made absolute), so two repos' files of the same

@@ -20,9 +20,9 @@ use bale_core::BaleHome;
 use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
-use crate::cmdline::{bale_call, own_call, sh_guarded, BaleCall};
+use crate::cmdline::{bale_call, own_call, own_exe, sh_guarded, BaleCall};
 use crate::install::{
-    backup_key, backup_path, read_config, tracked_by_git, tracked_note, Plan, Step,
+    backup_key, backup_path, read_config, repoint_note, tracked_by_git, tracked_note, Plan, Step,
 };
 use crate::{display_path, remove_tree, Tool};
 
@@ -151,6 +151,9 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 }
                 if let Some((user, bale)) = unchain(kind, current) {
                     any_bale = true;
+                    let args = ["hook", "conductor", kind];
+                    let old = own_exe(bale, &args).expect("bale's own script has an exe");
+                    notes.push(repoint_note(&path, &format!("scripts.{kind}"), &old, exe));
                     // bale's own command from another exe path: point it
                     // here, the user's script byte for byte as it was.
                     let repointed = match user {

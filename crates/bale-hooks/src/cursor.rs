@@ -24,7 +24,8 @@ use serde_json::{Map, Value};
 use crate::claude::sh_quote;
 use crate::cmdline::{cmd_guarded, sh_guarded, BaleCall};
 use crate::install::{
-    backup_key, backup_path, json_uninstall_steps, read_config, windows_quote, Plan, Step,
+    backup_key, backup_path, json_uninstall_steps, read_config, repoint_note, windows_quote, Plan,
+    Step,
 };
 use crate::{as_hook, display_path, Tool};
 
@@ -144,7 +145,7 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
             .find(|c| own_call(c).is_some())
             .map(|c| (k, c.to_string()))
     });
-    let mut repoint = false;
+    let mut repointed = None;
     match existing {
         Some((k, c)) if k == key && c == want => {
             return Ok(Plan::new(vec![Step::Note(format!(
@@ -164,7 +165,10 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
                     *cmd = Value::String(want.clone());
                 }
             }
-            repoint = true;
+            repointed = Some((
+                key,
+                crate::cmdline::own_exe(&c, &HOOK_ARGS).expect("bale's own entry has an exe"),
+            ));
         }
         Some((k, c)) => {
             // bale from another path, wrapped by the user, or under a key
@@ -178,7 +182,7 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
         }
         None => {}
     }
-    if !repoint {
+    if repointed.is_none() {
         let commands = obj
             .entry(key)
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -198,7 +202,7 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
         .parent()
         .expect("worktrees path has a parent")
         .to_path_buf();
-    Ok(Plan::new(vec![
+    let mut steps = vec![
         Step::Mkdir(dir),
         Step::Settings {
             path: path.clone(),
@@ -206,20 +210,29 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
             after,
             mode,
             // A repoint is not a first install: the file already ran bale.
-            backup: (!repoint).then(|| {
+            backup: repointed.is_none().then(|| {
                 backup_path(
                     backups,
                     &backup_key(repo, &Path::new(".cursor").join("worktrees.json")),
                 )
             }),
         },
-        Step::Note(format!(
-            "note: {} is usually committed; commit it so every Cursor worktree of this \
-             repo runs bale. The entry holds this machine's absolute path to bale; it \
-             is skipped where bale is not at that path",
-            display_path(&path)
-        )),
-    ]))
+    ];
+    if let Some((key, old)) = repointed {
+        steps.push(repoint_note(
+            &path,
+            &format!("bale's {key} entry"),
+            &old,
+            exe,
+        ));
+    }
+    steps.push(Step::Note(format!(
+        "note: {} is usually committed; commit it so every Cursor worktree of this \
+         repo runs bale. The entry holds this machine's absolute path to bale; it \
+         is skipped where bale is not at that path",
+        display_path(&path)
+    )));
+    Ok(Plan::new(steps))
 }
 
 /// The keys Cursor reads setup commands from.
