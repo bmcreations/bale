@@ -358,7 +358,11 @@ fn tracked_file_in_node_modules_under_lossy_filter_is_refused() {
             fs::write(wt.join("node_modules/n.txt"), "a   \n").unwrap();
         },
     );
-    assert_refused(&fx, &wt, &id, "node_modules/n.txt");
+    let named = Path::new("node_modules")
+        .join("n.txt")
+        .display()
+        .to_string();
+    assert_refused(&fx, &wt, &id, &named);
     assert_eq!(
         fs::read_to_string(wt.join("node_modules/n.txt")).unwrap(),
         "a   \n"
