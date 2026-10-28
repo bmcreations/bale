@@ -355,7 +355,7 @@ fn finish(
         if verify_in(&trash, &wip, &dest, &ex, Place::Moved)?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
-        let snapshot = match restore_check(&trash, &wip, &dest, &ex)? {
+        let snapshot = match restore_check(&id, &trash, &wip, &dest, &ex)? {
             Verdict::Same(snapshot) => snapshot,
             Verdict::Differs(reason) => return Ok(Some(Outcome::Skipped(not_restorable(&reason)))),
         };
@@ -425,6 +425,8 @@ fn back_to_baled(registry: &Registry, record: &mut Record, root: &Path) -> Resul
 /// from the save, or can't be checked, is moved back and set `Baled`.
 fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<Outcome> {
     let path = record.path.clone();
+    // A check the crash interrupted left its copy of the tree.
+    disk::remove_stale_checks(&path, &record.id)?;
     if fs::symlink_metadata(&path).is_ok() {
         let root =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
@@ -485,7 +487,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
-                Ok(match restore_check(&trash, wip, &dest, &ex)? {
+                Ok(match restore_check(&record.id, &trash, wip, &dest, &ex)? {
                     Verdict::Same(snapshot) if snapshot.changed()?.is_none() => {
                         record_hashes(&dest, snapshot.hashes)?;
                         None

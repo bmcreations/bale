@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::git::{self, Git, WorktreeInfo, LOCK_REASON};
 use crate::lock::WorkspaceLock;
+use crate::ops::disk;
 use crate::ops::open::{delete_saved, saved_refs};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
@@ -73,6 +74,10 @@ fn collect(
     let Some(record) = registry.get(id)? else {
         return Ok(());
     };
+    // Under the lock no check runs, so any check dir is a crashed cold's.
+    if !dry_run {
+        disk::remove_stale_checks(&record.path, id)?;
+    }
     match record.level {
         Level::Hot | Level::Baled => {}
         // Their dir can be legitimately absent while cold or mid-operation.

@@ -328,6 +328,45 @@ pub(crate) fn checkout_wip(g: &Git, wip: &str) -> Result<()> {
 
 /// Gives the owner full access to every dir under `root` (and `root`), so a
 /// check dir that copied a read-only dir mode can be removed.
+/// The name prefix of workspace `id`'s check dirs; `tempfile` adds six
+/// random alphanumerics.
+fn check_prefix(id: &str) -> String {
+    format!(".bale-check-{id}-")
+}
+
+/// Removes the check dirs a crashed cold of workspace `id` left beside
+/// `tree`: they hold copies of its files, saved secrets included. Only the
+/// holder of the workspace lock may call this; a check dir exists only
+/// while that holder is checking.
+pub(crate) fn remove_stale_checks(tree: &Path, id: &str) -> Result<()> {
+    let Some(parent) = tree.parent() else {
+        return Ok(());
+    };
+    let rd = match fs::read_dir(parent) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", parent.display())),
+    };
+    let prefix = check_prefix(id);
+    for entry in rd {
+        let entry = entry.with_context(|| format!("reading {}", parent.display()))?;
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if rest.len() != 6 || !rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = entry.path();
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        loosen(&path);
+        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn loosen(root: &Path) {
     #[cfg(unix)]
     {
@@ -488,6 +527,7 @@ fn stamp(meta: &fs::Metadata) -> Stamp {
 /// socket or device in the tree is a mismatch. `Err` means the check itself
 /// failed. On a match the verdict carries the stat of every entry walked.
 pub(crate) fn restore_check(
+    id: &str,
     tree: &Path,
     wip: &str,
     dest: &Path,
@@ -562,7 +602,7 @@ pub(crate) fn restore_check(
         .parent()
         .with_context(|| format!("{} has no parent directory", tree.display()))?;
     let tmp = tempfile::Builder::new()
-        .prefix(".bale-check-")
+        .prefix(&check_prefix(id))
         .tempdir_in(parent)
         .with_context(|| format!("creating a check dir in {}", parent.display()))?;
     let work = tmp.path().join("tree");

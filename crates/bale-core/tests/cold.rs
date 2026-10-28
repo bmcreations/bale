@@ -532,6 +532,27 @@ fn save_ignored_refuses_nested_repo() {
     assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
 }
 
+/// Recovering an interrupted cold removes the check dir the crash left
+/// (it holds copies of the tree's files), and only that workspace's.
+#[test]
+fn recover_removes_stale_check_dir() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_level(&fx, &id, Level::Cooling);
+    let parent = wt.parent().unwrap();
+    let ours = parent.join(format!(".bale-check-{id}-Zz9yX8"));
+    let theirs = parent.join(".bale-check-0123456789ab-Zz9yX8");
+    for d in [&ours, &theirs] {
+        fs::create_dir_all(d.join("tree")).unwrap();
+        fs::write(d.join("tree/.env"), "SECRET=1\n").unwrap();
+    }
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!ours.exists());
+    assert!(theirs.join("tree/.env").exists());
+}
+
 /// Sets extended attribute `name` on `path`; false if the filesystem
 /// refuses user attributes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

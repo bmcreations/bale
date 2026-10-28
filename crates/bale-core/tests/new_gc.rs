@@ -525,3 +525,36 @@ fn gc_keeps_a_gone_baled_tree_with_bales_old_lock() {
     assert_eq!(gc(&fx.home(), false).unwrap(), GcReport::default());
     assert!(registry(&fx).get(&id).unwrap().is_some());
 }
+
+/// Plants a check dir beside `wt` the way a crashed cold check leaves one:
+/// a copy of the tree, with a read-only dir inside.
+fn plant_check_dir(wt: &Path, name: &str) -> PathBuf {
+    let dir = wt.parent().unwrap().join(name);
+    fs::create_dir_all(dir.join("tree/ro")).unwrap();
+    fs::write(dir.join("tree/ro/.env"), "SECRET=1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("tree/ro"), fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    dir
+}
+
+/// A check dir a crashed cold left holds copies of the tree's secrets; gc
+/// removes this workspace's, and leaves other workspaces' and lookalikes.
+#[test]
+fn gc_removes_stale_check_dirs_of_the_workspace() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let ours = plant_check_dir(&wt, &format!(".bale-check-{id}-a1B2c3"));
+    let theirs = plant_check_dir(&wt, ".bale-check-0123456789ab-a1B2c3");
+    let lookalike = plant_check_dir(&wt, &format!(".bale-check-{id}-notes.d"));
+
+    gc(&fx.home(), true).unwrap();
+    assert!(ours.exists(), "a dry run removed it");
+    gc(&fx.home(), false).unwrap();
+    assert!(!ours.exists());
+    assert!(theirs.join("tree/ro/.env").exists());
+    assert!(lookalike.join("tree/ro/.env").exists());
+}
