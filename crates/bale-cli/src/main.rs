@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::SystemTime;
 
 use anyhow::Result;
-use bale_core::ops::cold::cold;
+use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::gc::{gc, GcReport};
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
@@ -36,6 +36,9 @@ enum Command {
     Cold {
         /// Worktree path or workspace id.
         target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
     },
     /// Restore a cold worktree at its path, then remove its saved state.
     Open {
@@ -125,9 +128,8 @@ fn main() -> ExitCode {
             }
             Ok(code)
         }),
-        Command::Cold { target } => {
-            resolve(&home, &target).and_then(|id| Ok(report_cold(&id, cold(&home, &id)?)))
-        }
+        Command::Cold { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| Ok(report_cold(&id, cold_ignoring(&home, &id, &ignore_pid)?))),
         Command::Open { target } => resolve(&home, &target).and_then(|id| {
             let opened = open(&home, &id)?;
             let code = report(&id, opened.outcome);

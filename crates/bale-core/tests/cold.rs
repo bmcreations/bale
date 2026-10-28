@@ -1,6 +1,8 @@
 mod support;
 
 use bale_core::git::worktrees;
+#[cfg(unix)]
+use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::cold::{cold, cold_if_clean, exclusions, save_ignored, save_wip};
 use bale_core::ops::up::{register, resolve, Outcome};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
@@ -460,6 +462,30 @@ fn busy_tree_is_not_removed() {
     assert_ne!(level(&fx, &id), Level::Cold);
     // Left Baled, and Baled trees carry no git lock.
     assert_eq!(linked(&fx).locked, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_ignoring_skips_listed_holder() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let child = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid = child.0.id();
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Busy(h) if h.iter().any(|x| x.pid == pid)),
+        "{out:?}"
+    );
+    let out = cold_ignoring(&fx.home(), &id, &[pid]).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
 }
 
 /// `git init` + one commit at `dir`.

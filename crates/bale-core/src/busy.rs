@@ -2,24 +2,12 @@
 use anyhow::Context;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-/// Pids that `busy_holders*` ignore for the rest of this process.
-static EXCLUDED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-/// Makes every later busy check in this process ignore `pids`. A hook uses
-/// it for the processes that invoked it (its shell and Claude Code), which
-/// hold the tree only because they are waiting on the hook.
-pub fn exclude_pids(pids: &[u32]) {
-    let mut excluded = EXCLUDED.lock().unwrap_or_else(|e| e.into_inner());
-    excluded.extend_from_slice(pids);
-}
-
-fn without_excluded(mut lists: Vec<Vec<Holder>>) -> Vec<Vec<Holder>> {
-    let excluded = EXCLUDED.lock().unwrap_or_else(|e| e.into_inner());
-    if !excluded.is_empty() {
+/// Drops holders whose pid is in `ignore` from every list.
+fn without_ignored(mut lists: Vec<Vec<Holder>>, ignore: &[u32]) -> Vec<Vec<Holder>> {
+    if !ignore.is_empty() {
         for list in &mut lists {
-            list.retain(|h| !excluded.contains(&h.pid));
+            list.retain(|h| !ignore.contains(&h.pid));
         }
     }
     lists
@@ -38,27 +26,31 @@ pub struct Holder {
 ///
 /// Processes (other than this one) with cwd or an open file under `root`.
 /// Windows returns empty: busy is detected by the rename in the cold path.
-pub fn busy_holders(root: &Path) -> Result<Vec<Holder>> {
+/// Holders whose pid is in `ignore` are left out (a hook passes the
+/// processes that are only waiting on it).
+pub fn busy_holders(root: &Path, ignore: &[u32]) -> Result<Vec<Holder>> {
     #[cfg(unix)]
     let root = root
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", root.display()))?;
     #[cfg(not(unix))]
     let root = root.to_path_buf();
-    Ok(busy_holders_many(&[root])?.pop().unwrap_or_default())
+    Ok(busy_holders_many(&[root], ignore)?
+        .pop()
+        .unwrap_or_default())
 }
 
 /// `busy_holders` for each of `roots`, in order, from one scan of the
 /// process table. Roots must already be canonical (paths are matched as
 /// given). Errs only when the scan fails.
-pub fn busy_holders_many(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
+pub fn busy_holders_many(roots: &[PathBuf], ignore: &[u32]) -> Result<Vec<Vec<Holder>>> {
     #[cfg(target_os = "linux")]
     let lists = linux::holders(roots)?;
     #[cfg(all(unix, not(target_os = "linux")))]
     let lists = lsof::holders(roots)?;
     #[cfg(not(unix))]
     let lists = vec![Vec::new(); roots.len()];
-    Ok(without_excluded(lists))
+    Ok(without_ignored(lists, ignore))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -239,19 +231,17 @@ mod linux {
 }
 
 #[cfg(test)]
-mod exclusion_tests {
+mod ignore_tests {
     use super::*;
 
     #[test]
-    fn excluded_pids_are_dropped_from_every_list() {
-        // A pid no real process has, so other tests in this binary are unaffected.
-        exclude_pids(&[u32::MAX - 7]);
+    fn ignored_pids_are_dropped_from_every_list() {
         let h = |pid| Holder {
             pid,
             command: "x".into(),
             path: PathBuf::from("/r"),
         };
-        let lists = without_excluded(vec![vec![h(u32::MAX - 7), h(10)], vec![h(u32::MAX - 7)]]);
+        let lists = without_ignored(vec![vec![h(7), h(10)], vec![h(7)]], &[7]);
         assert_eq!(lists, vec![vec![h(10)], vec![]]);
     }
 }

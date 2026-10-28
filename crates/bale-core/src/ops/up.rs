@@ -166,15 +166,16 @@ pub fn up_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
     };
-    up_locked_report(home, id)
+    up_locked_report(home, id, &[])
 }
 
 /// `up` for a caller that already holds the `WorkspaceLock` for `id`.
-pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
-    up_locked_report(home, id).map(|r| r.outcome)
+/// Processes in `ignore` do not count as holding the tree.
+pub(crate) fn up_locked(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<Outcome> {
+    up_locked_report(home, id, ignore).map(|r| r.outcome)
 }
 
-fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
+fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpReport> {
     let registry = Registry::open(home.clone());
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
@@ -200,7 +201,7 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
             if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
                 return skip(&reason);
             }
-            let holders = busy_holders(&root)?;
+            let holders = busy_holders(&root, ignore)?;
             if !holders.is_empty() {
                 return Ok(UpReport::plain(Outcome::Busy(holders)));
             }
@@ -225,7 +226,13 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     #[cfg(target_os = "macos")]
     {
         let failures = dirs::home_dir()
-            .map(|h| remove_derived_data(&root, &h.join("Library/Developer/Xcode/DerivedData")))
+            .map(|h| {
+                remove_derived_data(
+                    &root,
+                    &h.join("Library/Developer/Xcode/DerivedData"),
+                    ignore,
+                )
+            })
             .unwrap_or_default();
         if !failures.is_empty() {
             record.note = Some(format!("{DD_NOTE}{}", failures.join("; ")));
@@ -465,13 +472,13 @@ pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
 /// returns a message per folder that could not be probed or removed. A folder
 /// a process holds is left alone. Missing `dd_root` is not a failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn remove_derived_data(root: &Path, dd_root: &Path) -> Vec<String> {
+fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<String> {
     let mut failures = Vec::new();
     if !dd_root.is_dir() {
         return failures;
     }
     for dir in crate::derived_data::derived_data_for(root, dd_root) {
-        match busy_holders(&dir) {
+        match busy_holders(&dir, ignore) {
             Ok(h) if !h.is_empty() => continue,
             Ok(_) => {}
             Err(e) => {
@@ -584,7 +591,7 @@ mod tests {
     #[test]
     fn missing_derived_data_root_is_not_a_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope")).is_empty());
+        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope"), &[]).is_empty());
     }
 
     #[cfg(unix)]
@@ -608,7 +615,7 @@ mod tests {
         let locked = folder.join("Build/locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let failures = remove_derived_data(&ws, &tmp.path().join("dd"));
+        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &[]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("App-abc"), "{failures:?}");

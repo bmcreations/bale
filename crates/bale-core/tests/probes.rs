@@ -43,7 +43,7 @@ fn sleep_in(dir: &Path) -> Child {
 #[test]
 fn busy_holders_missing_root_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(busy_holders(&tmp.path().join("missing")).is_err());
+    assert!(busy_holders(&tmp.path().join("missing"), &[]).is_err());
 }
 
 #[cfg(unix)]
@@ -53,7 +53,7 @@ fn open_file_is_a_holder() {
     let root = tmp.path().join("wt");
     fs::create_dir_all(root.join("app")).unwrap();
     let child = sleep_in(&root.join("app"));
-    let holders = busy_holders(&root).unwrap();
+    let holders = busy_holders(&root, &[]).unwrap();
     assert!(
         holders.iter().any(|h| h.pid == child.0.id()),
         "holders: {holders:?}"
@@ -81,7 +81,7 @@ fn open_file_under_root_with_cwd_outside_is_a_holder() {
         .unwrap();
     let child = Child(child);
     std::thread::sleep(Duration::from_millis(300));
-    let holders = busy_holders(&root).unwrap();
+    let holders = busy_holders(&root, &[]).unwrap();
     assert!(
         holders.iter().any(|h| h.pid == child.0.id()),
         "holders: {holders:?}"
@@ -97,7 +97,7 @@ fn unrelated_process_is_not_a_holder() {
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&elsewhere).unwrap();
     let _child = sleep_in(&elsewhere);
-    let holders = busy_holders(&root).unwrap();
+    let holders = busy_holders(&root, &[]).unwrap();
     assert!(holders.is_empty(), "holders: {holders:?}");
 }
 
@@ -166,7 +166,7 @@ fn many_roots_from_one_scan_match_each_root() {
     let child = sleep_in(&held.join("app"));
     let pid = child.0.id();
 
-    let lists = busy_holders_many(&[free.clone(), held.clone(), held.clone()]).unwrap();
+    let lists = busy_holders_many(&[free.clone(), held.clone(), held.clone()], &[]).unwrap();
     assert_eq!(lists.len(), 3);
     assert!(lists[0].iter().all(|h| h.pid != pid), "{lists:?}");
     assert_eq!(
@@ -175,7 +175,7 @@ fn many_roots_from_one_scan_match_each_root() {
         "{lists:?}"
     );
     assert_eq!(lists[1], lists[2]);
-    assert!(busy_holders_many(&[]).unwrap().is_empty());
+    assert!(busy_holders_many(&[], &[]).unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -213,7 +213,7 @@ fn many_roots_prefix_cwd_outside_and_symlinked_root() {
         files.clone(),
         bale_core::paths::canonicalize(&link).unwrap(),
     ];
-    let lists = busy_holders_many(&roots).unwrap();
+    let lists = busy_holders_many(&roots, &[]).unwrap();
     let pids = |i: usize| lists[i].iter().map(|h| h.pid).collect::<Vec<_>>();
     assert!(pids(0).contains(&a) && !pids(0).contains(&b), "{lists:?}");
     // wt2 shares a string prefix with wt but is a different dir.
@@ -221,5 +221,5 @@ fn many_roots_prefix_cwd_outside_and_symlinked_root() {
     assert!(pids(2).contains(&b) && !pids(2).contains(&a), "{lists:?}");
     assert!(pids(3).contains(&a), "{lists:?}");
     // busy_holders canonicalizes a symlinked root itself.
-    assert!(busy_holders(&link).unwrap().iter().any(|h| h.pid == a));
+    assert!(busy_holders(&link, &[]).unwrap().iter().any(|h| h.pid == a));
 }

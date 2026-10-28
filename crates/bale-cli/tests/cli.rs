@@ -254,6 +254,28 @@ fn remove_hook_busy_tree_fails_and_stays() {
     assert!(wt.join("f").is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn cold_ignore_pid_flag() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .current_dir(&wt)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let target = wt.to_str().unwrap();
+    let without = env.bale(&env.repo, &["cold", target], None);
+    let pid = child.id().to_string();
+    let with = env.bale(&env.repo, &["cold", target, "--ignore-pid", &pid], None);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(without.status.code(), Some(3), "{}", stderr(&without));
+    assert!(with.status.success(), "{}", stderr(&with));
+    assert!(!wt.exists());
+}
+
 #[test]
 fn post_checkout_registers_new_worktree_only() {
     let env = Env::new();

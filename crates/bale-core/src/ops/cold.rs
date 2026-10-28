@@ -51,7 +51,14 @@ pub struct SavedFile {
 /// `$BALE_HOME/<id>/`, verifies it, and removes the checkout. A record left
 /// `Cooling` by a crash resumes from what is on disk.
 pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
-    cold_with(home, id, false)
+    cold_ignoring(home, id, &[])
+}
+
+/// `cold`, where processes in `ignore_pids` do not count as holding the
+/// tree. A hook passes the processes that invoked it, which hold the tree
+/// only because they are waiting on the hook. Every busy check honors it.
+pub fn cold_ignoring(home: &BaleHome, id: &str, ignore_pids: &[u32]) -> Result<Outcome> {
+    cold_with(home, id, false, ignore_pids)
 }
 
 /// `cold` for unattended callers: once the workspace lock is held, a tree
@@ -59,10 +66,10 @@ pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
 /// untouched as `Skipped("dirty")`. A `Cooling` record resumes regardless,
 /// since its work is already being saved.
 pub fn cold_if_clean(home: &BaleHome, id: &str) -> Result<Outcome> {
-    cold_with(home, id, true)
+    cold_with(home, id, true, &[])
 }
 
-fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> {
+fn cold_with(home: &BaleHome, id: &str, require_clean: bool, ignore: &[u32]) -> Result<Outcome> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(Outcome::Skipped("locked".into()));
     };
@@ -73,7 +80,7 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     match record.level {
         Level::Cold => return Ok(Outcome::Skipped("cold".into())),
         Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
-        Level::Cooling => return recover(home, &registry, record),
+        Level::Cooling => return recover(home, &registry, record, ignore),
         Level::Hot | Level::Baling | Level::Baled => {}
     }
 
@@ -88,7 +95,7 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     if let Some(reason) = refusal(&root, &exclusions(home, &root)?)? {
         return Ok(Outcome::Skipped(reason));
     }
-    match up_locked(home, id)? {
+    match up_locked(home, id, ignore)? {
         Outcome::Done(Level::Baled) => {}
         other => return Ok(other),
     }
@@ -102,7 +109,7 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     git::lock_worktree(&root, &root)?;
     record.level = Level::Cooling;
     registry.put(&record)?;
-    finish(home, &registry, record, &root)
+    finish(home, &registry, record, &root, ignore)
 }
 
 /// What cold leaves out of the ignored-file save for a tree. Capture,
@@ -327,6 +334,7 @@ fn finish(
     registry: &Registry,
     mut record: Record,
     root: &Path,
+    ignore: &[u32],
 ) -> Result<Outcome> {
     let id = record.id.clone();
     let dest = home.saved_dir(&id);
@@ -335,7 +343,7 @@ fn finish(
         let ex = exclusions(home, root)?;
         save_ignored(root, &dest, &ex)?;
         verify(root, &id, &dest, &ex)?;
-        Ok((busy_holders(root)?, ex))
+        Ok((busy_holders(root, ignore)?, ex))
     })();
     let (holders, ex) = match prepared {
         Ok(h) => h,
@@ -394,7 +402,7 @@ fn finish(
         };
         #[cfg(test)]
         tests::run_seam(&tests::AFTER_COMPARE, &trash);
-        let holders = busy_holders(&trash)?;
+        let holders = busy_holders(&trash, ignore)?;
         if !holders.is_empty() {
             return Ok(Some(Outcome::Busy(holders)));
         }
@@ -514,7 +522,12 @@ fn back_to_baled(registry: &Registry, record: &mut Record, root: &Path) -> Resul
 /// scratch; a missing one is only finished off (trash removed, `Cold`) when
 /// the wip ref and the manifest both exist. An unmarked trash that differs
 /// from the save, or can't be checked, is moved back and set `Baled`.
-fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<Outcome> {
+fn recover(
+    home: &BaleHome,
+    registry: &Registry,
+    mut record: Record,
+    ignore: &[u32],
+) -> Result<Outcome> {
     let path = record.path.clone();
     // A check the crash interrupted left its copy of the tree.
     disk::remove_stale_checks(&path, &record.id)?;
@@ -543,7 +556,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
         }
         record.branch = git::current_branch(&root)?;
         git::lock_worktree(&root, &root)?;
-        return finish(home, registry, record, &root);
+        return finish(home, registry, record, &root, ignore);
     }
 
     let wip = format!("refs/bale/{}/wip", record.id);
@@ -608,7 +621,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 };
                 // As `finish`: a process that has the tree open may still
                 // write to it.
-                let holders = busy_holders(&trash)?;
+                let holders = busy_holders(&trash, ignore)?;
                 if !holders.is_empty() {
                     return Ok(Some(Outcome::Busy(holders)));
                 }

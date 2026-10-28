@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
-use bale_core::ops::cold::cold;
+use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::new::{new_workspace, workspace_path};
 use bale_core::ops::up::{register, resolve, Outcome};
 use bale_core::BaleHome;
@@ -236,8 +236,10 @@ pub fn claude_worktree_remove(home: &BaleHome) -> Result<ExitCode> {
     if let Some(parent) = path.parent() {
         let _ = std::env::set_current_dir(parent);
     }
-    bale_core::busy::exclude_pids(&invoking_pids(std::process::id(), process_info));
-    let code = match resolve(home, &path.to_string_lossy()).and_then(|id| cold(home, &id)) {
+    let ignore = invoking_pids(std::process::id(), process_info);
+    let code = match resolve(home, &path.to_string_lossy())
+        .and_then(|id| cold_ignoring(home, &id, &ignore))
+    {
         Ok(Outcome::Done(_)) => ExitCode::SUCCESS,
         Ok(Outcome::Busy(holders)) => {
             eprint!("{}", busy_text(&path, &holders));
