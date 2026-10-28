@@ -169,13 +169,13 @@ fn git_fallback(cwd: &Path, name: &str, branch: &str) -> Result<PathBuf> {
 /// The pids whose hold on the tree comes from running this hook: this
 /// process and its parent. When the parent is a shell (Claude Code runs
 /// `sh -c`, which only stays around for a compound command), also the
-/// nearest ancestor that is Claude Code, or else the grandparent. When the
-/// parent is not a shell, `sh -c` exec'd bale and the parent is Claude Code
-/// itself (named `node` for an npm install), so the walk stops there.
-/// Nothing above that (such as the user's shell that started Claude Code)
-/// is included. `info` gives a pid's parent pid and process name or exe.
+/// grandparent, which is Claude Code. When the parent is not a shell,
+/// `sh -c` exec'd bale and the parent is Claude Code itself (named `node`
+/// for an npm install), so the walk stops there. Nothing above that (such
+/// as the user's shell that started Claude Code, or another `claude`
+/// process) is included. `info` gives a pid's parent pid and process name
+/// or exe.
 pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)>) -> Vec<u32> {
-    const SEARCH_DEPTH: usize = 8;
     let mut pids = vec![own];
     let Some((parent, _)) = info(own) else {
         return pids;
@@ -187,22 +187,9 @@ pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)
     let Some((grandparent, parent_name)) = info(parent) else {
         return pids;
     };
-    if !is_shell(&parent_name) || grandparent <= 1 {
-        return pids;
+    if is_shell(&parent_name) && grandparent > 1 {
+        pids.push(grandparent);
     }
-    let mut cur = grandparent;
-    for _ in 0..SEARCH_DEPTH {
-        let Some((next, name)) = info(cur) else { break };
-        if is_claude(&name) {
-            pids.push(cur);
-            return pids;
-        }
-        if next <= 1 {
-            break;
-        }
-        cur = next;
-    }
-    pids.push(grandparent);
     pids
 }
 
@@ -217,10 +204,6 @@ fn is_shell(name: &str) -> bool {
         base.trim_start_matches('-'),
         "sh" | "bash" | "dash" | "zsh" | "fish"
     )
-}
-
-fn is_claude(name: &str) -> bool {
-    name.to_lowercase().contains("claude")
 }
 
 /// `(parent pid, command)` for `pid` from `ps`; `None` where unavailable.
@@ -332,13 +315,14 @@ mod tests {
     }
 
     #[test]
-    fn finds_claude_above_a_wrapper() {
-        // zsh(10) -> claude(20) -> bash(25) -> sh(30) -> bale(40)
+    fn never_climbs_to_a_higher_claude() {
+        // claude(5) -> zsh(10) -> node(20) -> sh(30) -> bale(40): an outer
+        // Claude Code session above the user's shell stays a holder.
         let info = table(&[
-            (10, 1, "zsh"),
-            (20, 10, "claude"),
-            (25, 20, "bash"),
-            (30, 25, "sh"),
+            (5, 1, "claude"),
+            (10, 5, "zsh"),
+            (20, 10, "node"),
+            (30, 20, "sh"),
             (40, 30, "bale"),
         ]);
         assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);
