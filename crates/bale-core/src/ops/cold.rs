@@ -16,10 +16,10 @@ use crate::busy::{busy_holders, Holder};
 use crate::config::{load_config, Config};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
+use crate::lock::WorkspaceLock;
 use crate::ops::disk::{
     self, read_manifest, record_tree, restore_mismatch, write_manifest, Manifest, Skip,
 };
-use crate::lock::WorkspaceLock;
 use crate::ops::up::{
     bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
 };
@@ -174,8 +174,9 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         "--quiet",
         "foreach",
         "--recursive",
-        // Explicit flags: each submodule's own config could hide files.
-        r#"test -z "$(git status --porcelain --untracked-files=all --ignore-submodules=none)" || echo "$displaypath""#,
+        // The runner's -c overrides reach this status; the flag outranks a
+        // nested `.gitmodules` ignore, which -c does not.
+        r#"test -z "$(git status --porcelain --ignore-submodules=none)" || echo "$displaypath""#,
     ])?;
     let dirty: Vec<&str> = dirty.lines().filter(|l| !l.is_empty()).collect();
     if !dirty.is_empty() {
@@ -700,7 +701,6 @@ fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
             "status",
             "--porcelain",
             "-z",
-            "--untracked-files=all",
             "--ignore-submodules=dirty",
         ])?;
         let status: Vec<&str> = status.split('\0').filter(|e| !e.is_empty()).collect();
@@ -1422,9 +1422,9 @@ mod tests {
         assert_late_submodule_write_kept("late.log", "late\n");
     }
 
-    /// A late write inside a submodule of the submodule is caught too.
-    #[test]
-    fn write_in_nested_submodule_before_rename_moves_the_tree_back() {
+    /// A worktree with submodule `lib`, which has its own submodule `deep`.
+    /// `setup_lib` runs in lib's source repo before its commit.
+    fn nested_case(setup_lib: impl Fn(&Path)) -> (tempfile::TempDir, PathBuf, BaleHome, String) {
         let (tmp, repo) = repo();
         let inner = tmp.path().join("inner");
         fs::create_dir_all(&inner).unwrap();
@@ -1454,9 +1454,10 @@ mod tests {
                 "deep",
             ],
         );
+        setup_lib(&sub);
         git(
             &sub,
-            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "s"],
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-am", "s"],
         );
         let wt = tmp.path().join("wt");
         git(
@@ -1494,7 +1495,13 @@ mod tests {
         assert!(wt.join("lib/deep/i.txt").is_file());
         let home = BaleHome(tmp.path().join("home"));
         let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        (tmp, wt, home, id)
+    }
 
+    /// A late write inside a submodule of the submodule is caught too.
+    #[test]
+    fn write_in_nested_submodule_before_rename_moves_the_tree_back() {
+        let (_tmp, wt, home, id) = nested_case(|_| {});
         let seam = set_seam(&BEFORE_RENAME, |root: &Path| {
             fs::write(root.join("lib/deep/i.txt"), "edited\n").unwrap()
         });
@@ -1510,6 +1517,67 @@ mod tests {
         // Unchanged since, it goes cold.
         fs::write(wt.join("lib/deep/i.txt"), "i\n").unwrap();
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+    }
+
+    /// lib's own `.gitmodules` says `ignore = all` for `deep`.
+    fn ignore_deep(lib: &Path) {
+        git(
+            lib,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.deep.ignore",
+                "all",
+            ],
+        );
+    }
+
+    fn commit_in_deep(root: &Path) {
+        git(
+            &root.join("lib/deep"),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "late",
+            ],
+        );
+    }
+
+    /// Pins `--ignore-submodules=none` on `is_dirty`: `-c
+    /// diff.ignoreSubmodules` does not outrank `.gitmodules`.
+    #[test]
+    fn is_dirty_sees_a_submodule_edit_under_ignore_all() {
+        let (_tmp, wt, _home, _id) = submodule_case(|wt| {
+            ignore_all(wt);
+            fs::write(wt.join("lib/a.txt"), "edited\n").unwrap();
+        });
+        assert!(git::is_dirty(&wt).unwrap());
+    }
+
+    /// Pins `--ignore-submodules=none` in the foreach status.
+    #[test]
+    fn nested_submodule_commit_under_ignore_all_is_refused() {
+        let (_tmp, wt, home, id) = nested_case(ignore_deep);
+        commit_in_deep(&wt);
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+    }
+
+    /// Pins `--ignore-submodules=dirty` in `submodule_change`.
+    #[test]
+    fn late_nested_submodule_commit_under_ignore_all_moves_the_tree_back() {
+        let (_tmp, wt, home, id) = nested_case(ignore_deep);
+        let seam = set_seam(&BEFORE_RENAME, commit_in_deep);
+        let out = cold(&home, &id);
+        drop(seam);
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("lib/deep/.git").exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
     }
 
     /// Regenerable output written inside the submodule in the window is not

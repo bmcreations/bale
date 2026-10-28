@@ -15,8 +15,9 @@ const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
 /// every untracked file and every submodule change, and no cache or
 /// fsmonitor may stand in for reading the disk. `-c` outranks every config
 /// file and `GIT_CONFIG_PARAMETERS`, and reaches the git processes `git
-/// submodule foreach` starts. It does not outrank `submodule.<name>.ignore`
-/// from `.gitmodules`, so status calls also pass `--ignore-submodules`.
+/// submodule foreach` starts, so status calls rely on it for untracked
+/// files. It does not outrank `submodule.<name>.ignore` from `.gitmodules`,
+/// so status calls also pass `--ignore-submodules`.
 const OVERRIDES: [&str; 4] = [
     "status.showUntrackedFiles=all",
     "core.fsmonitor=false",
@@ -190,7 +191,6 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
             "--no-optional-locks",
             "status",
             "--porcelain",
-            "--untracked-files=all",
             "--ignore-submodules=none",
         ])?
         .trim()
