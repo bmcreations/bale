@@ -361,7 +361,8 @@ fn bale_hook_path(cmd: &str, kind: &str) -> Option<String> {
         None => sh_unquote(quoted)?,
     };
     let base = path.rsplit(['/', '\\']).next()?;
-    matches!(base, "bale" | "bale.exe").then_some(path)
+    // bale writes an absolute path; a relative one is the user's.
+    (crate::cmdline::is_absolute(&path) && matches!(base, "bale" | "bale.exe")).then_some(path)
 }
 
 /// The inverse of [`sh_quote`]: `'...'` segments joined by `\'`.
@@ -661,6 +662,8 @@ mod tests {
             "nice '/x/bale' hook claude create",
             "/x/bale hook claude create",
             "'/x/not-bale' hook claude create",
+            "'bale' hook claude create",
+            "'bin/bale' hook claude create",
             "'/x/bale' hook claude remove",
             "'/x/bale' hook claude create --flag",
             "'/x/a' '/x/bale' hook claude create",

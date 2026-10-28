@@ -109,7 +109,7 @@ pub(crate) fn cmd_guarded(quoted: &str, args: &str) -> String {
 /// Whether `word` is an absolute path on any OS bale supports: `/…`,
 /// `C:\…` or `C:/…`, or a UNC `\\…` path. Judged by text, not by the host,
 /// so a file written on one OS reads the same on another.
-fn is_absolute(word: &str) -> bool {
+pub(crate) fn is_absolute(word: &str) -> bool {
     let b = word.as_bytes();
     word.starts_with('/')
         || word.starts_with(r"\\")
