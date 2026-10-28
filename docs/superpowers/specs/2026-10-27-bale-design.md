@@ -314,7 +314,8 @@ Everything in `bale up`, then:
    are left alone.
 
    Because the compare reads the disk, a tree whose files git would not give back byte for byte stays:
-   a clean filter that changes content, `core.autocrlf=input` on a CRLF file, a new `ident` file holding an
+   a clean filter that changes content, `core.autocrlf=input` on a CRLF file, `core.autocrlf=true` (the
+   Windows default) on a file written with LF endings, a new `ident` file holding an
    unexpanded `$Id$` (checkout would expand it), and a fifo, socket or device. A case variant of `.git`
    such as `d/.GIT` stays too: git refuses it as a path on every platform (`add -A` drops it on macOS and
    Windows and fails on it on Linux), so cold walks the tree for one before `up` runs, outside the

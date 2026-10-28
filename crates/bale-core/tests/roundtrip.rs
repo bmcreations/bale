@@ -247,6 +247,22 @@ fn crlf_files_under_autocrlf_true_round_trip() {
     assert_eq!(fs::read(wt.join("new.txt")).unwrap(), b"n\r\n");
 }
 
+/// The default on Windows, with a file an agent wrote with LF endings:
+/// checkout would write it back as CRLF, so cold refuses and names it.
+#[test]
+fn lf_file_under_autocrlf_true_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            git(r, &["config", "core.autocrlf", "true"]);
+        },
+        |wt| fs::write(wt.join("lf.txt"), "a\nb\n").unwrap(),
+    );
+    assert_refused(&fx, &wt, &id, "lf.txt");
+    assert_eq!(fs::read(wt.join("lf.txt")).unwrap(), b"a\nb\n");
+}
+
 /// Git refuses a `.git` in any case as a path: depending on the platform
 /// `add -A` drops `.GIT` or fails on it. Cold refuses before `up` runs.
 #[test]
