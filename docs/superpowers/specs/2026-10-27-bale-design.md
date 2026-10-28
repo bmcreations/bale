@@ -374,7 +374,9 @@ the source it saves is about 1 GB per Android worktree.)*
   save that repo's state over the record. Such a folder, or one where git fails, is skipped, naming the
   path, with no ref or `$BALE_HOME` write and the record unchanged. `bale gc` makes the same check before
   it releases bale's lock on a `hot` workspace or deletes its leftover saved state, and leaves both alone
-  when it fails.
+  when it fails. `up` makes it too before removing output from a `hot` or `baled` tree. Registering
+  (`bale up|cold|open <path>`, the remove hook, `migrate --apply`) refuses a path with no `.git` entry,
+  so a stray folder can never repoint the record's admin dir at an enclosing repo.
 - `cold` skips a tree, before saving anything, when any of these hold: a submodule (nested ones too) has
   uncommitted changes or untracked files, ignored files that are not regenerable, or its own `.git`
   directory; a submodule is checked out at a commit other than the one HEAD records (a commit made inside
