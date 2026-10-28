@@ -16,6 +16,8 @@ use crate::registry::{workspace_id, Level, Record, Registry};
 use crate::BaleHome;
 
 const TRASH_PREFIX: &str = ".bale-trash-";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DD_NOTE: &str = "DerivedData not removed: ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -112,26 +114,62 @@ pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
             record.level = Level::Baling;
             registry.put(&record)?;
 
-            if let Err(e) = move_to_trash(home, &root) {
+            if let Err(failure) = move_to_trash(home, &root) {
                 let unlocked = git::unlock_worktree_if_ours(&root, &root);
                 record.level = Level::Hot;
                 registry.put(&record)?;
-                unlocked?;
-                if is_busy_error(&e) {
-                    return Ok(Outcome::Busy(Vec::new()));
-                }
-                return Err(e).context("moving build output aside");
+                return rename_failure(failure, unlocked);
             }
         }
     }
 
     remove_trash(&root)?;
     #[cfg(target_os = "macos")]
-    remove_derived_data(&root)?;
+    {
+        let failures = dirs::home_dir()
+            .map(|h| remove_derived_data(&root, &h.join("Library/Developer/Xcode/DerivedData")))
+            .unwrap_or_default();
+        if !failures.is_empty() {
+            record.note = Some(format!("{DD_NOTE}{}", failures.join("; ")));
+        } else if record
+            .note
+            .as_deref()
+            .is_some_and(|n| n.starts_with(DD_NOTE))
+        {
+            record.note = None;
+        }
+    }
 
     record.level = Level::Baled;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Baled))
+}
+
+/// Turns a failed move into the outcome. Dirs stranded in trash are an error
+/// naming each one, so the user can move them back; otherwise a permission or
+/// sharing error means busy. The rename error stays the root cause.
+fn rename_failure(failure: MoveFailure, unlocked: Result<bool>) -> Result<Outcome> {
+    let MoveFailure { cause, stranded } = failure;
+    let busy = is_busy_error(&cause);
+    let mut err = anyhow::Error::from(cause).context("moving build output aside");
+    let unlock_failed = unlocked.is_err();
+    if let Err(u) = unlocked {
+        err = err.context(format!("unlocking the worktree also failed: {u:#}"));
+    }
+    if !stranded.is_empty() {
+        let list: Vec<String> = stranded
+            .iter()
+            .map(|(trash, original)| format!("{} (was {})", trash.display(), original.display()))
+            .collect();
+        return Err(err.context(format!(
+            "could not restore build output; move these back by hand: {}",
+            list.join(", ")
+        )));
+    }
+    if busy && !unlock_failed {
+        return Ok(Outcome::Busy(Vec::new()));
+    }
+    Err(err)
 }
 
 fn regenerable(home: &BaleHome, root: &Path) -> Result<Vec<PathBuf>> {
@@ -143,12 +181,30 @@ fn is_busy_error(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && e.raw_os_error() == Some(32))
 }
 
-/// Renames each regenerable dir to `<parent>/.bale-trash-<name>-<nanos>`. On
-/// failure every dir already moved is renamed back before the error returns.
-fn move_to_trash(home: &BaleHome, root: &Path) -> io::Result<()> {
-    let mut dirs = regenerable(home, root).map_err(io::Error::other)?;
+#[derive(Debug)]
+struct MoveFailure {
+    cause: io::Error,
+    /// `(trash, original)` pairs whose restore rename failed.
+    stranded: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Renames each regenerable dir to `<parent>/.bale-trash-<name>-<nanos>`.
+fn move_to_trash(home: &BaleHome, root: &Path) -> Result<(), MoveFailure> {
+    let mut dirs = regenerable(home, root).map_err(|e| MoveFailure {
+        cause: io::Error::other(format!("{e:#}")),
+        stranded: Vec::new(),
+    })?;
     dirs.retain(|d| !in_trash(root, d));
     dirs.sort();
+    move_all(&dirs, |from, to| fs::rename(from, to))
+}
+
+/// Moves each dir to a trash name with `rename`. On the first failure every
+/// dir already moved is renamed back; restores that fail are reported.
+fn move_all(
+    dirs: &[PathBuf],
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<(), MoveFailure> {
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for dir in dirs {
         let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
@@ -159,15 +215,16 @@ fn move_to_trash(home: &BaleHome, root: &Path) -> io::Result<()> {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let trash = parent.join(format!("{TRASH_PREFIX}{}-{nanos}", name.to_string_lossy()));
-        if let Err(e) = fs::rename(&dir, &trash) {
-            for (from, to) in moved.iter().rev() {
-                // Best effort: a failed restore leaves a trash dir that the
-                // next `up` removes, which is no worse than baling it.
-                let _ = fs::rename(to, from);
-            }
-            return Err(e);
+        if let Err(cause) = rename(dir, &trash) {
+            let stranded = moved
+                .into_iter()
+                .rev()
+                .filter(|(from, to)| rename(to, from).is_err())
+                .map(|(from, to)| (to, from))
+                .collect();
+            return Err(MoveFailure { cause, stranded });
         }
-        moved.push((dir, trash));
+        moved.push((dir.clone(), trash));
     }
     Ok(())
 }
@@ -180,12 +237,20 @@ fn in_trash(root: &Path, path: &Path) -> bool {
 }
 
 /// Removes every `.bale-trash-*` entry under `root`. Symlinks are never
-/// followed: a trash entry that is a link has only the link removed.
+/// followed: a trash entry that is a link has only the link removed. An
+/// unreadable entry elsewhere in the tree is skipped; only failing to read
+/// the root or to remove a trash entry is an error.
 fn remove_trash(root: &Path) -> Result<()> {
     let mut found = Vec::new();
     let mut it = WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = it.next() {
-        let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) if err.depth() == 0 => {
+                return Err(err).with_context(|| format!("walking {}", root.display()))
+            }
+            Err(_) => continue,
+        };
         if entry.depth() == 0 {
             continue;
         }
@@ -228,22 +293,175 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Removes global DerivedData folders built from this worktree. A folder with
-/// a process holding it is left alone.
-#[cfg(target_os = "macos")]
-fn remove_derived_data(root: &Path) -> Result<()> {
-    let Some(home) = dirs::home_dir() else {
-        return Ok(());
-    };
-    let dd_root = home.join("Library/Developer/Xcode/DerivedData");
+/// Removes DerivedData folders under `dd_root` built from this worktree and
+/// returns a message per folder that could not be probed or removed. A folder
+/// a process holds is left alone. Missing `dd_root` is not a failure.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remove_derived_data(root: &Path, dd_root: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
     if !dd_root.is_dir() {
-        return Ok(());
+        return failures;
     }
-    for dir in crate::derived_data::derived_data_for(root, &dd_root) {
-        if !busy_holders(&dir)?.is_empty() {
-            continue;
+    for dir in crate::derived_data::derived_data_for(root, dd_root) {
+        match busy_holders(&dir) {
+            Ok(h) if !h.is_empty() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                failures.push(format!("{}: {e:#}", dir.display()));
+                continue;
+            }
         }
-        remove_entry(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        if let Err(e) = remove_entry(&dir) {
+            failures.push(format!("{}: {e}", dir.display()));
+        }
     }
-    Ok(())
+    failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn dirs_in(tmp: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|n| {
+                let d = tmp.join(n);
+                fs::create_dir_all(&d).unwrap();
+                fs::write(d.join("f"), n).unwrap();
+                d
+            })
+            .collect()
+    }
+
+    fn trash_in(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(TRASH_PREFIX)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn second_rename_failure_restores_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dirs = dirs_in(tmp.path(), &["one", "two"]);
+        let calls = Cell::new(0);
+        let failure = move_all(&dirs, |from, to| {
+            calls.set(calls.get() + 1);
+            if from == dirs[1] {
+                // The first dir really moved before this rename fails.
+                assert!(!dirs[0].exists());
+                assert_eq!(trash_in(tmp.path()).len(), 1);
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+        // Move one, fail two, restore one.
+        assert_eq!(calls.get(), 3);
+        assert_eq!(failure.cause.kind(), io::ErrorKind::PermissionDenied);
+        assert!(failure.stranded.is_empty());
+        assert_eq!(fs::read_to_string(dirs[0].join("f")).unwrap(), "one");
+        assert!(trash_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_restore_is_reported_as_stranded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dirs = dirs_in(tmp.path(), &["one", "two"]);
+        let failure = move_all(&dirs, |from, to| {
+            let is_restore = from
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(TRASH_PREFIX);
+            if from == dirs[1] || is_restore {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+        let trash = trash_in(tmp.path());
+        assert_eq!(failure.stranded, vec![(trash[0].clone(), dirs[0].clone())]);
+
+        let err = rename_failure(failure, Ok(true)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&trash[0].display().to_string()), "{msg}");
+        assert!(msg.contains(&dirs[0].display().to_string()), "{msg}");
+        assert_eq!(
+            err.root_cause()
+                .downcast_ref::<io::Error>()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn busy_rename_with_clean_restore_is_busy() {
+        let failure = MoveFailure {
+            cause: io::Error::from(io::ErrorKind::PermissionDenied),
+            stranded: Vec::new(),
+        };
+        assert_eq!(
+            rename_failure(failure, Ok(true)).unwrap(),
+            Outcome::Busy(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unlock_failure_keeps_rename_error_as_cause() {
+        let failure = MoveFailure {
+            cause: io::Error::from(io::ErrorKind::PermissionDenied),
+            stranded: Vec::new(),
+        };
+        let err = rename_failure(failure, Err(anyhow::anyhow!("git exploded"))).unwrap_err();
+        assert!(format!("{err:#}").contains("git exploded"));
+        assert_eq!(
+            err.root_cause()
+                .downcast_ref::<io::Error>()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn missing_derived_data_root_is_not_a_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_removal_failure_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join("App.xcworkspace")).unwrap();
+        let folder = tmp.path().join("dd/App-abc");
+        fs::create_dir_all(folder.join("Build/locked")).unwrap();
+        fs::write(folder.join("Build/locked/x"), "x").unwrap();
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "WorkspacePath".into(),
+            plist::Value::String(ws.join("App.xcworkspace").to_string_lossy().into_owned()),
+        );
+        plist::Value::Dictionary(dict)
+            .to_file_xml(folder.join("info.plist"))
+            .unwrap();
+        let locked = folder.join("Build/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let failures = remove_derived_data(&ws, &tmp.path().join("dd"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("App-abc"), "{failures:?}");
+    }
 }

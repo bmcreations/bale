@@ -281,3 +281,24 @@ fn derived_data_matching() {
         .collect();
     assert_eq!(names, vec!["A"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn unreadable_unrelated_dir_does_not_block_baling() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx);
+    fs::create_dir_all(wt.join("secret/inner")).unwrap();
+    fs::write(wt.join("secret/inner/s.txt"), "s").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    fs::set_permissions(wt.join("secret"), fs::Permissions::from_mode(0o000)).unwrap();
+    let guard = RestoreMode(wt.join("secret"));
+
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!wt.join("app/build").exists());
+    assert_eq!(level(&fx, &id), Level::Baled);
+    drop(guard);
+    assert!(wt.join("secret/inner/s.txt").exists());
+    assert!(trash_left(&wt).is_empty());
+}
