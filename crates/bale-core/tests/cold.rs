@@ -591,6 +591,54 @@ fn cold_refuses_file_with_extended_attribute() {
     assert_eq!(fs::read_to_string(wt.join("notes.txt")).unwrap(), "n\n");
 }
 
+/// What apps set on their own does not stop cold: Xcode's text encoding
+/// hint on project files, and Finder's flags on `.DS_Store`.
+#[cfg(target_os = "macos")]
+#[test]
+fn cold_allows_app_set_extended_attributes() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("contents.xcworkspacedata"), "<x/>\n").unwrap();
+    fs::write(wt.join(".DS_Store"), "ds").unwrap();
+    assert!(set_xattr(
+        &wt.join("contents.xcworkspacedata"),
+        "com.apple.TextEncoding",
+        b"utf-8;134217984"
+    ));
+    let mut finder = [0u8; 32];
+    finder[8] = 0x40;
+    assert!(set_xattr(
+        &wt.join(".DS_Store"),
+        "com.apple.FinderInfo",
+        &finder
+    ));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+}
+
+/// Finder info elsewhere can hold a colour label, which is the user's.
+#[cfg(target_os = "macos")]
+#[test]
+fn cold_refuses_finder_info_outside_ds_store() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("notes.txt"), "n\n").unwrap();
+    let mut finder = [0u8; 32];
+    finder[9] = 0x0c; // label colour bits
+    assert!(set_xattr(
+        &wt.join("notes.txt"),
+        "com.apple.FinderInfo",
+        &finder
+    ));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("notes.txt")),
+        "{out:?}"
+    );
+}
+
 /// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`,
 /// `build/` and `cache/`.
 fn worktree_with_submodule(fx: &Fixture, sub: &Fixture) -> PathBuf {

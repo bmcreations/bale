@@ -843,17 +843,20 @@ fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
-/// Extended attributes the OS sets on its own, which nothing restores and
-/// no one misses: Gatekeeper's provenance and quarantine marks, the
-/// last-opened date, the TCC sandbox list (macOS), and SELinux labels
-/// (Linux, set again by policy). Anything else, Finder tags and colours
-/// included, is the user's.
+/// Extended attributes the OS or apps set on their own, which nothing
+/// restores and no one misses: Gatekeeper's provenance and quarantine
+/// marks, the last-opened date, the TCC sandbox list, the text encoding
+/// hint Xcode and Cocoa apps write (the bytes don't depend on it) (macOS),
+/// and SELinux labels (Linux, set again by policy). Finder info is allowed
+/// only on `.DS_Store`, where Finder sets it; elsewhere it can hold a
+/// colour label. Anything else, Finder tags included, is the user's.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const OS_XATTRS: &[&str] = &[
     "com.apple.provenance",
     "com.apple.quarantine",
     "com.apple.lastuseddate#PS",
     "com.apple.macl",
+    "com.apple.TextEncoding",
     "security.selinux",
 ];
 
@@ -906,6 +909,9 @@ fn user_xattrs(path: &Path) -> Result<Vec<String>> {
             .filter(|n| !n.is_empty())
             .map(|n| String::from_utf8_lossy(n).into_owned())
             .filter(|n| !OS_XATTRS.contains(&n.as_str()))
+            .filter(|n| {
+                !(n == "com.apple.FinderInfo" && path.file_name() == Some(".DS_Store".as_ref()))
+            })
             .collect());
     }
 }
