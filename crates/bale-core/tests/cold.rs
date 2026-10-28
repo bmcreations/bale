@@ -713,6 +713,44 @@ fn cold_refuses_submodule_file_checkout_would_change() {
     assert_eq!(fs::read_to_string(lib.join("notes.txt")).unwrap(), "a  \n");
 }
 
+/// A commit made inside a submodule moves its HEAD off the gitlink HEAD
+/// records (` M lib`), with the submodule itself clean. Open restores HEAD's
+/// gitlink, so that commit would be left only in the submodule's reflog.
+#[test]
+fn cold_refuses_committed_submodule_head_move() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = worktree_with_submodule(&fx, &sub);
+    let lib = wt.join("lib");
+    fs::write(lib.join("new.txt"), "x\n").unwrap();
+    git(&lib, &["add", "new.txt"]);
+    git(
+        &lib,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "moved",
+        ],
+    );
+    let moved = git(&lib, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&wt, &["status", "--porcelain"]), " M lib\n");
+
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("submodule lib") && r.contains("commit")),
+        "{out:?}"
+    );
+    assert_eq!(git(&lib, &["rev-parse", "HEAD"]), moved);
+    assert_eq!(fs::read_to_string(lib.join("new.txt")).unwrap(), "x\n");
+}
+
 #[test]
 fn cold_refuses_submodule_with_git_dir() {
     let fx = Fixture::new();

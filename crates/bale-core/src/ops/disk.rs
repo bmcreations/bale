@@ -13,8 +13,8 @@ use walkdir::WalkDir;
 
 use crate::git::Git;
 use crate::ops::cold::{
-    copy_file, copy_symlink, create_private, hex, regen_dirs, submodule_deny, submodule_git_dir,
-    Exclusions, SavedFile, FILES, MANIFEST,
+    copy_file, copy_symlink, create_private, hex, moved_gitlink_reason, moved_gitlinks, regen_dirs,
+    submodule_deny, submodule_git_dir, Exclusions, SavedFile, FILES, MANIFEST,
 };
 use crate::ops::up::TRASH_PREFIX;
 
@@ -541,6 +541,18 @@ pub(crate) fn restore_check(
     let g = Git::at(tree);
     let git_dir = g.run(&["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(git_dir.trim_end_matches(['\n', '\r']));
+    // Open resets to wip's parent (HEAD), which puts HEAD's gitlinks back.
+    let moved = moved_gitlinks(&g.run(&[
+        "diff-tree",
+        "-r",
+        "-z",
+        "--no-renames",
+        "--no-commit-id",
+        wip,
+    ])?);
+    if !moved.is_empty() {
+        return Ok(Verdict::Differs(moved_gitlink_reason(&moved)));
+    }
     let listing = g.run(&["ls-tree", "-r", "-z", wip])?;
     let mut paths: Vec<String> = Vec::new();
     let mut gitlinks = BTreeSet::new();

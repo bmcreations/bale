@@ -183,6 +183,18 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         return Ok(Some(format!("dirty submodule: {}", dirty.join(", "))));
     }
 
+    let moved = moved_gitlinks(&g.run(&[
+        "diff-index",
+        "--raw",
+        "-z",
+        "--no-renames",
+        "--ignore-submodules=dirty",
+        "HEAD",
+    ])?);
+    if !moved.is_empty() {
+        return Ok(Some(moved_gitlink_reason(&moved)));
+    }
+
     // Nothing in a submodule's checkout is saved except what its own commits
     // hold, so its ignored files (other than regenerable output) or an
     // embedded git dir would be lost.
@@ -787,6 +799,30 @@ pub(crate) fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
     let git_dir =
         fs::canonicalize(&git_dir).with_context(|| format!("resolving {}", git_dir.display()))?;
     Ok(Some(git_dir))
+}
+
+/// Paths in raw `-z` diff output (`diff-tree`, `diff-index`) whose new
+/// side is a submodule entry (mode 160000): a gitlink that moved or was
+/// added. A deleted one is left out; open gives that back as it is.
+pub(crate) fn moved_gitlinks(raw: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut fields = raw.split('\0');
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        if meta.split(' ').nth(1) == Some("160000") {
+            found.push(path.to_string());
+        }
+    }
+    found
+}
+
+/// The refusal for submodules whose commit is not the one HEAD records.
+/// Open checks out HEAD's gitlink, so a commit made only in the submodule
+/// would be left in its reflog.
+pub(crate) fn moved_gitlink_reason(paths: &[String]) -> String {
+    format!(
+        "submodule {} is not at the commit HEAD records; commit the submodule change in the worktree first",
+        paths.join(", ")
+    )
 }
 
 /// Paths of the index's submodule entries (mode 160000).
@@ -1944,6 +1980,35 @@ mod tests {
             format!("{err:#}").contains("submodule lib changed while saving"),
             "{err:#}"
         );
+    }
+
+    /// The moved-tree check refuses a wip whose gitlink is not HEAD's, even
+    /// when the refusal before the save missed it: open's `reset` would put
+    /// HEAD's gitlink back.
+    #[test]
+    fn restore_check_refuses_moved_gitlink() {
+        let (tmp, wt, _home, _id) = submodule_case(|wt| {
+            git(
+                &wt.join("lib"),
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "moved",
+                ],
+            )
+        });
+        let dest = tmp.path().join("dest");
+        save_wip(&wt, "x").unwrap();
+        save_ignored(&wt, &dest, &none()).unwrap();
+        let wip = wip_commit(&wt, "x").unwrap();
+        match restore_check("x", &wt, &wip, &dest, &none()).unwrap() {
+            Verdict::Differs(reason) => assert!(reason.contains("submodule lib"), "{reason}"),
+            Verdict::Same(_) => panic!("a moved gitlink passed the check"),
+        }
     }
 
     /// `recover` checks an unmarked trash inside its submodules too.
