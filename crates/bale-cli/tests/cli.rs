@@ -889,6 +889,26 @@ fn git_hook_install_rewrites_stale_bale_path() {
     assert!(!hooks_dir(&env).join("post-checkout.pre-bale").exists());
 }
 
+/// A bale hook the user edited stays as it is, with a note naming it.
+#[test]
+fn git_hook_install_keeps_an_edited_bale_hook() {
+    let env = Env::new();
+    let hook = hooks_dir(&env).join("post-checkout");
+    install(&env, "git", true);
+    let edited = fs::read_to_string(&hook).unwrap() + "echo my-edit\n";
+    fs::write(&hook, &edited).unwrap();
+
+    let out = install(&env, "git", true);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), edited);
+    assert!(
+        stdout(&out).contains("left unchanged")
+            && stdout(&out).contains(&hook.display().to_string()),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stdout(&out).contains("wrote"), "{}", stdout(&out));
+}
+
 #[test]
 fn git_hook_notes_global_hooks_path() {
     let env = Env::new();

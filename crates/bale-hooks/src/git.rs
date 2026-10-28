@@ -73,6 +73,7 @@ fn render_hook(marker: &str, sub: &str, quoted: &str) -> String {
 
 /// Installs bale's post-checkout hook in `repo`'s hooks dir, moving a
 /// hook that is not bale's to `post-checkout.pre-bale` and chaining to it.
+/// A bale hook the user edited is left alone, as uninstall leaves it.
 pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     let g = Git::at(repo);
     let dir = hooks_dir(&g)?;
@@ -115,7 +116,15 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
                         display_path(&hook)
                     ))]));
                 }
-                // Ours, from another bale binary path: rewrite in place.
+                if !is_unedited_bale_hook(&current) {
+                    return Ok(Plan::new(vec![Step::Note(format!(
+                        "note: left unchanged: {} is bale's hook but was edited; to \
+                         reinstall, remove it and rerun",
+                        display_path(&hook)
+                    ))]));
+                }
+                // Ours, unedited, from another bale binary path or an older
+                // bale: rewrite in place.
             } else {
                 if fs::symlink_metadata(&prev).is_ok() {
                     bail!(
