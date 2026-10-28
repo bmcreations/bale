@@ -1,5 +1,6 @@
 pub mod config;
 pub mod detect;
+pub mod git;
 pub mod lock;
 pub mod registry;
 
