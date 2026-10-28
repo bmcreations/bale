@@ -1,9 +1,11 @@
 pub mod busy;
 pub mod config;
+pub mod derived_data;
 pub mod detect;
 pub mod git;
 pub mod idle;
 pub mod lock;
+pub mod ops;
 pub mod registry;
 
 use std::path::PathBuf;
