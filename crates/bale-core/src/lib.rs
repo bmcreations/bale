@@ -1,4 +1,5 @@
 pub mod config;
+pub mod detect;
 
 use std::path::PathBuf;
 
