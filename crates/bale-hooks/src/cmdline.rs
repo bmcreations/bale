@@ -94,6 +94,42 @@ pub(crate) fn bale_call(cmd: &str, args: &[&str]) -> Option<BaleCall> {
         .then_some(BaleCall::Wrapped)
 }
 
+/// `quoted` (bale's exe, sh-quoted) running `args`, only when the exe is
+/// there: status 0 without it, bale's status with it.
+pub(crate) fn sh_guarded(quoted: &str, args: &str) -> String {
+    format!("if [ -x {quoted} ]; then {quoted} {args}; fi")
+}
+
+/// `quoted` (bale's exe, cmd-quoted) running `args`, only when the exe is
+/// there.
+pub(crate) fn cmd_guarded(quoted: &str, args: &str) -> String {
+    format!("if exist {quoted} {quoted} {args}")
+}
+
+/// How `cmd` runs bale with `args`, counting the forms [`sh_guarded`] and
+/// [`cmd_guarded`] write as [`BaleCall::Plain`] when the guard and the call
+/// name the same bale exe.
+pub(crate) fn own_call(cmd: &str, args: &[&str]) -> Option<BaleCall> {
+    let call = bale_call(cmd, args)?;
+    if call == BaleCall::Plain {
+        return Some(call);
+    }
+    let w = words(cmd)?;
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    let tail = |rest: &[&str]| rest.iter().copied().eq(args.iter().copied());
+    let guarded = match w.as_slice() {
+        ["if", "[", "-x", guard, "]", ";", "then", exe, rest @ ..] => {
+            matches!(rest.split_last(), Some((&"fi", body))
+                if matches!(body.split_last(), Some((&";", a)) if tail(a)))
+                && guard == exe
+                && is_bale(exe)
+        }
+        ["if", "exist", guard, exe, rest @ ..] => tail(rest) && guard == exe && is_bale(exe),
+        _ => false,
+    };
+    Some(if guarded { BaleCall::Plain } else { call })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

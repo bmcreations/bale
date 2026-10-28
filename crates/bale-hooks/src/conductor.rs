@@ -20,7 +20,7 @@ use bale_core::BaleHome;
 use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
-use crate::cmdline::{bale_call, is_bale, words, BaleCall};
+use crate::cmdline::{bale_call, own_call, sh_guarded, BaleCall};
 use crate::install::{
     backup_key, backup_path, read_config, tracked_by_git, tracked_note, Plan, Step,
 };
@@ -65,7 +65,7 @@ pub fn archive(home: &BaleHome) -> ExitCode {
 /// bale present, bale's status is the command's.
 fn hook_command(exe: &Path, kind: &str) -> String {
     let exe = sh_quote(&display_path(exe).replace('\\', "/"));
-    format!("if [ -x {exe} ]; then {exe} hook conductor {kind}; fi")
+    sh_guarded(&exe, &format!("hook conductor {kind}"))
 }
 
 /// `existing` with bale's `want` chained after it. The user's script runs
@@ -230,18 +230,7 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
 /// the guarded form [`hook_command`] writes, or the bare call earlier
 /// installs wrote.
 fn is_bale_script(cmd: &str, kind: &str) -> bool {
-    if bale_call(cmd, &["hook", "conductor", kind]) == Some(BaleCall::Plain) {
-        return true;
-    }
-    let Some(w) = words(cmd) else {
-        return false;
-    };
-    let w: Vec<&str> = w.iter().map(String::as_str).collect();
-    matches!(
-        w.as_slice(),
-        ["if", "[", "-x", guard, "]", ";", "then", exe, "hook", "conductor", k, ";", "fi"]
-            if guard == exe && is_bale(exe) && *k == kind
-    )
+    own_call(cmd, &["hook", "conductor", kind]) == Some(BaleCall::Plain)
 }
 
 /// `value` split the way [`chain`] built it: the user's script (`None` when

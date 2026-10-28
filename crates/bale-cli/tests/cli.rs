@@ -2059,7 +2059,7 @@ fn install_cursor_creates_file() {
     let cmds = v["setup-worktree"].as_array().unwrap();
     assert_eq!(cmds.len(), 1, "{v}");
     assert!(
-        cmds[0].as_str().unwrap().ends_with(" hook cursor setup"),
+        cmds[0].as_str().unwrap().contains(" hook cursor setup"),
         "{v}"
     );
 }
@@ -2087,7 +2087,7 @@ fn install_cursor_appends_to_existing_array() {
     assert_eq!(cmds.len(), 2, "{text}");
     assert_eq!(cmds[0], "npm install");
     assert!(
-        cmds[1].as_str().unwrap().ends_with(" hook cursor setup"),
+        cmds[1].as_str().unwrap().contains(" hook cursor setup"),
         "{text}"
     );
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -2133,9 +2133,60 @@ fn install_cursor_finds_bale_in_any_setup_key_by_its_words() {
     let cmds = v["setup-worktree"].as_array().unwrap();
     assert_eq!(cmds.len(), 2, "{v}");
     assert!(
-        cmds[1].as_str().unwrap().ends_with("' hook cursor setup"),
+        cmds[1].as_str().unwrap().contains("' hook cursor setup"),
         "{v}"
     );
+}
+
+/// bale's entry under the key Cursor runs, in the bare form earlier installs
+/// wrote or from another path, is repointed to this exe in the guarded form;
+/// uninstall takes either form out.
+#[test]
+fn install_cursor_repoints_and_guards_bales_entry() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let exe = env!("CARGO_BIN_EXE_bale");
+    let (bare, guarded) = if cfg!(windows) {
+        let q = format!("\"{exe}\"");
+        (
+            format!("{q} hook cursor setup"),
+            format!("if exist {q} {q} hook cursor setup"),
+        )
+    } else {
+        let q = format!("'{exe}'");
+        (
+            format!("{q} hook cursor setup"),
+            format!("if [ -x {q} ]; then {q} hook cursor setup; fi"),
+        )
+    };
+    for old in [bare.clone(), "'/old/bale' hook cursor setup".to_string()] {
+        let text = serde_json::json!({"setup-worktree": ["npm i", old]}).to_string();
+        fs::write(&path, &text).unwrap();
+        let out = install(&env, "cursor", true);
+        assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["setup-worktree"],
+            serde_json::json!(["npm i", guarded]),
+            "{old}"
+        );
+        let out = install(&env, "cursor", true);
+        assert!(
+            stdout(&out).contains("already installed"),
+            "{}",
+            stdout(&out)
+        );
+    }
+
+    for entry in [bare, guarded] {
+        let text = serde_json::json!({"setup-worktree": ["npm i", entry]}).to_string();
+        fs::write(&path, &text).unwrap();
+        let out = uninstall(&env, "cursor", true);
+        assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["setup-worktree"], serde_json::json!(["npm i"]), "{entry}");
+    }
 }
 
 #[test]

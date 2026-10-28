@@ -22,7 +22,7 @@ use bale_core::BaleHome;
 use serde_json::{Map, Value};
 
 use crate::claude::sh_quote;
-use crate::cmdline::{bale_call, BaleCall};
+use crate::cmdline::{cmd_guarded, sh_guarded, BaleCall};
 use crate::install::{
     backup_key, backup_path, json_uninstall_steps, read_config, windows_quote, Plan, Step,
 };
@@ -59,13 +59,22 @@ pub fn setup(home: &BaleHome) -> ExitCode {
 /// shell Cursor uses for the OS the entry is installed for. The docs don't
 /// name the Windows shell; their array example uses cmd-style `%VAR%`, so the
 /// exe is quoted for cmd.exe with no PowerShell `& ` prefix, which cmd rejects.
+/// The entry runs bale only when the exe is there: the file is usually
+/// committed, and a teammate without bale at this path must not get a
+/// failing setup.
 fn hook_command(exe: &Path, windows: bool) -> String {
-    let exe = if windows {
-        windows_quote(&display_path(exe))
+    let args = HOOK_ARGS.join(" ");
+    if windows {
+        cmd_guarded(&windows_quote(&display_path(exe)), &args)
     } else {
-        sh_quote(&display_path(exe).replace('\\', "/"))
-    };
-    format!("{exe} hook cursor setup")
+        sh_guarded(&sh_quote(&display_path(exe).replace('\\', "/")), &args)
+    }
+}
+
+/// How `cmd` runs bale's setup: [`BaleCall::Plain`] for bale's own entry,
+/// guarded or in the bare form earlier installs wrote, from any exe path.
+fn own_call(cmd: &str) -> Option<BaleCall> {
+    crate::cmdline::own_call(cmd, &HOOK_ARGS)
 }
 
 /// The key bale appends to: the OS-specific one when the file has it (it
@@ -132,15 +141,30 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
             .as_array()?
             .iter()
             .filter_map(Value::as_str)
-            .find(|c| bale_call(c, &HOOK_ARGS).is_some())
+            .find(|c| own_call(c).is_some())
             .map(|c| (k, c.to_string()))
     });
+    let mut repoint = false;
     match existing {
         Some((k, c)) if k == key && c == want => {
             return Ok(Plan::new(vec![Step::Note(format!(
                 "{}: Cursor hook already installed",
                 display_path(&path)
             ))]));
+        }
+        Some((k, c)) if k == key && own_call(&c) == Some(BaleCall::Plain) => {
+            // bale's own entry, bare or from another exe path: point it here,
+            // guarded, in its place.
+            let commands = obj
+                .get_mut(key)
+                .and_then(Value::as_array_mut)
+                .expect("the entry was found in this array");
+            for cmd in commands.iter_mut() {
+                if cmd.as_str() == Some(c.as_str()) {
+                    *cmd = Value::String(want.clone());
+                }
+            }
+            repoint = true;
         }
         Some((k, c)) => {
             // bale from another path, wrapped by the user, or under a key
@@ -154,18 +178,20 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
         }
         None => {}
     }
-    let commands = obj
-        .entry(key)
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .with_context(|| {
-            format!(
-                "\"{key}\" in {} is not an array of commands (a script path?); \
+    if !repoint {
+        let commands = obj
+            .entry(key)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .with_context(|| {
+                format!(
+                    "\"{key}\" in {} is not an array of commands (a script path?); \
                  add `{want}` to that script by hand",
-                path.display()
-            )
-        })?;
-    commands.push(Value::String(want));
+                    path.display()
+                )
+            })?;
+        commands.push(Value::String(want));
+    }
 
     let after = format!("{}\n", serde_json::to_string_pretty(&root)?);
     let dir: PathBuf = path
@@ -179,15 +205,18 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
             before,
             after,
             mode,
-            backup: Some(backup_path(
-                backups,
-                &backup_key(repo, &Path::new(".cursor").join("worktrees.json")),
-            )),
+            // A repoint is not a first install: the file already ran bale.
+            backup: (!repoint).then(|| {
+                backup_path(
+                    backups,
+                    &backup_key(repo, &Path::new(".cursor").join("worktrees.json")),
+                )
+            }),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Cursor worktree of this \
-             repo runs bale. The entry holds this machine's absolute path to bale, so \
-             teammates need bale at the same path",
+             repo runs bale. The entry holds this machine's absolute path to bale; it \
+             is skipped where bale is not at that path",
             display_path(&path)
         )),
     ]))
@@ -228,22 +257,17 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
             continue;
         };
         let n = commands.len();
-        commands.retain(|c| {
-            match c
-                .as_str()
-                .and_then(|c| Some((c, bale_call(c, &HOOK_ARGS)?)))
-            {
-                Some((_, BaleCall::Plain)) => false,
-                Some((c, BaleCall::Wrapped)) => {
-                    steps.push(Step::Note(format!(
-                        "note: left unchanged in {}: {key} entry `{c}` runs bale but is not \
+        commands.retain(|c| match c.as_str().and_then(|c| Some((c, own_call(c)?))) {
+            Some((_, BaleCall::Plain)) => false,
+            Some((c, BaleCall::Wrapped)) => {
+                steps.push(Step::Note(format!(
+                    "note: left unchanged in {}: {key} entry `{c}` runs bale but is not \
                      bale's plain entry; remove it by hand",
-                        display_path(&path)
-                    )));
-                    true
-                }
-                None => true,
+                    display_path(&path)
+                )));
+                true
             }
+            None => true,
         });
         if commands.len() != n {
             changed = true;
@@ -307,25 +331,57 @@ mod tests {
         assert_eq!(v["setup-worktree-unix"], serde_json::json!(["npm i"]));
         assert_eq!(
             v["setup-worktree-windows"],
-            serde_json::json!(["npm.cmd i", "\"/opt/bale\" hook cursor setup"])
+            serde_json::json!([
+                "npm.cmd i",
+                "if exist \"/opt/bale\" \"/opt/bale\" hook cursor setup"
+            ])
         );
     }
 
     #[test]
-    fn hook_command_quotes_the_exe_per_shell() {
+    fn hook_command_quotes_and_guards_the_exe_per_shell() {
+        let q = r"'/opt/it'\''s/bale'";
         assert_eq!(
             hook_command(Path::new("/opt/it's/bale"), false),
-            r"'/opt/it'\''s/bale' hook cursor setup"
+            format!("if [ -x {q} ]; then {q} hook cursor setup; fi")
         );
+        let q = r#""C:\Program Files\bale\bale.exe""#;
         assert_eq!(
             hook_command(Path::new(r"C:\Program Files\bale\bale.exe"), true),
-            r#""C:\Program Files\bale\bale.exe" hook cursor setup"#
+            format!("if exist {q} {q} hook cursor setup")
         );
     }
 
+    /// bale's entry in the guarded forms and in the bare form earlier
+    /// installs wrote, for sh and cmd, counts as bale's own.
     #[test]
-    fn windows_entry_is_recognised_as_bales() {
-        let cmd = hook_command(Path::new(r"C:\Program Files\bale\bale.exe"), true);
-        assert_eq!(bale_call(&cmd, &HOOK_ARGS), Some(BaleCall::Plain));
+    fn guarded_and_bare_entries_are_bales() {
+        let win = Path::new(r"C:\Program Files\bale\bale.exe");
+        for cmd in [
+            hook_command(Path::new("/opt/bale"), false),
+            hook_command(win, true),
+            "'/opt/bale' hook cursor setup".to_string(),
+            r#""C:\Program Files\bale\bale.exe" hook cursor setup"#.to_string(),
+        ] {
+            assert_eq!(own_call(&cmd), Some(BaleCall::Plain), "{cmd}");
+        }
+        for mixed in [
+            "if [ -x '/a/bale' ]; then '/b/bale' hook cursor setup; fi",
+            r#"if exist "C:\a\bale.exe" "C:\b\bale.exe" hook cursor setup"#,
+        ] {
+            assert_eq!(own_call(mixed), Some(BaleCall::Wrapped), "{mixed}");
+        }
+    }
+
+    /// Without bale at the recorded path, the sh entry exits 0.
+    #[cfg(unix)]
+    #[test]
+    fn unix_entry_exits_0_when_bale_is_missing() {
+        let cmd = hook_command(Path::new("/nonexistent/bale"), false);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
     }
 }
