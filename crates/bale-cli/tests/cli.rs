@@ -306,6 +306,51 @@ fn post_checkout_registers_new_worktree_only() {
     assert!(!env.is_registered(&env.repo));
 }
 
+#[test]
+fn adopt_registers_a_linked_worktree() {
+    let env = Env::new();
+    let wt = env.add_worktree("adopted");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.trim_end().ends_with(": hot"), "{text:?}");
+    assert!(env.is_registered(&wt));
+}
+
+#[test]
+fn adopt_refuses_main_checkout() {
+    let env = Env::new();
+    let out = env.bale(&env.repo, &["adopt", env.repo.to_str().unwrap()], None);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("main checkout"), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+}
+
+#[test]
+fn adopt_defaults_to_cwd() {
+    let env = Env::new();
+    let wt = env.add_worktree("cwd-adopted");
+    let out = env.bale(&wt, &["adopt"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.is_registered(&wt));
+}
+
+#[test]
+fn new_print_path_prints_only_the_path() {
+    let env = Env::new();
+    let out = env.bale(
+        &env.repo,
+        &["new", "printed", "--print-path", "--branch", "printed-b"],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = single_path(&out);
+    assert!(path.is_dir(), "{path:?}");
+    assert!(env.is_registered(&path));
+    assert_eq!(path, canon(&path), "printed path is canonical");
+    assert!(path.ends_with("printed"), "{path:?}");
+}
+
 /// Writes an executable hook script.
 fn write_hook(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();

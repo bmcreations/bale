@@ -12,7 +12,7 @@ use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
-use bale_core::ops::up::{resolve, up_report, Outcome};
+use bale_core::ops::up::{register, resolve, up_report, Outcome};
 use bale_core::registry::Registry;
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
@@ -70,6 +70,15 @@ enum Command {
         /// Branch to check out, created when missing (default: the name).
         #[arg(long)]
         branch: Option<String>,
+        /// Print only the new worktree's path.
+        #[arg(long)]
+        print_path: bool,
+    },
+    /// Register an existing linked worktree.
+    Adopt {
+        /// The worktree checkout (default: the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Forget worktrees that are gone, and clear stale leftovers on hot ones.
     Gc {
@@ -143,12 +152,23 @@ fn main() -> ExitCode {
         }),
         Command::Sweep { dry_run } => cmd_sweep(&home, dry_run).map(|()| ExitCode::SUCCESS),
         Command::Migrate { repos, apply } => cmd_migrate(&home, &repos, apply),
-        Command::New { name, repo, branch } => {
-            new_workspace(&home, &repo, &name, branch.as_deref()).map(|r| {
+        Command::New {
+            name,
+            repo,
+            branch,
+            print_path,
+        } => new_workspace(&home, &repo, &name, branch.as_deref()).map(|r| {
+            if print_path {
+                println!("{}", r.path.display());
+            } else {
                 println!("{}: {}", r.id, r.path.display());
-                ExitCode::SUCCESS
-            })
-        }
+            }
+            ExitCode::SUCCESS
+        }),
+        Command::Adopt { path } => register(&home, &path).map(|r| {
+            println!("{}: {}", r.id, r.level.name());
+            ExitCode::SUCCESS
+        }),
         Command::Gc { dry_run } => gc(&home, dry_run).map(|report| {
             for (to_stderr, line) in gc_lines(&report, dry_run) {
                 if to_stderr {
