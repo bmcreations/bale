@@ -203,7 +203,8 @@ against what was captured before it is used.
 5. Rename each regenerable directory to a trash name inside the workspace, then delete the trash names.
    This makes a crash leave either a full directory or a trash name that the next run finishes deleting.
    A directory with a regenerable name that holds files git tracks, or untracked files that are not
-   ignored, is kept and reported: it is source, not build output.
+   ignored, is kept and reported: it is source, not build output. A regenerable-named entry that is itself
+   untracked and not ignored, including a symlink, is kept the same way.
 6. Remove the workspace's external build output too. That includes Xcode DerivedData folders under
    `~/Library/Developer/Xcode/DerivedData` whose `info.plist` `WorkspacePath` points into this workspace.
    A folder with a missing or unreadable `WorkspacePath` is left alone. So is global DerivedData that matches
