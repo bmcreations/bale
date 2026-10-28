@@ -100,22 +100,34 @@ fn report(id: &str, outcome: Outcome) -> ExitCode {
     }
 }
 
-/// One line per workspace; rows needing attention also go to stderr.
+/// One line per workspace: on stdout, or on stderr when it needs attention.
 fn cmd_sweep(home: &BaleHome, dry_run: bool) -> Result<()> {
     for (id, action, result) in sweep(home, dry_run)? {
-        let name = match action {
-            Action::Keep => "keep",
-            Action::Up => "up",
-            Action::Cold => "cold",
-            Action::Report(_) => "report",
-        };
-        let line = format!("{id}  {name}  {result}");
-        println!("{line}");
-        if matches!(action, Action::Report(_)) || result.starts_with("error: ") {
-            eprintln!("bale: {line}");
+        for (to_stderr, line) in sweep_lines(&id, &action, &result) {
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
     }
     Ok(())
+}
+
+/// The lines for one sweep row, each flagged `true` when it goes to stderr.
+fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
+    let name = match action {
+        Action::Keep => "keep",
+        Action::Up => "up",
+        Action::Cold => "cold",
+        Action::Report(_) => "report",
+    };
+    let line = format!("{id}  {name}  {result}");
+    if matches!(action, Action::Report(_)) || result.starts_with("error: ") {
+        vec![(true, format!("bale: {line}"))]
+    } else {
+        vec![(false, line)]
+    }
 }
 
 fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
@@ -162,5 +174,35 @@ fn ago(t: SystemTime) -> String {
         s if s < 3600 => format!("{}m ago", s / 60),
         s if s < 86400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count(lines: &[(bool, String)], text: &str) -> usize {
+        lines.iter().filter(|(_, l)| l.contains(text)).count()
+    }
+
+    #[test]
+    fn report_text_is_printed_once_on_stderr() {
+        let text = "git status failed in /x: fatal: not a git repository";
+        let lines = sweep_lines("abc", &Action::Report(text.into()), text);
+        assert_eq!(count(&lines, text), 1, "{lines:?}");
+        assert!(lines.iter().all(|(err, _)| *err), "{lines:?}");
+    }
+
+    #[test]
+    fn error_result_is_printed_once_on_stderr() {
+        let lines = sweep_lines("abc", &Action::Up, "error: boom");
+        assert_eq!(count(&lines, "boom"), 1, "{lines:?}");
+        assert!(lines.iter().all(|(err, _)| *err), "{lines:?}");
+    }
+
+    #[test]
+    fn ordinary_row_goes_to_stdout() {
+        let lines = sweep_lines("abc", &Action::Up, "baled");
+        assert_eq!(lines, vec![(false, "abc  up  baled".to_string())]);
     }
 }

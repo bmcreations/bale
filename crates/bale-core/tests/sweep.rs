@@ -276,3 +276,42 @@ fn global_threshold_applies_without_repo_config() {
     assert_eq!(row(&rows, &id).1, Action::Keep, "{rows:?}");
     assert_eq!(level(&fx, &id), Level::Hot);
 }
+
+#[test]
+fn corrupt_record_is_reported_and_others_processed() {
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx, "wt");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    fs::write(fx.home().records_dir().join("garbage.json"), "not json").unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let (_, action, result) = row(&rows, "garbage");
+    assert!(
+        matches!(action, Action::Report(t) if t.starts_with("corrupt record: ")),
+        "{rows:?}"
+    );
+    assert!(result.starts_with("corrupt record: "), "{result}");
+    assert_eq!(row(&rows, &id).1, Action::Keep);
+}
+
+#[test]
+fn malformed_config_does_not_hide_level_only_actions() {
+    let fx = Fixture::new();
+    let opening = fx.add_worktree("opening", "opening");
+    let cold_wt = fx.add_worktree("cold", "cold");
+    let opening_id = register(&fx.home(), &opening).unwrap().id;
+    let cold_id = register(&fx.home(), &cold_wt).unwrap().id;
+    fs::remove_dir_all(&opening).unwrap();
+    set_level(&fx, &opening_id, Level::Opening);
+    set_level(&fx, &cold_id, Level::Cold);
+    global_config(&fx.home(), "idle_baled_hours = 'x'\n");
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let (_, _, result) = row(&rows, &opening_id);
+    assert!(
+        result.contains(&format!("run `bale open {opening_id}`")),
+        "{result}"
+    );
+    assert_eq!(row(&rows, &cold_id).1, Action::Keep);
+}

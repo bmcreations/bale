@@ -129,6 +129,28 @@ impl Registry {
 
     /// Reads every record; a corrupt one is an error naming its file.
     pub fn all(&self) -> Result<Vec<Record>> {
+        self.record_paths()?.iter().map(|p| Self::read(p)).collect()
+    }
+
+    /// Reads every record separately, pairing each result with its file
+    /// stem, so one corrupt record does not hide the others. Errs only when
+    /// the registry directory cannot be listed.
+    pub fn all_lenient(&self) -> Result<Vec<(String, Result<Record>)>> {
+        Ok(self
+            .record_paths()?
+            .into_iter()
+            .map(|p| {
+                let stem = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (stem, Self::read(&p))
+            })
+            .collect())
+    }
+
+    /// The `*.json` files in the records dir, sorted; none when it is absent.
+    fn record_paths(&self) -> Result<Vec<PathBuf>> {
         let dir = self.home.records_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
@@ -137,12 +159,14 @@ impl Registry {
         };
         let mut paths = Vec::new();
         for entry in entries {
-            let path = entry?.path();
+            let path = entry
+                .with_context(|| format!("reading {}", dir.display()))?
+                .path();
             if path.extension().is_some_and(|e| e == "json") {
                 paths.push(path);
             }
         }
         paths.sort();
-        paths.iter().map(|p| Self::read(p)).collect()
+        Ok(paths)
     }
 }

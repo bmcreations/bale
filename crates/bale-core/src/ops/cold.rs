@@ -45,6 +45,18 @@ pub struct SavedFile {
 /// `$BALE_HOME/<id>/`, verifies it, and removes the checkout. A record left
 /// `Cooling` by a crash resumes from what is on disk.
 pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
+    cold_with(home, id, false)
+}
+
+/// `cold` for unattended callers: once the workspace lock is held, a tree
+/// with uncommitted changes, or whose state git cannot report, is left
+/// untouched as `Skipped("dirty")`. A `Cooling` record resumes regardless,
+/// since its work is already being saved.
+pub fn cold_if_clean(home: &BaleHome, id: &str) -> Result<Outcome> {
+    cold_with(home, id, true)
+}
+
+fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(Outcome::Skipped("locked".into()));
     };
@@ -61,6 +73,9 @@ pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
 
     let root = fs::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
+    if require_clean && git::is_dirty(&root).unwrap_or(true) {
+        return Ok(Outcome::Skipped("dirty".into()));
+    }
     if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
         return Ok(Outcome::Skipped(reason));
     }

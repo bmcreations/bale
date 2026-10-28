@@ -1,7 +1,7 @@
 mod support;
 
 use bale_core::git::worktrees;
-use bale_core::ops::cold::{cold, save_ignored, save_wip};
+use bale_core::ops::cold::{cold, cold_if_clean, save_ignored, save_wip};
 use bale_core::ops::up::{register, Outcome};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
@@ -814,6 +814,45 @@ fn submodule_prefixed_deny_applies_inside_submodule() {
     let sub = Fixture::new();
     let (wt, id) = submodule_cache_with_deny(&fx, &sub, "lib/cache");
     let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
+}
+
+#[test]
+fn cold_if_clean_skips_dirty_tree_untouched() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let out = cold_if_clean(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Skipped("dirty".into()));
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert!(wt.join("build/out.bin").exists());
+    assert_eq!(git(&fx.repo, &["for-each-ref", "refs/bale/"]), "");
+    assert_eq!(linked(&fx).locked, None);
+    assert!(!fx.home().saved_dir(&id).exists());
+}
+
+#[test]
+fn cold_if_clean_treats_failed_probe_as_dirty() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    fs::write(wt.join(".git"), "gitdir: /nonexistent/bale-test\n").unwrap();
+
+    let out = cold_if_clean(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Skipped("dirty".into()));
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert!(wt.join("f").exists());
+}
+
+#[test]
+fn cold_if_clean_colds_clean_tree() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let out = cold_if_clean(&fx.home(), &id).unwrap();
     assert_eq!(out, Outcome::Done(Level::Cold));
     assert!(!wt.exists());
 }
