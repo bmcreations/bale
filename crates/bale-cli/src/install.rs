@@ -748,16 +748,50 @@ fn make_executable(_path: &Path) -> Result<()> {
 
 /// Args joined for display, double-quoting any that need it.
 fn shell_words(args: &[String]) -> String {
+    shell_words_for(args, cfg!(windows))
+}
+
+/// `args` as one command line. An arg with a space, tab or quote is
+/// double-quoted. For sh a backslash in it is escaped; on Windows a
+/// backslash is literal except in a run before a `"`, which is doubled, so a
+/// path prints as typed.
+fn shell_words_for(args: &[String], windows: bool) -> String {
     args.iter()
         .map(|a| {
-            if a.is_empty() || a.contains([' ', '"', '\'', '\t']) {
-                format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
+            if !a.is_empty() && !a.contains([' ', '"', '\'', '\t']) {
                 a.clone()
+            } else if windows {
+                windows_quote(a)
+            } else {
+                format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\""))
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `a` double-quoted the way `CommandLineToArgvW` reads it back.
+fn windows_quote(a: &str) -> String {
+    let mut out = String::from('"');
+    let mut slashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
 }
 
 /// A line diff of `before` to `after`: changed lines with two lines of context.
@@ -833,6 +867,25 @@ mod tests {
             "/opt/homebrew/Cellar/bale/0.3.1/bin/bale"
         )));
         assert!(!is_unstable_location(Path::new("/opt/homebrew/bin/bale")));
+    }
+
+    #[test]
+    fn windows_words_keep_path_backslashes() {
+        let args = [
+            "/TR".to_string(),
+            r#""D:\a b\bale.exe" sweep"#.to_string(),
+            r"C:\dir with space\".to_string(),
+        ];
+        assert_eq!(
+            shell_words_for(&args, true),
+            r#"/TR "\"D:\a b\bale.exe\" sweep" "C:\dir with space\\""#
+        );
+    }
+
+    #[test]
+    fn unix_words_escape_backslashes() {
+        let args = [r"a b\c".to_string()];
+        assert_eq!(shell_words_for(&args, false), r#""a b\\c""#);
     }
 
     #[test]
