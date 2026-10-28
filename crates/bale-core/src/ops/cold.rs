@@ -147,10 +147,15 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
         "--recursive",
         r#"echo "$displaypath""#,
     ])?;
-    let root_regen = regen_dirs(root);
+    let subs: Vec<&str> = subs.lines().filter(|l| !l.is_empty()).collect();
+    let root_regen = if subs.is_empty() {
+        Vec::new()
+    } else {
+        regen_dirs(root)
+    };
     let mut ignored = Vec::new();
     let mut embedded = Vec::new();
-    for sub in subs.lines().filter(|l| !l.is_empty()) {
+    for sub in subs {
         let dir = root.join(sub);
         if fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir()) {
             embedded.push(sub);
@@ -158,7 +163,7 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
         }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
-        let scan = scan_ignored_with(&dir, deny, &regen)?;
+        let scan = scan_ignored_with(&dir, &submodule_deny(deny, sub), &regen)?;
         if !scan.entries.is_empty() || !scan.nested.is_empty() {
             ignored.push(sub);
         }
@@ -549,6 +554,28 @@ fn scan_ignored(dir: &Path, deny: &[String]) -> Result<IgnoredScan> {
     scan_ignored_with(dir, deny, &regen_dirs(dir))
 }
 
+/// `deny` as it applies inside the submodule at `sub` (relative to the
+/// worktree root): bare names as they are; a slashed entry only when it lies
+/// under `sub/`, rebased onto the submodule root.
+fn submodule_deny(deny: &[String], sub: &str) -> Vec<String> {
+    let sub = sub.trim_end_matches('/');
+    deny.iter()
+        .filter_map(|d| {
+            if !d.contains('/') {
+                return Some(d.clone());
+            }
+            let d = d.trim_end_matches('/');
+            if d == sub {
+                // The whole submodule; "/" trims to "", a prefix of everything.
+                return Some("/".to_string());
+            }
+            d.strip_prefix(sub)?
+                .strip_prefix('/')
+                .map(|rest| format!("{rest}/"))
+        })
+        .collect()
+}
+
 /// Regenerable dirs under `dir` for the build systems detected there.
 fn regen_dirs(dir: &Path) -> Vec<PathBuf> {
     regenerable_dirs(dir, &detect(dir), &no_extras())
@@ -888,6 +915,27 @@ mod tests {
         assert!(
             format!("{err:#}").contains("changed while saving"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn submodule_deny_rebases_only_entries_under_the_submodule() {
+        let deny: Vec<String> = [
+            "node",
+            "cache/x",
+            "lib/cache",
+            "lib",
+            "lib/",
+            "libx/a",
+            "lib/sub/y/",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            submodule_deny(&deny, "lib"),
+            ["node", "cache/", "lib", "/", "sub/y/"]
+                .map(String::from)
+                .to_vec()
         );
     }
 

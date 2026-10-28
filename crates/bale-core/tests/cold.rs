@@ -492,10 +492,10 @@ fn save_ignored_refuses_nested_repo() {
     assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
 }
 
-/// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`
-/// and `build/`.
+/// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`,
+/// `build/` and `cache/`.
 fn worktree_with_submodule(fx: &Fixture, sub: &Fixture) -> PathBuf {
-    fs::write(sub.repo.join(".gitignore"), ".env\nbuild/\n").unwrap();
+    fs::write(sub.repo.join(".gitignore"), ".env\nbuild/\ncache/\n").unwrap();
     git(&sub.repo, &["add", ".gitignore"]);
     git(&sub.repo, &["commit", "-m", "ignore"]);
     let wt = fx.add_worktree("wt", "feature");
@@ -637,6 +637,13 @@ fn submodule_with_only_regenerable_output_goes_cold() {
     assert_eq!(level(&fx, &id), Level::Cold);
 }
 
+/// Root ignores permission bits, so the chmod-based tests prove nothing.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    let out = std::process::Command::new("id").arg("-u").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim() == "0"
+}
+
 #[cfg(unix)]
 fn chmod(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -646,6 +653,9 @@ fn chmod(path: &Path, mode: u32) {
 #[cfg(unix)]
 #[test]
 fn cold_skips_unreadable_dir_under_untracked_dir() {
+    if running_as_root() {
+        return;
+    }
     let fx = Fixture::new();
     let wt = fx.add_worktree("wt", "feature");
     fs::create_dir_all(wt.join("u/locked")).unwrap();
@@ -668,6 +678,9 @@ fn cold_skips_unreadable_dir_under_untracked_dir() {
 #[cfg(unix)]
 #[test]
 fn recovery_finishes_partly_removed_trash() {
+    if running_as_root() {
+        return;
+    }
     let fx = Fixture::new();
     let wt = dirty_worktree(&fx);
     // remove_dir_all empties `locked/inner`, then cannot unlink it from
@@ -761,4 +774,46 @@ fn recovery_keeps_trash_without_git_entry() {
         "untracked\n"
     );
     assert_eq!(level(&fx, &id), Level::Cooling);
+}
+
+/// A submodule `lib` holding ignored `lib/cache/x/secret`, with the machine
+/// config denylist set to `deny`.
+fn submodule_cache_with_deny(fx: &Fixture, sub: &Fixture, deny: &str) -> (PathBuf, String) {
+    let wt = worktree_with_submodule(fx, sub);
+    fs::create_dir_all(wt.join("lib/cache/x")).unwrap();
+    fs::write(wt.join("lib/cache/x/secret"), "S=1\n").unwrap();
+    fs::create_dir_all(&fx.home().0).unwrap();
+    fs::write(
+        fx.home().0.join("config.toml"),
+        format!("ignored_denylist = [\"{deny}\"]\n"),
+    )
+    .unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    (wt, id)
+}
+
+#[test]
+fn root_slashed_deny_does_not_apply_inside_submodule() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let (wt, id) = submodule_cache_with_deny(&fx, &sub, "cache/x");
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib")),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("lib/cache/x/secret")).unwrap(),
+        "S=1\n"
+    );
+}
+
+#[test]
+fn submodule_prefixed_deny_applies_inside_submodule() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let (wt, id) = submodule_cache_with_deny(&fx, &sub, "lib/cache");
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
 }
