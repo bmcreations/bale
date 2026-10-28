@@ -136,6 +136,26 @@ fn cold_saves_everything_and_removes_dir() {
 }
 
 #[test]
+fn user_locked_tree_is_skipped_untouched() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &["worktree", "lock", "--reason", "mine", wt.to_str().unwrap()],
+    );
+    assert_eq!(
+        cold(&fx.home(), &id).unwrap(),
+        Outcome::Skipped("locked: mine".into())
+    );
+    assert!(wt.join("build/out.bin").exists());
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert_eq!(linked(&fx).locked.as_deref(), Some("mine"));
+    assert!(git(&fx.repo, &["for-each-ref", "refs/bale/"]).is_empty());
+}
+
+#[test]
 fn cold_refuses_main_checkout() {
     let fx = Fixture::new();
     let root = fs::canonicalize(&fx.repo).unwrap();

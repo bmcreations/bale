@@ -82,6 +82,17 @@ pub struct WorktreeInfo {
     pub prunable: bool,
 }
 
+impl WorktreeInfo {
+    /// The skip reason for a lock someone other than bale holds, if any.
+    pub fn foreign_lock(&self) -> Option<String> {
+        match self.locked.as_deref() {
+            None | Some(LOCK_REASON) => None,
+            Some("") => Some("locked: no reason given".into()),
+            Some(reason) => Some(format!("locked: {reason}")),
+        }
+    }
+}
+
 /// Parses `git worktree list --porcelain`; the first entry is the main worktree.
 pub fn worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>> {
     let out = Git::at(repo).run(&["worktree", "list", "--porcelain"])?;
@@ -142,7 +153,8 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
         .is_empty())
 }
 
-fn find_worktree(repo: &Path, path: &Path) -> Result<WorktreeInfo> {
+/// The entry `git worktree list` in `repo` gives for `path`.
+pub fn find_worktree(repo: &Path, path: &Path) -> Result<WorktreeInfo> {
     let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     worktrees(repo)?
         .into_iter()
@@ -150,10 +162,14 @@ fn find_worktree(repo: &Path, path: &Path) -> Result<WorktreeInfo> {
         .with_context(|| format!("{} is not a worktree of {}", path.display(), repo.display()))
 }
 
-/// Locks the worktree with bale's reason. An existing lock, whatever its
-/// reason, counts as success and is left untouched.
+/// Locks the worktree with bale's reason. An existing bale lock counts as
+/// success; a lock with any other reason is left untouched and is an error.
 pub fn lock_worktree(repo: &Path, path: &Path) -> Result<()> {
-    if find_worktree(repo, path)?.locked.is_some() {
+    let info = find_worktree(repo, path)?;
+    if let Some(reason) = info.foreign_lock() {
+        bail!("{} is {reason}", path.display());
+    }
+    if info.locked.is_some() {
         return Ok(());
     }
     let p = path.to_string_lossy();

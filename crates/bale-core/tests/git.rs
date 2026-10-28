@@ -51,7 +51,8 @@ fn lock_respects_foreign_lock() {
             wt.to_str().unwrap(),
         ],
     );
-    git::lock_worktree(&fx.repo, &wt).unwrap();
+    let err = git::lock_worktree(&fx.repo, &wt).unwrap_err();
+    assert!(format!("{err:#}").contains("someone else"), "{err:#}");
     assert!(!git::unlock_worktree_if_ours(&fx.repo, &wt).unwrap());
     let list = git::worktrees(&fx.repo).unwrap();
     let w = list.iter().find(|w| !w.is_main).unwrap();

@@ -139,6 +139,9 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
         Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
+            if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
+                return Ok(Outcome::Skipped(reason));
+            }
             let holders = busy_holders(&root)?;
             if !holders.is_empty() {
                 return Ok(Outcome::Busy(holders));

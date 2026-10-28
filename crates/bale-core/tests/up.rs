@@ -135,6 +135,33 @@ fn recovers_from_crash() {
     assert_eq!(level(&fx, &rec.id), Level::Baled);
 }
 
+fn lock(fx: &Fixture, wt: &Path, reason: Option<&str>) {
+    let mut args = vec!["worktree", "lock"];
+    if let Some(r) = reason {
+        args.extend(["--reason", r]);
+    }
+    args.push(wt.to_str().unwrap());
+    support::git(&fx.repo, &args);
+}
+
+#[test]
+fn user_locked_tree_is_skipped_untouched() {
+    for (reason, want) in [
+        (Some("mine"), "locked: mine"),
+        (None, "locked: no reason given"),
+    ] {
+        let fx = Fixture::new();
+        let wt = gradle_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        lock(&fx, &wt, reason);
+        let out = up(&fx.home(), &id).unwrap();
+        assert_eq!(out, Outcome::Skipped(want.into()));
+        assert!(wt.join("app/build/big.bin").exists());
+        assert_eq!(level(&fx, &id), Level::Hot);
+        assert_eq!(linked_lock(&fx).as_deref(), Some(reason.unwrap_or("")));
+    }
+}
+
 #[test]
 fn held_lock_skips() {
     let fx = Fixture::new();

@@ -115,6 +115,9 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
             root.display()
         );
     }
+    if let Some(reason) = info.foreign_lock() {
+        return Ok(Some(reason));
+    }
 
     let g = Git::at(root);
     let sparse = g.run(&[
