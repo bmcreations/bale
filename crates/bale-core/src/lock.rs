@@ -38,4 +38,24 @@ impl WorkspaceLock {
             Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
         }
     }
+
+    /// Whether another holder has the lock, without creating the lock file
+    /// or its dir: no file means nobody holds it. Any lock taken to check is
+    /// released before returning.
+    pub fn is_held(home: &BaleHome, id: &str) -> Result<bool> {
+        let path = home.locks_dir().join(format!("{id}.lock"));
+        let file = match OpenOptions::new().write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
+        match file.try_lock_exclusive() {
+            Ok(true) => {
+                drop(WorkspaceLock { file });
+                Ok(false)
+            }
+            Ok(false) => Ok(true),
+            Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
+        }
+    }
 }

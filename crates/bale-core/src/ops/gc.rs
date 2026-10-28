@@ -57,10 +57,19 @@ fn collect(
     if !is_workspace_id(id) {
         bail!("{id:?} is not a workspace id");
     }
-    let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(());
+    // A dry run only probes the lock, so it creates no lock files.
+    let _lock = if dry_run {
+        if WorkspaceLock::is_held(home, id)? {
+            return Ok(());
+        }
+        None
+    } else {
+        match WorkspaceLock::try_acquire(home, id)? {
+            Some(lock) => Some(lock),
+            None => return Ok(()),
+        }
     };
-    // Re-read under the lock: another process may have changed it since.
+    // Re-read (under the lock, for a real run): it may have changed since.
     let Some(record) = registry.get(id)? else {
         return Ok(());
     };

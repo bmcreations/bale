@@ -118,13 +118,33 @@ fn new_uses_configured_worktree_root() {
 #[test]
 fn new_rejects_bad_names() {
     let fx = Fixture::new();
-    for name in ["", "../x", "a/b", "a\\b", "..", "-f", "x..y"] {
-        let err = new_workspace(&fx.home(), &fx.repo, name, None);
+    for name in ["", ".", "../x", "a/b", "a\\b", "..", "-f", "./x"] {
+        // With a valid branch, so git's own branch-name check can't refuse it.
+        let err = new_workspace(&fx.home(), &fx.repo, name, Some("foo"));
         assert!(err.is_err(), "{name:?} accepted");
     }
     assert!(!default_root(&fx).exists());
     assert!(!fx.repo.parent().unwrap().join("x").exists());
     assert!(registry(&fx).all().unwrap().is_empty());
+}
+
+#[test]
+fn new_resolves_a_relative_worktree_root_against_the_main_checkout() {
+    let fx = Fixture::new();
+    fs::write(fx.repo.join(".bale.toml"), "worktree_root = \"../wt\"\n").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    assert_ne!(
+        fs::canonicalize(&cwd).unwrap(),
+        fs::canonicalize(&fx.repo).unwrap()
+    );
+    let stray = cwd.join("../wt");
+    let stray_before = stray.exists();
+    let rec = new_workspace(&fx.home(), &fx.repo, "x", None).unwrap();
+    let want = fs::canonicalize(fx.repo.join("../wt/my repo é/x")).unwrap();
+    assert_eq!(rec.path, want);
+    assert_eq!(head_ref(&want), "refs/heads/x");
+    assert_eq!(stray.exists(), stray_before, "stray dir beside the cwd");
+    assert!(!fx.repo.join("wt").exists());
 }
 
 #[test]
@@ -346,6 +366,35 @@ fn gc_leaves_bales_lock_on_a_baled_workspace() {
     assert_eq!(lock_reason(&fx, &wt), Some(LOCK_REASON.to_string()));
 }
 
+fn lock_files(fx: &Fixture) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = match fs::read_dir(fx.home().locks_dir()) {
+        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    files
+}
+
+#[test]
+fn gc_dry_run_creates_no_lock_files() {
+    let fx = Fixture::new();
+    let id = orphan(&fx, "wt");
+    fs::remove_dir_all(fx.home().locks_dir()).unwrap();
+    let report = gc(&fx.home(), true).unwrap();
+    assert_eq!(report.removed, vec![id]);
+    assert!(!fx.home().locks_dir().exists());
+}
+
+#[test]
+fn gc_dry_run_skips_a_workspace_another_process_holds() {
+    let fx = Fixture::new();
+    let id = orphan(&fx, "wt");
+    let _held = WorkspaceLock::try_acquire(&fx.home(), &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(gc(&fx.home(), true).unwrap(), GcReport::default());
+}
+
 #[test]
 fn gc_dry_run_changes_nothing() {
     let fx = Fixture::new();
@@ -365,7 +414,9 @@ fn gc_dry_run_changes_nothing() {
     );
     plant_saved_state(&fx, &stale);
 
+    let locks_before = lock_files(&fx);
     let report = gc(&fx.home(), true).unwrap();
+    assert_eq!(lock_files(&fx), locks_before, "dry run created lock files");
     assert_eq!(report.removed, vec![gone.clone()]);
     assert_eq!(report.unlocked, vec![stale.clone()]);
     assert_eq!(report.cleaned, vec![stale.clone()]);

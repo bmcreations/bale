@@ -116,10 +116,10 @@ fn main() -> ExitCode {
                     println!("{line}");
                 }
             }
-            if report.errors.is_empty() {
-                ExitCode::SUCCESS
-            } else {
+            if gc_failed(&report, dry_run) {
                 ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
             }
         }),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
@@ -179,6 +179,12 @@ fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
     } else {
         vec![(false, line)]
     }
+}
+
+/// Whether gc exits 1: a real run with error rows. A dry run attempts
+/// nothing, so its error rows are shown but do not fail it.
+fn gc_failed(report: &GcReport, dry_run: bool) -> bool {
+    !dry_run && !report.errors.is_empty()
 }
 
 /// One line per id in each list; errors are flagged `true` for stderr.
@@ -465,6 +471,19 @@ mod tests {
             ]
         );
         assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");
+    }
+
+    #[test]
+    fn gc_fails_only_for_errors_in_a_real_run() {
+        let clean = GcReport::default();
+        let errored = GcReport {
+            errors: vec![("c".into(), "boom".into())],
+            ..GcReport::default()
+        };
+        assert!(!gc_failed(&clean, false));
+        assert!(!gc_failed(&clean, true));
+        assert!(gc_failed(&errored, false));
+        assert!(!gc_failed(&errored, true));
     }
 
     #[test]

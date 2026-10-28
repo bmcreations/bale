@@ -1,7 +1,7 @@
 //! `bale new`: create a linked worktree with `git worktree add` and register it.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -13,7 +13,8 @@ use crate::BaleHome;
 
 /// Creates a worktree named `name` for `repo` and registers it `Hot`.
 ///
-/// The path is `<worktree_root>/<repo-dir-name>/<name>`, or
+/// The path is `<worktree_root>/<repo-dir-name>/<name>` (a relative
+/// `worktree_root` is taken from the main checkout), or
 /// `<repo>/../<repo-dir-name>-worktrees/<name>` without a configured root,
 /// where `<repo>` is the main checkout. The branch (`name` by default) is
 /// created when it does not exist and checked out when it does. Refuses a
@@ -36,7 +37,8 @@ pub fn new_workspace(
         .to_os_string();
     let cfg = load_config(home, Some(&main))?;
     let root = match cfg.worktree_root {
-        Some(r) => r.join(&repo_name),
+        // A relative root is relative to the main checkout, never the cwd.
+        Some(r) => main.join(r).join(&repo_name),
         None => {
             let mut dir = repo_name.clone();
             dir.push("-worktrees");
@@ -81,14 +83,17 @@ pub fn new_workspace(
         .with_context(|| format!("{} was created but could not be registered", path.display()))
 }
 
-/// Rejects names that are empty, contain a path separator or `..`, or start
-/// with `-`. Both separators are rejected on every OS.
+/// Accepts only a single plain path component (no `.`, `..`, separator or
+/// empty name) that does not start with `-`. `\` is rejected on every OS so
+/// all platforms accept the same names.
 fn check_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("workspace name is empty");
-    }
-    if name.contains(['/', '\\']) || name.contains("..") || name.starts_with('-') {
-        bail!("workspace name {name:?} must not contain '/', '\\' or '..', or start with '-'");
+    let mut parts = Path::new(name).components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if !single || name.contains('\\') || name.starts_with('-') {
+        bail!("workspace name {name:?} must be a single directory name not starting with '-'");
     }
     Ok(())
 }
