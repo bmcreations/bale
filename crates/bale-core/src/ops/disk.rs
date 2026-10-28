@@ -688,6 +688,12 @@ fn check_in(
     let root_meta = fs::symlink_metadata(tree)?;
     let root = stamp(&root_meta);
     let seen = entries(tree, &skip)?;
+    // The walk starts below the root, so its attributes are checked here.
+    if let Some(name) = user_xattrs(tree)?.into_iter().next() {
+        return Ok(Verdict::Differs(format!(
+            "the tree's root has extended attribute {name}, which can't be saved"
+        )));
+    }
     if let (Some(x), Some(y)) = (
         file_mode(&root_meta),
         file_mode(&fs::symlink_metadata(work)?),

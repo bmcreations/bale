@@ -591,6 +591,26 @@ fn cold_refuses_file_with_extended_attribute() {
     assert_eq!(fs::read_to_string(wt.join("notes.txt")).unwrap(), "n\n");
 }
 
+/// The worktree's root dir is not one of the walked entries, so its
+/// extended attributes need their own check.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cold_refuses_extended_attribute_on_the_root() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    if !set_xattr(&wt, "user.bale-test", b"x") {
+        eprintln!("skipped: the filesystem refuses user xattrs");
+        return;
+    }
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("user.bale-test")),
+        "{out:?}"
+    );
+    assert!(wt.join("f").exists());
+}
+
 /// What apps set on their own does not stop cold: Xcode's text encoding
 /// hint on project files, and Finder's flags on `.DS_Store`.
 #[cfg(target_os = "macos")]
