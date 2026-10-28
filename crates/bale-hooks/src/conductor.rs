@@ -21,7 +21,9 @@ use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
 use crate::cmdline::{bale_call, BaleCall};
-use crate::install::{backup_path, read_config, Plan, Step};
+use crate::install::{
+    backup_key, backup_path, read_config, tracked_by_git, tracked_note, Plan, Step,
+};
 use crate::{display_path, remove_tree, Tool};
 
 /// The workspace a script runs for: `CONDUCTOR_WORKSPACE_PATH`, or the cwd.
@@ -207,7 +209,12 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
             before,
             after,
             mode,
-            backup: (!any_bale).then(|| backup_path(backups, &path)),
+            backup: (!any_bale).then(|| {
+                backup_path(
+                    backups,
+                    &backup_key(repo, &Path::new(".conductor").join("settings.toml")),
+                )
+            }),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Conductor workspace of \
@@ -307,7 +314,8 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         }
         return Ok(Plan::new(steps));
     }
-    let backup = fs::read_to_string(backup_path(backups, &path)).ok();
+    let key = backup_key(repo, &Path::new(".conductor").join("settings.toml"));
+    let backup = fs::read_to_string(backup_path(backups, &key)).ok();
     if scripts.is_empty() {
         let in_backup = backup
             .as_deref()
@@ -340,9 +348,12 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         }
     }
     let after = doc.to_string();
-    if after.trim().is_empty() && backup.is_none() {
+    if after.trim().is_empty() && backup.is_none() && !tracked_by_git(&path) {
         steps.push(Step::Remove(path));
     } else {
+        if after.trim().is_empty() && backup.is_none() {
+            steps.push(tracked_note(&path));
+        }
         steps.push(Step::Settings {
             path,
             before: Some(before),

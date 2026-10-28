@@ -23,7 +23,9 @@ use serde_json::{Map, Value};
 
 use crate::claude::sh_quote;
 use crate::cmdline::{bale_call, BaleCall};
-use crate::install::{backup_path, json_uninstall_steps, read_config, windows_quote, Plan, Step};
+use crate::install::{
+    backup_key, backup_path, json_uninstall_steps, read_config, windows_quote, Plan, Step,
+};
 use crate::{as_hook, display_path, Tool};
 
 /// setup: registers the worktree Cursor ran it in (the cwd) and records
@@ -177,7 +179,10 @@ fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> R
             before,
             after,
             mode,
-            backup: Some(backup_path(backups, &path)),
+            backup: Some(backup_path(
+                backups,
+                &backup_key(repo, &Path::new(".cursor").join("worktrees.json")),
+            )),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Cursor worktree of this \
@@ -254,8 +259,9 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         )));
         return Ok(Plan::new(steps));
     }
+    let key = backup_key(repo, &Path::new(".cursor").join("worktrees.json"));
     steps.extend(json_uninstall_steps(
-        backups, &path, before, mode, &root, &emptied,
+        backups, &key, &path, before, mode, &root, &emptied,
     )?);
     Ok(Plan::new(steps))
 }

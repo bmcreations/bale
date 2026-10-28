@@ -33,7 +33,9 @@ use bale_core::BaleHome;
 use serde_json::{json, Map, Value};
 
 use crate::cmdline::bale_call;
-use crate::install::{backup_path, json_uninstall_steps, read_config, Plan, Step};
+use crate::install::{
+    backup_key, backup_path, json_uninstall_steps, read_config, reformat_text, Plan, Step,
+};
 use crate::{display_path, remove_tree, Tool};
 
 /// Reads the hook's JSON payload from stdin.
@@ -388,7 +390,8 @@ fn hook_group(exe: &Path, kind: &str) -> Value {
 /// is refused: Claude Code would run both, and two hooks creating the same
 /// worktree conflict.
 pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
-    let path = home.join(".claude").join("settings.json");
+    let tail = Path::new(".claude").join("settings.json");
+    let path = home.join(&tail);
     let meta = match fs::symlink_metadata(&path) {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -506,13 +509,17 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 .to_path_buf(),
         ),
         Step::Settings {
-            backup: (!any_ours).then(|| backup_path(backups, &path)),
-            path,
-            before,
+            backup: (!any_ours).then(|| backup_path(backups, &backup_key(home, &tail))),
+            path: path.clone(),
+            before: before.clone(),
             after,
             mode,
         },
     ]);
+    // A repoint takes no backup, but still rewrites the user's layout.
+    if any_ours && before.is_some() {
+        notes.extend(reformat_text(&path, None).map(Step::Note));
+    }
     Ok(Plan::new(notes))
 }
 
@@ -585,8 +592,10 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
         return Ok(Plan::new(steps));
     }
     emptied_events.push(vec!["hooks"]);
+    let key = backup_key(home, &Path::new(".claude").join("settings.json"));
     steps.extend(json_uninstall_steps(
         backups,
+        &key,
         &path,
         before,
         mode,

@@ -157,14 +157,18 @@ impl Plan {
                                 .with_context(|| format!("backing up {}", path.display()))?;
                         }
                         // bale creates the file: a backup left from an
-                        // earlier file at this path no longer describes it.
-                        (None, Some(backup)) => match fs::remove_file(backup) {
-                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                                return Err(e)
-                                    .with_context(|| format!("deleting {}", backup.display()))
-                            }
-                            _ => {}
-                        },
+                        // earlier file at this path no longer describes it,
+                        // but may be the user's only copy of that file.
+                        (None, Some(backup)) if fs::symlink_metadata(backup).is_ok() => {
+                            let old = retired_backup_path(backup);
+                            fs::rename(backup, &old)
+                                .with_context(|| format!("renaming {}", backup.display()))?;
+                            println!(
+                                "note: {} keeps the backup of an earlier {}",
+                                display_path(&old),
+                                display_path(path)
+                            );
+                        }
                         _ => {}
                     }
                     write_atomic(path, after)?;
@@ -212,10 +216,59 @@ impl Plan {
     }
 }
 
+/// The path a config's backup is named for: `tail` under `root` (the repo or
+/// home) with `root` canonicalized, so a symlinked or `..` spelling of it
+/// names the same backup. Only `root` is resolved: the config's own
+/// directory may not exist before the first install.
+pub(crate) fn backup_key(root: &Path, tail: &Path) -> PathBuf {
+    bale_core::paths::canonicalize(root)
+        .or_else(|_| std::path::absolute(root))
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(tail)
+}
+
+/// Whether git tracks `path` in its repo; false when git or a repo is missing.
+pub(crate) fn tracked_by_git(path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The note that uninstall kept a file git tracks, which it would otherwise
+/// have deleted as bale's own.
+pub(crate) fn tracked_note(path: &Path) -> Step {
+    Step::Note(format!(
+        "note: git tracks {}; kept it with bale's entries removed",
+        display_path(path)
+    ))
+}
+
+/// Where install moves a backup that no longer describes the file:
+/// `<name>.<unix-secs>.old` beside it.
+fn retired_backup_path(backup: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut name = backup.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{secs}.old"));
+    backup.with_file_name(name)
+}
+
 /// Where a config's original is kept: in `backups` (bale's
-/// `$BALE_HOME/backups`), named for the sha256 of `path`'s absolute path, so
-/// two repos' files of the same name keep separate backups, then the path's
-/// last characters for a reader, short enough for any filesystem.
+/// `$BALE_HOME/backups`), named for the sha256 of `key` (from
+/// [`backup_key`], or else made absolute), so two repos' files of the same
+/// name keep separate backups, then the path's last characters for a
+/// reader, short enough for any filesystem.
 pub(crate) fn backup_path(backups: &Path, path: &Path) -> PathBuf {
     use sha2::{Digest, Sha256};
     const TAIL: usize = 80;
@@ -254,14 +307,22 @@ fn old_backup_path(path: &Path) -> PathBuf {
 /// kept. toml_edit keeps a TOML file's layout, so it gets none.
 fn reformat_note(path: &Path, before: &Option<String>, backup: &Option<PathBuf>) -> Option<String> {
     let backup = backup.as_ref().filter(|_| before.is_some())?;
+    reformat_text(path, Some(backup))
+}
+
+/// The reformat note for a JSON `path`, naming `backup` when there is one.
+pub(crate) fn reformat_text(path: &Path, backup: Option<&Path>) -> Option<String> {
     if path.extension().is_none_or(|e| e != "json") {
         return None;
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    Some(format!(
-        "note: {name} is reformatted (2-space JSON); {} keeps the original",
-        display_path(backup)
-    ))
+    Some(match backup {
+        Some(backup) => format!(
+            "note: {name} is reformatted (2-space JSON); {} keeps the original",
+            display_path(backup)
+        ),
+        None => format!("note: {name} is reformatted (2-space JSON)"),
+    })
 }
 
 /// A config file's text and permissions, or `None` when it does not exist.
@@ -296,9 +357,12 @@ pub(crate) fn read_config(path: &Path) -> Result<Option<(String, fs::Permissions
 /// - with a backup that does not match, the file is rewritten without the
 ///   emptied containers and kept, even if nothing is left;
 /// - with no backup, bale created the file, and deletes it when nothing is
-///   left.
+///   left, unless git tracks it.
+///
+/// `key` is the path the backup is named for (see [`backup_key`]).
 pub(crate) fn json_uninstall_steps(
     backups: &Path,
+    key: &Path,
     path: &Path,
     before: String,
     mode: fs::Permissions,
@@ -314,7 +378,7 @@ pub(crate) fn json_uninstall_steps(
     };
     let old = old_backup_path(path);
     let mut any_backup = false;
-    for candidate in [backup_path(backups, path), old.clone()] {
+    for candidate in [backup_path(backups, key), old.clone()] {
         if fs::symlink_metadata(&candidate).is_err() {
             continue;
         }
@@ -335,7 +399,15 @@ pub(crate) fn json_uninstall_steps(
     }
     let root = prune(kept, emptied, None);
     if !any_backup && root.as_object().is_some_and(|o| o.is_empty()) {
-        return Ok(vec![Step::Remove(path.to_path_buf())]);
+        if !tracked_by_git(path) {
+            return Ok(vec![Step::Remove(path.to_path_buf())]);
+        }
+        // A committed file is the repo's, whoever made it: keep it, and
+        // keep the containers the removal emptied.
+        return Ok(vec![
+            settings(serde_json::to_string_pretty(kept)? + "\n"),
+            tracked_note(path),
+        ]);
     }
     Ok(vec![settings(serde_json::to_string_pretty(&root)? + "\n")])
 }

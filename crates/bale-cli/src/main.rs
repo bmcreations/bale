@@ -106,6 +106,11 @@ enum Command {
     },
     /// Remove the sweep schedule, or with --hooks only bale's entries in those tools' hooks.
     /// Saved state and cold worktrees are kept.
+    ///
+    /// A config file left empty is deleted when bale finds no backup of it
+    /// and git does not track it. That includes a ~/.claude/settings.json
+    /// installed by an older bale whose settings.json.bak-bale was since
+    /// deleted: bale treats it as its own.
     Uninstall {
         /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex.
         #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]

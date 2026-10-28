@@ -2714,3 +2714,141 @@ fn uninstall_git_notes_global_hooks_path() {
     );
     assert!(!shared.join("post-checkout").exists());
 }
+
+/// Commits `text` as `.cursor/worktrees.json` in the env's repo.
+fn commit_cursor_worktrees(env: &Env, text: &str) -> PathBuf {
+    let path = cursor_worktrees(env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, text).unwrap();
+    env.git(&env.repo, &["add", "-A"]);
+    env.git(&env.repo, &["commit", "-q", "-m", "cursor"]);
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_through_the_real_path_finds_a_backup_made_through_a_symlink() {
+    let env = Env::new();
+    let committed = r#"{"setup-worktree":[]}"#;
+    let path = commit_cursor_worktrees(&env, committed);
+    let link = env.tmp.path().join("link");
+    std::os::unix::fs::symlink(&env.repo, &link).unwrap();
+    let out = env.bale(
+        &env.repo,
+        &[
+            "install",
+            "--hooks",
+            "cursor",
+            "--repo",
+            link.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = uninstall(&env, "cursor", true);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        committed,
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(env.git(&env.repo, &["status", "--short"]), "");
+}
+
+#[test]
+fn uninstall_with_dot_finds_a_backup_made_through_dot_dot() {
+    let env = Env::new();
+    let committed = r#"{"setup-worktree":[]}"#;
+    let path = commit_cursor_worktrees(&env, committed);
+    let dotdot = env.repo.join(".cursor").join("..");
+    let out = env.bale(
+        &env.repo,
+        &[
+            "install",
+            "--hooks",
+            "cursor",
+            "--repo",
+            dotdot.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = env.bale(
+        &env.repo,
+        &["uninstall", "--hooks", "cursor", "--repo", "."],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        committed,
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(env.git(&env.repo, &["status", "--short"]), "");
+}
+
+#[test]
+fn uninstall_never_deletes_a_tracked_file_without_a_backup() {
+    let env = Env::new();
+    // bale made both files and the user committed them; the backups are gone.
+    install(&env, "cursor", true);
+    install(&env, "conductor", true);
+    env.git(&env.repo, &["add", "-A"]);
+    env.git(&env.repo, &["commit", "-q", "-m", "hooks"]);
+    let _ = fs::remove_dir_all(env.bale_home().join("backups"));
+    for (tool, path) in [
+        ("cursor", cursor_worktrees(&env)),
+        ("conductor", conductor_settings(&env)),
+    ] {
+        let out = uninstall(&env, tool, true);
+        let text = stdout(&out);
+        assert!(path.exists(), "{tool}: {text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("removed ")),
+            "{tool}: {text}"
+        );
+        assert!(text.contains("note: git tracks"), "{tool}: {text}");
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("hook"), "{tool}: {after}");
+    }
+}
+
+#[test]
+fn install_keeps_a_stale_backup_under_an_old_name() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let precious = r#"{"model":"precious"}"#;
+    fs::write(&path, precious).unwrap();
+    install(&env, "claude", false);
+    fs::remove_file(&path).unwrap();
+    let out = install(&env, "claude", false);
+    let text = stdout(&out);
+    let backups = backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}\n{text}");
+    let old = &backups[0];
+    let name = old.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with(".old"), "{name}");
+    assert_eq!(fs::read_to_string(old).unwrap(), precious);
+    assert!(text.contains(&name), "{text}");
+}
+
+#[test]
+fn claude_repoint_prints_the_reformat_note() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":"'/old/bale' hook claude create"}]}],"WorktreeRemove":[{"hooks":[{"type":"command","command":"'/old/bale' hook claude remove"}]}]}}"#,
+    )
+    .unwrap();
+    let out = install(&env, "claude", false);
+    let text = stdout(&out);
+    assert!(
+        text.contains("note: settings.json is reformatted (2-space JSON)"),
+        "{text}"
+    );
+    assert!(backups(&env).is_empty());
+}
