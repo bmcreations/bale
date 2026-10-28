@@ -31,6 +31,11 @@ impl Git {
                 .current_dir(&self.dir)
                 .env("LC_ALL", "C")
                 .env("GIT_TERMINAL_PROMPT", "0")
+                // A git hook sets these; they would redirect us to another repo.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
                 .output()
                 .with_context(|| format!("failed to run git {}", args.join(" ")))?;
             if out.status.success() {
@@ -114,7 +119,12 @@ pub fn admin_dir(dir: &Path) -> Result<PathBuf> {
 /// True when `status --porcelain` shows anything, untracked files included.
 pub fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(!Git::at(dir)
-        .run(&["status", "--porcelain", "--untracked-files=all"])?
+        .run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ])?
         .trim()
         .is_empty())
 }

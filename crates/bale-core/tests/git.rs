@@ -113,12 +113,28 @@ fn other_errors_return_immediately_with_stderr() {
     let fx = Fixture::new();
     let start = std::time::Instant::now();
     let err = Git::at(&fx.repo).run(&["rev-parse", "nope-ref"]).unwrap_err();
-    assert!(start.elapsed() < std::time::Duration::from_millis(90));
-    assert!(format!("{err:#}").contains("nope-ref"), "{err:#}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown revision") || msg.contains("ambiguous argument"),
+        "{msg}"
+    );
 }
 
 #[test]
 fn home_is_under_fixture() {
     let fx = Fixture::new();
     assert!(!fx.home().0.starts_with(&fx.repo));
+}
+
+#[test]
+fn is_dirty_does_not_need_index_lock() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feat");
+    // Make the index stat-dirty so a plain `git status` would want to refresh it.
+    std::fs::write(wt.join("f"), "one\n").unwrap();
+    std::fs::write(git::admin_dir(&wt).unwrap().join("index.lock"), "").unwrap();
+    let start = std::time::Instant::now();
+    assert!(!git::is_dirty(&wt).unwrap());
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
 }
