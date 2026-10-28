@@ -17,6 +17,8 @@ pub enum Level {
     Baled,
     Cooling,
     Cold,
+    /// `bale open` is restoring a cold workspace; a rerun resumes it.
+    Opening,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +45,7 @@ pub fn workspace_id(path: &Path) -> String {
 /// Canonicalizes `path`; when it no longer exists, canonicalizes the nearest
 /// existing ancestor and re-joins the remaining components, so the result
 /// matches what canonicalize gave while the path existed.
-fn canonical_or_ancestor(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_ancestor(path: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(path) {
         return c;
     }
@@ -102,8 +104,8 @@ impl Registry {
         let final_path = self.record_path(&record.id);
         let tmp_path = dir.join(format!("{}.json.tmp", record.id));
         let bytes = serde_json::to_vec_pretty(record)?;
-        let mut f = File::create(&tmp_path)
-            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        let mut f =
+            File::create(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
         f.write_all(&bytes)?;
         f.sync_all()?;
         drop(f);

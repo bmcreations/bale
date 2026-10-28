@@ -4,8 +4,9 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use bale_core::ops::cold::cold;
+use bale_core::ops::open::open;
 use bale_core::ops::up::{register, up, Outcome};
-use bale_core::registry::{Level, Registry};
+use bale_core::registry::{workspace_id, Level, Registry};
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
 
@@ -29,6 +30,11 @@ enum Command {
         /// Worktree path or workspace id.
         target: String,
     },
+    /// Restore a cold worktree at its path, then remove its saved state.
+    Open {
+        /// Worktree path or workspace id.
+        target: String,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
@@ -47,6 +53,14 @@ fn main() -> ExitCode {
         Command::Cold { target } => {
             resolve(&home, &target).and_then(|id| Ok(report(&id, cold(&home, &id)?)))
         }
+        Command::Open { target } => resolve(&home, &target).and_then(|id| {
+            let opened = open(&home, &id)?;
+            let code = report(&id, opened.outcome);
+            if let Some(reason) = opened.detached_reason {
+                println!("  HEAD left detached: {reason}");
+            }
+            Ok(code)
+        }),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -56,16 +70,23 @@ fn main() -> ExitCode {
 }
 
 /// An existing path is registered and its id returned; anything else must be
-/// the id of a registered workspace.
+/// a registered workspace id or the path of a registered (cold) workspace.
 fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
     let path = Path::new(arg);
     if path.exists() {
         return Ok(register(home, path)?.id);
     }
-    Registry::open(home.clone())
-        .get(arg)?
+    let registry = Registry::open(home.clone());
+    if let Some(r) = registry.get(arg)? {
+        return Ok(r.id);
+    }
+    let absolute = std::env::current_dir()
+        .context("reading the current directory")?
+        .join(path);
+    registry
+        .get(&workspace_id(&absolute))?
         .map(|r| r.id)
-        .with_context(|| format!("{arg} is neither an existing path nor a registered workspace id"))
+        .with_context(|| format!("{arg} is neither an existing path nor a registered workspace"))
 }
 
 /// Prints the outcome; exit 0 done, 3 busy, 4 skipped.
@@ -119,6 +140,7 @@ fn level_name(level: Level) -> &'static str {
         Level::Baled => "baled",
         Level::Cooling => "cooling",
         Level::Cold => "cold",
+        Level::Opening => "opening",
     }
 }
 

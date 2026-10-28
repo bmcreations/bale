@@ -16,6 +16,8 @@ use crate::registry::{workspace_id, Level, Record, Registry};
 use crate::BaleHome;
 
 pub(crate) const TRASH_PREFIX: &str = ".bale-trash-";
+/// Skip reason for a record a `bale open` left half done.
+pub(crate) const OPENING: &str = "opening; run `bale open` to finish";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DD_NOTE: &str = "DerivedData not removed: ";
 
@@ -109,6 +111,7 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
 
     match record.level {
         Level::Cooling | Level::Cold => return Ok(Outcome::Skipped("cold".into())),
+        Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
             let holders = busy_holders(&root)?;

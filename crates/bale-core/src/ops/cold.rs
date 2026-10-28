@@ -16,12 +16,12 @@ use crate::config::{load_config, Config};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
-use crate::ops::up::{is_busy_error, remove_entry, up_locked, Outcome, TRASH_PREFIX};
+use crate::ops::up::{is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX};
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
 
-const MANIFEST: &str = "manifest.json";
-const FILES: &str = "files";
+pub(crate) const MANIFEST: &str = "manifest.json";
+pub(crate) const FILES: &str = "files";
 /// Names the trash dir `finish` verified and the wip commit it verified
 /// against, so recovery can delete what is left of it without git.
 const TRASH_MARKER: &str = "trash";
@@ -54,6 +54,7 @@ pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
     };
     match record.level {
         Level::Cold => return Ok(Outcome::Skipped("cold".into())),
+        Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
         Level::Cooling => return recover(home, &registry, record),
         Level::Hot | Level::Baling | Level::Baled => {}
     }
@@ -454,7 +455,7 @@ pub fn save_wip(dir: &Path, id: &str) -> Result<()> {
 /// The tree `add -A` would build, computed in a temporary copy of the index
 /// (so force-added files stay), with assume-unchanged bits cleared (so their
 /// edits are seen). Without a real index it starts from `read-tree HEAD`.
-fn snapshot_tree(dir: &Path) -> Result<String> {
+pub(crate) fn snapshot_tree(dir: &Path) -> Result<String> {
     let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
     let index = tmp.path().join("index");
     let real = Git::at(dir).run(&["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
@@ -703,7 +704,7 @@ fn make_dirs(path: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
-fn create_private(path: &Path) -> Result<File> {
+pub(crate) fn create_private(path: &Path) -> Result<File> {
     let mut o = OpenOptions::new();
     // Never reuse an existing path: it could be a link out of `dest`.
     o.write(true).create_new(true);
@@ -717,7 +718,7 @@ fn create_private(path: &Path) -> Result<File> {
 }
 
 /// Copies `from` to `to` with mode 0600 and returns the sha256 of the bytes.
-fn copy_file(from: &Path, to: &Path) -> Result<String> {
+pub(crate) fn copy_file(from: &Path, to: &Path) -> Result<String> {
     let mut src = File::open(from).with_context(|| format!("opening {}", from.display()))?;
     let mut dst = create_private(to)?;
     let mut hasher = Sha256::new();
@@ -737,7 +738,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
-fn copy_symlink(from: &Path, to: &Path, rel: PathBuf) -> Result<SavedFile> {
+pub(crate) fn copy_symlink(from: &Path, to: &Path, rel: PathBuf) -> Result<SavedFile> {
     let target = fs::read_link(from).with_context(|| format!("reading {}", from.display()))?;
     if let Some(parent) = to.parent() {
         make_dirs(parent)?;
@@ -763,11 +764,11 @@ fn copy_symlink(from: &Path, to: &Path, rel: PathBuf) -> Result<SavedFile> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn sha_file(path: &Path) -> Result<String> {
+pub(crate) fn sha_file(path: &Path) -> Result<String> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
