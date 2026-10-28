@@ -1885,6 +1885,53 @@ fn sweep_sizes_global_derived_data_apart_from_the_tree() {
 }
 
 #[test]
+fn sweep_totals_global_derived_data_no_tree_claims() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let dd_root = env.home().join("Library/Developer/Xcode/DerivedData");
+    let add = |name: &str, project: &Path, bytes: usize| {
+        let dd = dd_root.join(name);
+        fs::create_dir_all(dd.join("Build/Products")).unwrap();
+        fs::write(dd.join("Build/Products/out.bin"), vec![7u8; bytes]).unwrap();
+        fs::create_dir_all(project).unwrap();
+        let workspace = project.to_string_lossy().replace('&', "&amp;");
+        fs::write(
+            dd.join("info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>WorkspacePath</key><string>{workspace}</string></dict></plist>\n"
+            ),
+        )
+        .unwrap();
+    };
+    add("App-abc", &wt.join("App.xcodeproj"), 300_000);
+    // Built from a worktree bale never registered.
+    add(
+        "Other-def",
+        &env.home().join("other/Other.xcodeproj"),
+        500_000,
+    );
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let all = trace_lines(&env);
+    let tree = all.iter().find(|v| v["kind"] == "tree").unwrap();
+    let ours = tree["global_dd_bytes"].as_u64().unwrap();
+    assert!((300_000..500_000).contains(&ours), "{tree}");
+    assert!(tree.get("global_dd_truncated").is_none(), "{tree}");
+    let sweep = all.iter().find(|v| v["kind"] == "sweep").unwrap();
+    let unattributed = sweep["global_dd_unattributed_bytes"].as_u64().unwrap();
+    assert!((500_000..800_000).contains(&unattributed), "{sweep}");
+    assert_eq!(
+        sweep["global_dd_total_bytes"].as_u64().unwrap(),
+        ours + unattributed,
+        "{sweep}"
+    );
+}
+
+#[test]
 fn remove_hook_ops_carry_the_remove_intent() {
     let env = Env::new();
     let wt = env.add_worktree("wt");

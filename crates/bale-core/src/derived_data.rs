@@ -6,25 +6,63 @@ use std::path::{Path, PathBuf};
 /// folder with a missing or unparseable plist, or no `WorkspacePath`, is
 /// never matched.
 pub fn derived_data_for(workspace: &Path, dd_root: &Path) -> Vec<PathBuf> {
-    let ws = crate::paths::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let ws = workspace_key(workspace);
+    index(dd_root)
+        .into_iter()
+        .filter(|d| d.built_from(&ws))
+        .map(|d| d.dir)
+        .collect()
+}
+
+/// One folder directly under a DerivedData root, read once so several
+/// trees can be matched against it.
+#[derive(Debug)]
+pub(crate) struct DdDir {
+    pub(crate) dir: PathBuf,
+    /// `WorkspacePath` as recorded and canonicalised (when it still
+    /// exists); both `None` without a usable plist.
+    workspace: Option<PathBuf>,
+    canonical: Option<PathBuf>,
+}
+
+impl DdDir {
+    /// True when the project this folder was built from lies inside the
+    /// tree whose [`workspace_key`] is `ws`.
+    pub(crate) fn built_from(&self, ws: &Path) -> bool {
+        self.workspace.as_ref().is_some_and(|wp| wp.starts_with(ws))
+            || self.canonical.as_ref().is_some_and(|c| c.starts_with(ws))
+    }
+}
+
+/// The form of a tree path [`DdDir::built_from`] compares against: the
+/// canonical path, or the path as given when it cannot be resolved.
+pub(crate) fn workspace_key(workspace: &Path) -> PathBuf {
+    crate::paths::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+/// Every folder directly under `dd_root`, sorted, with its `WorkspacePath`.
+/// Folders without one (such as `ModuleCache.noindex`) are listed too.
+/// Missing or unreadable `dd_root` lists nothing.
+pub(crate) fn index(dd_root: &Path) -> Vec<DdDir> {
     let Ok(entries) = fs::read_dir(dd_root) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(wp) = workspace_path(&entry.path().join("info.plist")) else {
-            continue;
-        };
-        let inside = wp.starts_with(&ws)
-            || crate::paths::canonicalize(&wp).is_ok_and(|c| c.starts_with(&ws));
-        if inside {
-            out.push(entry.path());
-        }
-    }
-    out.sort();
+    let mut out: Vec<DdDir> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let workspace = workspace_path(&e.path().join("info.plist"));
+            let canonical = workspace
+                .as_ref()
+                .and_then(|wp| crate::paths::canonicalize(wp).ok());
+            DdDir {
+                dir: e.path(),
+                workspace,
+                canonical,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
     out
 }
 

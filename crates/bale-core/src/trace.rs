@@ -499,24 +499,50 @@ fn allocated(meta: &fs::Metadata) -> u64 {
     }
 }
 
-/// `(whole tree, under any of regen)` allocated bytes below `root`, without
-/// following symlinks, or `None` once `deadline` passes.
-pub(crate) fn size_tree(root: &Path, regen: &[PathBuf], deadline: Instant) -> Option<(u64, u64)> {
-    let (mut tree, mut in_regen) = (0u64, 0u64);
-    for entry in WalkDir::new(root).follow_links(false) {
-        if Instant::now() >= deadline {
-            return None;
+/// Allocated bytes counted by [`size_tree`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Size {
+    /// The whole walk.
+    pub tree: u64,
+    /// The part under any of the `regen` dirs.
+    pub in_regen: u64,
+    /// The walk was cut short; the counts cover only what it reached.
+    pub truncated: bool,
+}
+
+/// Allocated bytes below `root`, without following symlinks. A walk still
+/// running at `deadline` stops there and returns what it counted so far.
+pub(crate) fn size_tree(root: &Path, regen: &[PathBuf], deadline: Instant) -> Size {
+    size_tree_until(root, regen, || Instant::now() >= deadline)
+}
+
+/// [`size_tree`] that stops when `over_budget` returns true, which it asks
+/// before every entry after the first.
+pub(crate) fn size_tree_until(
+    root: &Path,
+    regen: &[PathBuf],
+    mut over_budget: impl FnMut() -> bool,
+) -> Size {
+    let mut size = Size::default();
+    for (i, entry) in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if i > 0 && over_budget() {
+            size.truncated = true;
+            break;
         }
         // Entries that vanish or can't be read mid-walk are skipped.
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
-        let size = allocated(&meta);
-        tree += size;
+        let bytes = allocated(&meta);
+        size.tree += bytes;
         if regen.iter().any(|r| entry.path().starts_with(r)) {
-            in_regen += size;
+            size.in_regen += bytes;
         }
     }
-    Some((tree, in_regen))
+    size
 }
 
 /// A key for the volume holding `path`, which must exist, that stays the
@@ -882,7 +908,27 @@ mod tests {
     fn size_tree_stops_at_the_deadline() {
         let tmp = tempfile::TempDir::new().unwrap();
         fs::write(tmp.path().join("f"), "x").unwrap();
-        assert_eq!(size_tree(tmp.path(), &[], Instant::now()), None);
-        assert!(size_tree(tmp.path(), &[], Instant::now() + Duration::from_secs(30)).is_some());
+        assert!(size_tree(tmp.path(), &[], Instant::now()).truncated);
+        let full = size_tree(tmp.path(), &[], Instant::now() + Duration::from_secs(30));
+        assert!(!full.truncated);
+        assert!(full.tree > 0);
+    }
+
+    #[test]
+    fn a_truncated_walk_keeps_the_bytes_it_counted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fs::write(tmp.path().join(name), vec![1u8; 20_000]).unwrap();
+        }
+        let full = size_tree_until(tmp.path(), &[], || false);
+        assert!(!full.truncated);
+        let mut checks = 0;
+        let cut = size_tree_until(tmp.path(), &[], || {
+            checks += 1;
+            checks >= 3
+        });
+        assert!(cut.truncated, "{cut:?}");
+        assert!(cut.tree >= 20_000, "{cut:?}");
+        assert!(cut.tree < full.tree, "{cut:?} vs {full:?}");
     }
 }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::Map;
 
 use crate::config::{load_config, Config};
-use crate::derived_data::{all_for, global_for};
+use crate::derived_data::{global_root, index, is_derived_data_root, workspace_key, DdDir};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
@@ -17,7 +17,7 @@ use crate::ops::cold::cold_if_clean;
 use crate::ops::up::{bale_able_from, up_report, Outcome};
 use crate::par::par_map;
 use crate::registry::{Level, Record, Registry};
-use crate::trace::{put_clipped, BuildLog, MAX_ID, MAX_PATH};
+use crate::trace::{put_clipped, BuildLog, Size, MAX_ID, MAX_PATH};
 use crate::BaleHome;
 
 /// Report text for a record `bale open` left half done; `sweep` puts the
@@ -75,10 +75,32 @@ pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, Stri
 fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
     let start = Instant::now();
     let records = Registry::open(home.clone()).all_lenient()?;
-    let measured = par_map(&records, |(_, record)| match record {
+    // Xcode's shared DerivedData is listed once and each folder in it sized
+    // once, however many trees it belongs to.
+    let global = global_root().map(|g| index(&g)).unwrap_or_default();
+    let roots: Vec<Option<PathBuf>> = records
+        .iter()
+        .map(|(_, r)| r.as_ref().ok().map(|r| workspace_key(&r.path)))
+        .collect();
+    let matches = match_trees(&global, &roots);
+    let mut measured = par_map(&records, |(_, record)| match record {
         Ok(r) => measure(home, r),
         Err(_) => Measured::default(),
     });
+    let wanted: Vec<bool> = measured.iter().map(|m| m.wants_global).collect();
+    let global_dd = size_global_dd(&global, &matches, &wanted, |dir, deadline| {
+        crate::trace::size_tree(dir, &[], deadline)
+    });
+    // Build logs in the shared folders, from the same listing, before any
+    // tree's `up` removes one.
+    for ((m, mine), dd) in measured.iter_mut().zip(&matches).zip(&global_dd.per_tree) {
+        m.global_dd = *dd;
+        if m.wants_global {
+            for &i in mine {
+                m.builds.extend(logs_of(&global[i].dir));
+            }
+        }
+    }
     let mut rows = Vec::with_capacity(records.len());
     let mut builds = Vec::new();
     let mut paths = Vec::new();
@@ -105,31 +127,53 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
         fields.insert("dry_run".into(), true.into());
     }
     fields.insert("volumes".into(), crate::trace::volumes(home, &paths).into());
+    fields.insert("global_dd_total_bytes".into(), global_dd.total.into());
+    fields.insert(
+        "global_dd_unattributed_bytes".into(),
+        global_dd.unattributed.into(),
+    );
+    if global_dd.truncated {
+        fields.insert("global_dd_truncated".into(), true.into());
+    }
+    if global_dd.unattributed_truncated {
+        fields.insert("global_dd_unattributed_truncated".into(), true.into());
+    }
     fields.insert("duration_ms".into(), millis(start.elapsed()).into());
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
     Ok(rows)
 }
 
-/// Sizing longer than this for one tree is cut short and recorded as null.
+/// Sizing longer than this for one tree's checkout is cut short; the bytes
+/// counted so far are recorded with `sizing_truncated`.
 const SIZING_LIMIT: Duration = Duration::from_secs(30);
+
+/// Walking one folder in Xcode's shared DerivedData longer than this is cut
+/// short; the bytes counted so far are recorded with `global_dd_truncated`.
+/// Folders no tree claims share one such budget, from the start of the
+/// shared DerivedData pass.
+const GLOBAL_DD_LIMIT: Duration = Duration::from_secs(120);
 
 /// What sweep reads from a tree before changing anything, for its trace.
 #[derive(Default)]
 struct Measured {
-    /// `(regen_bytes, tree_bytes)`; `None` for trees not on disk, after an
-    /// error, or when cut short.
+    /// `(regen_bytes, tree_bytes)`, partial when `truncated`; `None` for
+    /// trees not on disk or after an error.
     sizes: Option<(u64, u64)>,
+    truncated: bool,
+    /// The tree is on disk and `Hot` or `Baled`, so its share of Xcode's
+    /// shared DerivedData is sized too.
+    wants_global: bool,
     /// Bytes of the folders in Xcode's shared DerivedData built from the
     /// tree, which `up` also removes on macOS; `None` when not sized.
-    global_dd: Option<u64>,
-    truncated: bool,
+    global_dd: Option<DdBytes>,
     sizing_ms: Option<u64>,
     builds: Vec<BuildLog>,
 }
 
-/// Sizes a `Hot` or `Baled` tree and reads its Xcode build logs. Errors
-/// warn once (via the trace) and leave the fields empty.
+/// Sizes a `Hot` or `Baled` checkout and reads the Xcode build logs inside
+/// it. Shared DerivedData is left to [`size_global_dd`]. Errors warn once
+/// (via the trace) and leave the fields empty.
 fn measure(home: &BaleHome, record: &Record) -> Measured {
     let mut m = Measured::default();
     if !matches!(record.level, Level::Hot | Level::Baled) {
@@ -140,50 +184,129 @@ fn measure(home: &BaleHome, record: &Record) -> Measured {
         Ok(root) => root,
         Err(_) => return m,
     };
+    m.wants_global = true;
     let regen =
         load_config(home, Some(&root)).map(|cfg| regenerable_dirs(&root, &detect(&root), &cfg));
     match regen {
         Ok(regen) => {
             match bale_able_from(&root, regen.clone()) {
                 Ok((removable, _)) => {
-                    let deadline = start + SIZING_LIMIT;
-                    match crate::trace::size_tree(&root, &removable, deadline) {
-                        Some((tree, in_regen)) => m.sizes = Some((in_regen, tree)),
-                        None => m.truncated = true,
-                    }
-                    if m.sizes.is_some() {
-                        m.global_dd = global_dd_bytes(&root, deadline);
-                        m.truncated = m.global_dd.is_none();
-                    }
+                    let size = crate::trace::size_tree(&root, &removable, start + SIZING_LIMIT);
+                    m.sizes = Some((size.in_regen, size.tree));
+                    m.truncated = size.truncated;
                     m.sizing_ms = Some(millis(start.elapsed()));
                 }
                 Err(e) => crate::trace::warn(&e),
             }
-            m.builds = build_logs_for(&root, &regen);
+            for dd in regen.iter().filter(|d| is_derived_data_root(d)) {
+                m.builds.extend(logs_of(dd));
+            }
         }
         Err(e) => crate::trace::warn(&e),
     }
     m
 }
 
-/// Total size of the shared DerivedData folders built from the tree at
-/// `root`, or `None` when the walk passes `deadline`.
-fn global_dd_bytes(root: &Path, deadline: Instant) -> Option<u64> {
-    let mut total = 0;
-    for dd in global_for(root) {
-        total += crate::trace::size_tree(&dd, &[], deadline)?.0;
-    }
-    Some(total)
+/// The build logs of one Xcode DerivedData root; errors warn and give none.
+fn logs_of(dd: &Path) -> Vec<BuildLog> {
+    crate::trace::build_logs(dd).unwrap_or_else(|e| {
+        crate::trace::warn(&e);
+        Vec::new()
+    })
 }
 
-/// The build logs of every Xcode DerivedData root that belongs to the tree.
-fn build_logs_for(root: &Path, regen: &[PathBuf]) -> Vec<BuildLog> {
-    let mut out = Vec::new();
-    for dd in all_for(root, regen) {
-        match crate::trace::build_logs(&dd) {
-            Ok(logs) => out.extend(logs),
-            Err(e) => crate::trace::warn(&e),
+/// For each tree root (as [`workspace_key`]; `None` for a record that did
+/// not parse), the positions in `index` of the shared DerivedData folders
+/// built from it.
+fn match_trees(index: &[DdDir], roots: &[Option<PathBuf>]) -> Vec<Vec<usize>> {
+    roots
+        .iter()
+        .map(|root| match root {
+            Some(root) => (0..index.len())
+                .filter(|&i| index[i].built_from(root))
+                .collect(),
+            None => Vec::new(),
+        })
+        .collect()
+}
+
+/// A tree's share of Xcode's shared DerivedData.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DdBytes {
+    bytes: u64,
+    /// One of its folders was cut short; `bytes` is what was counted.
+    truncated: bool,
+}
+
+/// Xcode's shared DerivedData as sweep saw it.
+struct GlobalDd {
+    /// Per tree, `Some` where `wanted`.
+    per_tree: Vec<Option<DdBytes>>,
+    /// Every folder, each counted once.
+    total: u64,
+    /// Folders built from no registered tree, or with no `WorkspacePath`.
+    unattributed: u64,
+    /// Some folder was cut short.
+    truncated: bool,
+    /// Some unattributed folder was cut short or never started.
+    unattributed_truncated: bool,
+}
+
+/// Sizes each folder in `index` exactly once with `size(dir, deadline)` on
+/// up to [`crate::par::THREADS`] threads, then attributes the bytes. A
+/// folder that `matches` puts under several trees counts in full for each
+/// of them, as either tree's `up` would remove it, and once in the totals.
+/// Folders some tree claims go first, each with [`GLOBAL_DD_LIMIT`] from
+/// its own start; the rest share one [`GLOBAL_DD_LIMIT`] from the start.
+fn size_global_dd(
+    index: &[DdDir],
+    matches: &[Vec<usize>],
+    wanted: &[bool],
+    size: impl Fn(&Path, Instant) -> Size + Sync,
+) -> GlobalDd {
+    let start = Instant::now();
+    let mut claimed = vec![false; index.len()];
+    for &i in matches.iter().flatten() {
+        claimed[i] = true;
+    }
+    let mut order: Vec<usize> = (0..index.len()).filter(|&i| claimed[i]).collect();
+    order.extend((0..index.len()).filter(|&i| !claimed[i]));
+    let sized = par_map(&order, |&i| {
+        if claimed[i] {
+            size(&index[i].dir, Instant::now() + GLOBAL_DD_LIMIT)
+        } else if start.elapsed() >= GLOBAL_DD_LIMIT {
+            Size {
+                truncated: true,
+                ..Size::default()
+            }
+        } else {
+            size(&index[i].dir, start + GLOBAL_DD_LIMIT)
         }
+    });
+    let mut sizes = vec![Size::default(); index.len()];
+    for (i, s) in order.into_iter().zip(sized) {
+        sizes[i] = s;
+    }
+    let mut out = GlobalDd {
+        per_tree: Vec::with_capacity(matches.len()),
+        total: 0,
+        unattributed: 0,
+        truncated: false,
+        unattributed_truncated: false,
+    };
+    for (i, s) in sizes.iter().enumerate() {
+        out.total += s.tree;
+        out.truncated |= s.truncated;
+        if !claimed[i] {
+            out.unattributed += s.tree;
+            out.unattributed_truncated |= s.truncated;
+        }
+    }
+    for (mine, &want) in matches.iter().zip(wanted) {
+        out.per_tree.push(want.then(|| DdBytes {
+            bytes: mine.iter().map(|&i| sizes[i].tree).sum(),
+            truncated: mine.iter().any(|&i| sizes[i].truncated),
+        }));
     }
     out
 }
@@ -234,7 +357,13 @@ fn trace_tree(
     );
     f.insert("regen_bytes".into(), m.sizes.map(|s| s.0).into());
     f.insert("tree_bytes".into(), m.sizes.map(|s| s.1).into());
-    f.insert("global_dd_bytes".into(), m.global_dd.into());
+    f.insert(
+        "global_dd_bytes".into(),
+        m.global_dd.map(|d| d.bytes).into(),
+    );
+    if m.global_dd.is_some_and(|d| d.truncated) {
+        f.insert("global_dd_truncated".into(), true.into());
+    }
     if m.truncated {
         f.insert("sizing_truncated".into(), true.into());
     }
@@ -392,6 +521,118 @@ mod tests {
 
     fn d(n: u64) -> Duration {
         Duration::from_secs(n * 86400)
+    }
+
+    /// A shared DerivedData dir under `dd_root` named `name`, built from the
+    /// project at `workspace` (or with no plist when `None`).
+    fn dd_dir(dd_root: &Path, name: &str, workspace: Option<&Path>) -> PathBuf {
+        let dir = dd_root.join(name);
+        fs::create_dir_all(dir.join("Build")).unwrap();
+        if let Some(ws) = workspace {
+            fs::create_dir_all(ws).unwrap();
+            let ws = ws.to_string_lossy().replace('&', "&amp;");
+            fs::write(
+                dir.join("info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                     <key>WorkspacePath</key><string>{ws}</string></dict></plist>\n"
+                ),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// Global DerivedData under a temp dir: `shared` built from a project
+    /// in `outer/sub`, `stray` from a project in no tree, and `cache` with
+    /// no plist. Trees are registered at `outer` and `outer/sub`.
+    fn nested_trees() -> (tempfile::TempDir, Vec<DdDir>, Vec<Option<PathBuf>>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = crate::paths::canonicalize(tmp.path()).unwrap();
+        let dd_root = base.join("DerivedData");
+        let outer = base.join("outer");
+        let inner = outer.join("sub");
+        dd_dir(&dd_root, "shared", Some(&inner.join("App.xcodeproj")));
+        dd_dir(
+            &dd_root,
+            "stray",
+            Some(&base.join("elsewhere/App.xcodeproj")),
+        );
+        dd_dir(&dd_root, "cache", None);
+        let index = crate::derived_data::index(&dd_root);
+        (tmp, index, vec![Some(outer), Some(inner)])
+    }
+
+    fn fake_size(path: &Path) -> Size {
+        let name = path.file_name().unwrap().to_string_lossy();
+        match name.as_ref() {
+            "shared" => Size {
+                tree: 100,
+                in_regen: 0,
+                truncated: false,
+            },
+            "stray" => Size {
+                tree: 10,
+                in_regen: 0,
+                truncated: true,
+            },
+            _ => Size {
+                tree: 1,
+                in_regen: 0,
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_global_dd_dir_is_walked_once_when_several_trees_resolve_to_it() {
+        let (_tmp, index, roots) = nested_trees();
+        assert_eq!(index.len(), 3);
+        let matches = match_trees(&index, &roots);
+        assert_eq!(matches[0], matches[1], "{matches:?}");
+        assert_eq!(matches[0].len(), 1, "{matches:?}");
+
+        let walks = std::sync::Mutex::new(Vec::new());
+        let global = size_global_dd(&index, &matches, &[true, true], |dir, _| {
+            walks.lock().unwrap().push(dir.to_path_buf());
+            fake_size(dir)
+        });
+        let mut walks = walks.into_inner().unwrap();
+        walks.sort();
+        let before = walks.len();
+        walks.dedup();
+        assert_eq!(walks.len(), before, "a dir was walked twice: {walks:?}");
+        assert_eq!(walks.len(), 3, "{walks:?}");
+
+        let shared = Some(DdBytes {
+            bytes: 100,
+            truncated: false,
+        });
+        assert_eq!(global.per_tree, vec![shared, shared]);
+    }
+
+    #[test]
+    fn unattributed_global_dd_is_totalled_with_partial_counts() {
+        let (_tmp, index, roots) = nested_trees();
+        let matches = match_trees(&index, &roots);
+        // Only the inner tree is measured; the outer one still counts as
+        // registered, so `shared` is attributed.
+        let global = size_global_dd(&index, &matches, &[false, true], |dir, _| fake_size(dir));
+        assert_eq!(
+            global.per_tree,
+            vec![
+                None,
+                Some(DdBytes {
+                    bytes: 100,
+                    truncated: false
+                })
+            ]
+        );
+        assert_eq!(global.total, 111);
+        // `stray` was cut short at 10 bytes: counted, not dropped to 0.
+        assert_eq!(global.unattributed, 11);
+        assert!(global.unattributed_truncated);
+        assert!(global.truncated);
     }
 
     #[test]
