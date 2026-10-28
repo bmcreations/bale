@@ -137,7 +137,7 @@ the next build fills it back in. Only `cold` needs an explicit open.
 `bale` is a CLI. Every integration calls it rather than reimplementing any part of it.
 
 ```
-bale install            # set up the periodic sweep and the optional hooks
+bale install            # set up the periodic sweep; --hooks <tools> installs tool hooks (see the multi-tool addendum)
 bale migrate [--apply]  # adopt existing worktrees; dry run by default
 bale new <name>         # create a workspace (tier 2: clone from the repo's base)
 bale base [--refresh]   # tier 2: build or rebuild the repo's warm base
