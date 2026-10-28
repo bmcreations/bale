@@ -1,4 +1,3 @@
-mod hook;
 mod install;
 
 use std::path::PathBuf;
@@ -113,12 +112,30 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HookKind {
-    /// Claude Code WorktreeCreate: JSON on stdin, prints the worktree path.
-    ClaudeWorktreeCreate,
-    /// Claude Code WorktreeRemove: JSON on stdin, colds the worktree.
-    ClaudeWorktreeRemove,
-    /// git post-checkout: registers a newly added linked worktree.
-    GitPostCheckout {
+    /// Claude Code's WorktreeCreate and WorktreeRemove hooks.
+    Claude {
+        #[command(subcommand)]
+        event: ClaudeHook,
+    },
+    /// git hooks.
+    Git {
+        #[command(subcommand)]
+        event: GitHook,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaudeHook {
+    /// WorktreeCreate: JSON on stdin, prints the worktree path.
+    Create,
+    /// WorktreeRemove: JSON on stdin, colds the worktree.
+    Remove,
+}
+
+#[derive(Subcommand)]
+enum GitHook {
+    /// post-checkout: registers a newly added linked worktree.
+    PostCheckout {
         prev: String,
         new: String,
         flag: String,
@@ -184,11 +201,15 @@ fn main() -> ExitCode {
             }
         }),
         Command::Hook { kind } => match kind {
-            HookKind::ClaudeWorktreeCreate => hook::claude_worktree_create(&home),
-            HookKind::ClaudeWorktreeRemove => hook::claude_worktree_remove(&home),
-            HookKind::GitPostCheckout { prev, flag, .. } => {
-                Ok(hook::git_post_checkout(&home, &prev, &flag))
-            }
+            HookKind::Claude {
+                event: ClaudeHook::Create,
+            } => bale_hooks::claude::create(&home),
+            HookKind::Claude {
+                event: ClaudeHook::Remove,
+            } => bale_hooks::claude::remove(&home),
+            HookKind::Git {
+                event: GitHook::PostCheckout { prev, new, flag },
+            } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
         },
         Command::Install {
             claude_hooks,
@@ -247,7 +268,7 @@ fn report_cold(id: &str, outcome: Outcome) -> ExitCode {
 /// What `report` prints for a busy tree.
 fn busy_report(id: &str, holders: &[bale_core::busy::Holder], during_cold: bool) -> String {
     if holders.is_empty() && during_cold {
-        return format!("{id}: {}\n", hook::CHANGED_DURING_COLD);
+        return format!("{id}: {}\n", bale_hooks::CHANGED_DURING_COLD);
     }
     let mut text = format!("{id}: busy, left untouched\n");
     for h in holders {
@@ -477,7 +498,7 @@ mod tests {
     fn busy_report_without_holders_says_the_tree_changed() {
         assert_eq!(
             busy_report("wt-1", &[], true),
-            format!("wt-1: {}\n", hook::CHANGED_DURING_COLD)
+            format!("wt-1: {}\n", bale_hooks::CHANGED_DURING_COLD)
         );
     }
 

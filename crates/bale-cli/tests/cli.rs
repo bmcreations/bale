@@ -174,7 +174,7 @@ fn single_path(out: &Output) -> PathBuf {
 fn create_hook_prints_only_path() {
     let env = Env::new();
     let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert!(path.is_dir(), "{}", path.display());
@@ -200,7 +200,7 @@ fn create_hook_falls_back_to_git_when_bale_fails() {
     // From inside a linked worktree, the fallback still roots at the main checkout.
     let linked = env.add_worktree("linked");
     let input = payload("worktree_create.json", &[("cwd", &linked)]);
-    let out = env.bale(&linked, &["hook", "claude-worktree-create"], Some(&input));
+    let out = env.bale(&linked, &["hook", "claude", "create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert_eq!(
@@ -224,13 +224,13 @@ fn remove_hook_exit_matches_dir_state() {
     let wt = env.add_worktree("wt");
     fs::write(wt.join("f"), "dirty\n").unwrap();
     let input = payload("worktree_remove.json", &[("worktree_path", &wt)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-remove"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "remove"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(fs::symlink_metadata(&wt).is_err(), "dir still exists");
     assert!(stdout(&out).is_empty(), "{}", stdout(&out));
 
     // Already gone: counts as removed.
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-remove"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "remove"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
@@ -246,7 +246,7 @@ fn remove_hook_busy_tree_fails_and_stays() {
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
     let input = payload("worktree_remove.json", &[("worktree_path", &wt)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-remove"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "remove"], Some(&input));
     let _ = child.kill();
     let _ = child.wait();
     assert!(!out.status.success());
@@ -286,20 +286,24 @@ fn post_checkout_registers_new_worktree_only() {
 
     let out = env.bale(
         &fresh,
-        &["hook", "git-post-checkout", ZEROS, sha, "1"],
+        &["hook", "git", "post-checkout", ZEROS, sha, "1"],
         None,
     );
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(env.is_registered(&fresh));
 
-    let out = env.bale(&other, &["hook", "git-post-checkout", sha, sha, "1"], None);
+    let out = env.bale(
+        &other,
+        &["hook", "git", "post-checkout", sha, sha, "1"],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!env.is_registered(&other));
 
     // The main checkout (as after `git clone`) is never registered, and never fails.
     let out = env.bale(
         &env.repo,
-        &["hook", "git-post-checkout", ZEROS, sha, "1"],
+        &["hook", "git", "post-checkout", ZEROS, sha, "1"],
         None,
     );
     assert!(out.status.success(), "{}", stderr(&out));
@@ -406,7 +410,7 @@ fn git_hook_install_twice_does_not_double_chain() {
     assert!(prev.contains(original), "{prev}");
     assert!(!prev.contains("bale"), "bale chained to itself: {prev}");
     let hook = fs::read_to_string(dir.join("post-checkout")).unwrap();
-    assert_eq!(hook.matches("hook git-post-checkout").count(), 1, "{hook}");
+    assert_eq!(hook.matches("hook git post-checkout").count(), 1, "{hook}");
 }
 
 #[test]
@@ -445,7 +449,7 @@ fn git_hook_goes_in_hooks_path_outside_tree() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(shared.join("post-checkout.pre-bale").is_file());
     let hook = fs::read_to_string(shared.join("post-checkout")).unwrap();
-    assert!(hook.contains("hook git-post-checkout"), "{hook}");
+    assert!(hook.contains("hook git post-checkout"), "{hook}");
 }
 
 #[test]
@@ -459,7 +463,7 @@ fn git_hook_refuses_hooks_path_inside_tree() {
     let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
     assert!(!out.status.success());
     let all = format!("{}{}", stdout(&out), stderr(&out));
-    assert!(all.contains("hook git-post-checkout"), "{all}");
+    assert!(all.contains("hook git post-checkout"), "{all}");
     assert_eq!(
         fs::read_to_string(husky.join("post-checkout")).unwrap(),
         before
@@ -643,7 +647,7 @@ fn create_hook_reuses_worktree_bale_already_made() {
         .unwrap()
         .expect("lock");
     let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert_eq!(canon(&path), canon(&target));
@@ -660,7 +664,7 @@ fn remove_via_shell(env: &Env, wt: &Path, extra: &str) -> Output {
     use std::process::Stdio;
     let input = payload("worktree_remove.json", &[("worktree_path", wt)]);
     let script = format!(
-        "cd \"$WT\" || exit 9\n{extra}\n\"$BALE\" hook claude-worktree-remove\nstatus=$?\nexit $status\n"
+        "cd \"$WT\" || exit 9\n{extra}\n\"$BALE\" hook claude remove\nstatus=$?\nexit $status\n"
     );
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
@@ -866,7 +870,7 @@ fn remove_hook_blocks_on_holder_above_non_shell_parent() {
     let wt = env.add_worktree("wt");
     let input = payload("worktree_remove.json", &[("worktree_path", &wt)]);
     let script = r#"cd "$WT" || exit 9
-perl -e 'system(@ARGV); exit($? >> 8)' sh -c "'$BALE' hook claude-worktree-remove"
+perl -e 'system(@ARGV); exit($? >> 8)' sh -c "'$BALE' hook claude remove"
 exit $?
 "#;
     let mut cmd = Command::new("sh");
@@ -917,7 +921,7 @@ fn create_hook_does_not_adopt_a_preexisting_worktree() {
     );
     fs::write(theirs.join("f"), "user edits\n").unwrap();
     let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    let out = env.bale(&env.repo, &["hook", "claude", "create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert_eq!(
@@ -969,7 +973,7 @@ fn create_hook_fallback_roots_at_main_checkout_with_separate_git_dir() {
         fs::create_dir_all(env.tmp.path().join(root).join("feature-auth")).unwrap();
     }
     let input = payload("worktree_create.json", &[("cwd", &main)]);
-    let out = env.bale(&main, &["hook", "claude-worktree-create"], Some(&input));
+    let out = env.bale(&main, &["hook", "claude", "create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert_eq!(

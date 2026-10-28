@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 bale-core = { path = "../bale-core" }
+bale-hooks = { path = "../bale-hooks" }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tempfile = "3.27.0"

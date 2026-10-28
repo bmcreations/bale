@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use bale_core::git::Git;
 use serde_json::{json, Map, Value};
 
-use crate::hook::display_path;
+use bale_hooks::display_path;
 
 /// First line after the shebang of the git hook bale writes; marks it as ours.
 const GIT_HOOK_MARKER: &str = "# Installed by `bale install --git-hook`.";
@@ -616,7 +616,7 @@ fn git_hook_script(exe: &Path) -> String {
          BALE='{exe}'\n\
          command -v \"$BALE\" >/dev/null 2>&1 || BALE=bale\n\
          if command -v \"$BALE\" >/dev/null 2>&1; then\n\
-         \x20 \"$BALE\" hook git-post-checkout \"$@\" || true\n\
+         \x20 \"$BALE\" hook git post-checkout \"$@\" || true\n\
          fi\n\
          PREV=\"$(dirname \"$0\")/post-checkout.pre-bale\"\n\
          if [ -x \"$PREV\" ]; then\n\
@@ -643,7 +643,7 @@ fn git_hook_plan(repo: &Path, exe: &Path) -> Result<Plan> {
                 bail!(
                     "core.hooksPath points at {} inside the working tree; bale does not \
                      change tracked hooks. Add this line to its post-checkout instead:\n  \
-                     \"{}\" hook git-post-checkout \"$@\" || true",
+                     \"{}\" hook git post-checkout \"$@\" || true",
                     display_path(&dir),
                     display_path(exe).replace('\\', "/")
                 );
@@ -927,7 +927,7 @@ mod tests {
         assert!(s.starts_with("#!/bin/sh\n"));
         assert!(s.contains(GIT_HOOK_MARKER));
         assert!(s.contains(r"BALE='/opt/it'\''s/bale'"));
-        assert_eq!(s.matches("hook git-post-checkout").count(), 1);
+        assert_eq!(s.matches("hook git post-checkout").count(), 1);
         assert!(s.contains("exec \"$PREV\" \"$@\""));
     }
 }
