@@ -24,15 +24,18 @@ pub enum Step {
         from: PathBuf,
         to: PathBuf,
     },
-    /// Rewrites a config file atomically. A JSON file, which serde_json
-    /// reformats, has `before` backed up to `<name>.bak-bale` the first time;
-    /// other formats are edited in place and get no backup.
+    /// Deletes a file; one already gone counts as deleted.
+    Remove(PathBuf),
+    /// Rewrites a config file atomically. With `backup`, the file as it was
+    /// is copied there first unless a backup already exists: serde_json
+    /// reformats a JSON file, and the copy keeps the original layout.
     Settings {
         path: PathBuf,
         before: Option<String>,
         after: String,
         /// The original file's permissions, restored after the rewrite.
         mode: Option<fs::Permissions>,
+        backup: Option<PathBuf>,
     },
     Run {
         args: Vec<String>,
@@ -65,16 +68,18 @@ impl Plan {
                 Step::Rename { from, to } => {
                     println!("mv {} {}", display_path(from), display_path(to))
                 }
+                Step::Remove(p) => println!("rm {}", display_path(p)),
                 Step::Settings {
                     path,
                     before,
                     after,
+                    backup,
                     ..
                 } => {
                     println!("update {}:", display_path(path));
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if before.is_some() && is_json(path) {
-                        println!("{}", reformat_note(path));
+                    if let (Some(_), Some(backup)) = (before, backup) {
+                        println!("{}", reformat_note(path, backup));
                     }
                 }
                 Step::Run {
@@ -120,20 +125,29 @@ impl Plan {
                     })?;
                     println!("moved {} to {}", display_path(from), display_path(to));
                 }
+                Step::Remove(p) => {
+                    match fs::remove_file(p) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(e).with_context(|| format!("deleting {}", p.display()))
+                        }
+                        _ => {}
+                    }
+                    println!("removed {}", display_path(p));
+                }
                 Step::Settings {
                     path,
                     before,
                     after,
                     mode,
+                    backup,
                 } => {
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if before.is_some() && is_json(path) {
-                        println!("{}", reformat_note(path));
-                    }
-                    let backup = backup_path(path);
-                    if before.is_some() && is_json(path) && fs::symlink_metadata(&backup).is_err() {
-                        fs::copy(path, &backup)
-                            .with_context(|| format!("backing up {}", path.display()))?;
+                    if let (Some(_), Some(backup)) = (before, backup) {
+                        println!("{}", reformat_note(path, backup));
+                        if fs::symlink_metadata(backup).is_err() {
+                            fs::copy(path, backup)
+                                .with_context(|| format!("backing up {}", path.display()))?;
+                        }
                     }
                     write_atomic(path, after)?;
                     if let Some(mode) = mode {
@@ -180,21 +194,69 @@ impl Plan {
     }
 }
 
-/// Whether `path` is a JSON file, which serde_json rewrites in its own layout.
-fn is_json(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e == "json")
-}
-
-/// `<name>.bak-bale` beside `path`.
-fn backup_path(path: &Path) -> PathBuf {
+/// Where a JSON config's original is kept: `<name>.bak-bale` beside `path`.
+pub(crate) fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".bak-bale");
     path.with_file_name(name)
 }
 
-fn reformat_note(path: &Path) -> String {
+fn reformat_note(path: &Path, backup: &Path) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    format!("note: {name} is reformatted (2-space JSON); {name}.bak-bale keeps the original")
+    format!(
+        "note: {name} is reformatted (2-space JSON); {} keeps the original",
+        display_path(backup)
+    )
+}
+
+/// A config file's text and permissions, or `None` when it does not exist.
+/// A symlink is refused: bale would replace it with a regular file.
+pub(crate) fn read_config(path: &Path) -> Result<Option<(String, fs::Permissions)>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink; bale will not replace it with a regular file. Remove \
+             bale's entries from the file it points at by hand",
+            path.display()
+        );
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some((text, meta.permissions())))
+}
+
+/// The steps that write `root`, a JSON config with bale's entries removed:
+/// delete the file when nothing is left, else rewrite it, restoring the
+/// install's backup byte for byte when it holds the same JSON.
+pub(crate) fn json_uninstall_steps(
+    path: &Path,
+    before: String,
+    mode: fs::Permissions,
+    root: &serde_json::Value,
+) -> Result<Vec<Step>> {
+    if root.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(vec![Step::Remove(path.to_path_buf())]);
+    }
+    let original = fs::read_to_string(backup_path(path)).ok().filter(|text| {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .as_ref()
+            == Some(root)
+    });
+    let after = match original {
+        Some(text) => text,
+        None => serde_json::to_string_pretty(root)? + "\n",
+    };
+    Ok(vec![Step::Settings {
+        path: path.to_path_buf(),
+        before: Some(before),
+        after,
+        mode: Some(mode),
+        backup: None,
+    }])
 }
 
 /// Writes `content` to a temp file beside `path`, then renames it over `path`.

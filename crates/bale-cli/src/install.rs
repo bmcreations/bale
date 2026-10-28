@@ -1,11 +1,13 @@
-//! `bale install`: the sweep schedule, or with `--hooks` only the given
-//! tools' hooks (built by `bale-hooks`). Every effect is first built as a
-//! [`Plan`], which `--print-only` prints and a real run applies.
+//! `bale install` and `bale uninstall`: the sweep schedule, or with `--hooks`
+//! only the given tools' hooks (built by `bale-hooks`). Every effect is first
+//! built as a [`Plan`], which `--print-only` prints and a real run applies.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use bale_core::registry::{Level, Registry};
+use bale_core::BaleHome;
 use bale_hooks::install::{Plan, Step};
 use bale_hooks::{display_path, Tool};
 
@@ -25,6 +27,82 @@ pub fn plan(hooks: &[Tool], repo: Option<&Path>) -> Result<Plan> {
         plan.extend(bale_hooks::install_plan(tool, &exe, &home, repo)?);
     }
     Ok(plan)
+}
+
+/// Builds the whole uninstall: without hooks it removes the sweep schedule,
+/// otherwise only bale's entries in the listed tools' hooks. bale's saved
+/// state is never touched; the plan ends saying so.
+pub fn uninstall_plan(hooks: &[Tool], repo: Option<&Path>, bale: &BaleHome) -> Result<Plan> {
+    let home = home_dir()?;
+    let mut plan = Plan::default();
+    if hooks.is_empty() {
+        plan.extend(unschedule_plan(&home)?);
+    }
+    for &tool in hooks {
+        plan.extend(bale_hooks::uninstall_plan(tool, &home, repo)?);
+    }
+    plan.extend(Plan::new(vec![Step::Note(kept_note(bale)?)]));
+    Ok(plan)
+}
+
+/// Says that bale's saved state stays, with how many worktrees are cold.
+fn kept_note(bale: &BaleHome) -> Result<String> {
+    let cold = Registry::open(bale.clone())
+        .all_lenient()?
+        .into_iter()
+        .filter(|(_, r)| r.as_ref().is_ok_and(|r| r.level == Level::Cold))
+        .count();
+    let count = match cold {
+        1 => "1 worktree is cold".to_string(),
+        n => format!("{n} worktrees are cold"),
+    };
+    Ok(format!(
+        "note: bale's saved state in {} is kept: {count}, and `bale open` still restores \
+         a cold worktree",
+        display_path(&bale.0)
+    ))
+}
+
+/// Stops and deletes the sweep schedule [`schedule_plan`] installs. Each
+/// stop command's failure is ignored: the schedule may not be installed.
+fn unschedule_plan(home: &Path) -> Result<Plan> {
+    let run = |args: &[&str]| Step::Run {
+        args: args.iter().map(|s| s.to_string()).collect(),
+        ignore_failure: true,
+        attempts: 1,
+    };
+    let steps = if cfg!(target_os = "macos") {
+        let uid = current_uid()?;
+        vec![
+            run(&[
+                "launchctl",
+                "bootout",
+                &format!("gui/{uid}/{LAUNCHD_LABEL}"),
+            ]),
+            Step::Remove(
+                home.join("Library")
+                    .join("LaunchAgents")
+                    .join(format!("{LAUNCHD_LABEL}.plist")),
+            ),
+        ]
+    } else if cfg!(windows) {
+        vec![run(&["schtasks", "/Delete", "/TN", "bale-sweep", "/F"])]
+    } else {
+        let units = home.join(".config").join("systemd").join("user");
+        vec![
+            run(&[
+                "systemctl",
+                "--user",
+                "disable",
+                "--now",
+                "bale-sweep.timer",
+            ]),
+            Step::Remove(units.join("bale-sweep.service")),
+            Step::Remove(units.join("bale-sweep.timer")),
+            run(&["systemctl", "--user", "daemon-reload"]),
+        ]
+    };
+    Ok(Plan::new(steps))
 }
 
 /// The running binary's absolute path as invoked (not canonicalized, so a

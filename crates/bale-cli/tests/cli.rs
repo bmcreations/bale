@@ -2144,3 +2144,227 @@ fn codex_setup_resolves_relative_path_arg() {
     assert!(env.is_registered(&wt), "{}", stdout(&out));
     assert_eq!(json_record(&env, &wt)["origin"]["tool"], "codex");
 }
+
+/// `bale uninstall --hooks <tool> [--repo <repo>]`.
+fn uninstall(env: &Env, tool: &str, repo: bool) -> Output {
+    let mut args = vec!["uninstall", "--hooks", tool];
+    let repo_s = env.repo.to_str().unwrap();
+    if repo {
+        args.extend(["--repo", repo_s]);
+    }
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    out
+}
+
+/// `bale install --hooks <tool> [--repo <repo>]`, which must succeed.
+fn install(env: &Env, tool: &str, repo: bool) -> Output {
+    let mut args = vec!["install", "--hooks", tool];
+    let repo_s = env.repo.to_str().unwrap();
+    if repo {
+        args.extend(["--repo", repo_s]);
+    }
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    out
+}
+
+#[test]
+fn uninstall_claude_keeps_user_hooks() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Not in serde_json's layout: the original bytes come back.
+    let compact =
+        serde_json::to_string(&serde_json::from_str::<Value>(USER_HOOKS).unwrap()).unwrap();
+    fs::write(&path, &compact).unwrap();
+    install(&env, "claude", false);
+    let out = uninstall(&env, "claude", false);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        compact,
+        "{}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("bale open"), "{}", stdout(&out));
+
+    // Edited after install: only bale's entries go; a wrapped one stays.
+    install(&env, "claude", false);
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["model"] = "opus".into();
+    v["hooks"]["WorktreeRemove"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"hooks": [{"type": "command",
+            "command": "nice '/x/bale' hook claude remove"}]}));
+    fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    let out = uninstall(&env, "claude", false);
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let user: Value = serde_json::from_str(USER_HOOKS).unwrap();
+    assert_eq!(after["model"], "opus");
+    assert_eq!(after["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
+    assert!(after["hooks"].get("WorktreeCreate").is_none(), "{after}");
+    let remove = after["hooks"]["WorktreeRemove"].as_array().unwrap();
+    assert_eq!(remove.len(), 2, "{after}");
+    assert_eq!(remove[0], user["hooks"]["WorktreeRemove"][0]);
+    assert_eq!(
+        remove[1]["hooks"][0]["command"],
+        "nice '/x/bale' hook claude remove"
+    );
+
+    // A settings file bale created is deleted.
+    let env = Env::new();
+    let path = settings_path(&env);
+    install(&env, "claude", false);
+    assert!(path.is_file());
+    uninstall(&env, "claude", false);
+    assert!(!path.exists());
+}
+
+#[test]
+fn uninstall_conductor_restores_scripts() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for original in [CONDUCTOR_TOML, "# no scripts yet\n[other]\nkey = 1\n"] {
+        fs::write(&path, original).unwrap();
+        install(&env, "conductor", true);
+        assert_ne!(fs::read_to_string(&path).unwrap(), original);
+        let out = uninstall(&env, "conductor", true);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "{}",
+            stdout(&out)
+        );
+    }
+
+    // Written by hand around bale: left alone.
+    let by_hand = "[scripts]\nsetup = \"npm i && '/old/bale' hook conductor setup\"\n";
+    fs::write(&path, by_hand).unwrap();
+    let out = uninstall(&env, "conductor", true);
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert_eq!(fs::read_to_string(&path).unwrap(), by_hand);
+
+    // A file bale created is deleted.
+    fs::remove_file(&path).unwrap();
+    install(&env, "conductor", true);
+    assert!(path.is_file());
+    uninstall(&env, "conductor", true);
+    assert!(!path.exists());
+}
+
+#[test]
+fn uninstall_cursor_removes_only_bale_entry() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = r#"{"zeta":1,"setup-worktree":["npm install"],"alpha":2}"#;
+    fs::write(&path, original).unwrap();
+    install(&env, "cursor", true);
+    uninstall(&env, "cursor", true);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    // Edited after install: the user's commands stay, bale's key goes.
+    fs::write(&path, r#"{"other":1}"#).unwrap();
+    install(&env, "cursor", true);
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["other"] = 2.into();
+    v["setup-worktree-unix"] = serde_json::json!(["echo hi"]);
+    fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    uninstall(&env, "cursor", true);
+    let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        after,
+        serde_json::json!({"other": 2, "setup-worktree-unix": ["echo hi"]})
+    );
+
+    // A file bale created is deleted.
+    fs::remove_file(&path).unwrap();
+    install(&env, "cursor", true);
+    uninstall(&env, "cursor", true);
+    assert!(!path.exists());
+}
+
+#[test]
+fn uninstall_git_hook_leaves_foreign_hook() {
+    let env = Env::new();
+    let hook = hooks_dir(&env).join("post-checkout");
+    let prev = hooks_dir(&env).join("post-checkout.pre-bale");
+    write_hook(&hook, "echo mine");
+    let foreign = fs::read(&hook).unwrap();
+
+    // Not bale's: untouched.
+    let out = uninstall(&env, "git", true);
+    assert!(stdout(&out).contains("not bale's"), "{}", stdout(&out));
+    assert_eq!(fs::read(&hook).unwrap(), foreign);
+
+    // Chained by install: the user's hook moves back.
+    install(&env, "git", true);
+    assert!(prev.is_file());
+    uninstall(&env, "git", true);
+    assert_eq!(fs::read(&hook).unwrap(), foreign);
+    assert!(!prev.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&hook).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111);
+    }
+
+    // bale's own hook alone: removed.
+    fs::remove_file(&hook).unwrap();
+    install(&env, "git", true);
+    assert!(hook.is_file());
+    uninstall(&env, "git", true);
+    assert!(!hook.exists());
+}
+
+#[test]
+fn uninstall_schedule_print_only_lists_steps() {
+    let env = Env::new();
+    let wt = env.add_worktree("cold-one");
+    let out = env.bale(&env.repo, &["cold", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = listing(&env.home());
+    let bale_before = listing(&env.bale_home());
+
+    let out = env.bale(&env.repo, &["uninstall", "--print-only"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let home = env.home();
+    if cfg!(target_os = "macos") {
+        let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+        assert!(
+            text.contains(&format!(
+                "run: launchctl bootout gui/{}/dev.bale.sweep",
+                uid.trim()
+            )),
+            "{text}"
+        );
+        let plist = home.join("Library/LaunchAgents/dev.bale.sweep.plist");
+        assert!(text.contains(&format!("rm {}", plist.display())), "{text}");
+    } else if cfg!(windows) {
+        assert!(
+            text.contains("run: schtasks /Delete /TN bale-sweep /F"),
+            "{text}"
+        );
+    } else {
+        assert!(
+            text.contains("run: systemctl --user disable --now bale-sweep.timer"),
+            "{text}"
+        );
+        let units = home.join(".config/systemd/user");
+        for unit in ["bale-sweep.service", "bale-sweep.timer"] {
+            assert!(
+                text.contains(&format!("rm {}", units.join(unit).display())),
+                "{text}"
+            );
+        }
+    }
+    assert!(text.contains("1 worktree is cold"), "{text}");
+    assert!(text.contains("bale open"), "{text}");
+    assert_eq!(listing(&env.home()), before);
+    assert_eq!(listing(&env.bale_home()), bale_before);
+}

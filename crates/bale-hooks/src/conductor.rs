@@ -20,7 +20,8 @@ use bale_core::BaleHome;
 use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
-use crate::install::{Plan, Step};
+use crate::cmdline::{bale_call, BaleCall};
+use crate::install::{read_config, Plan, Step};
 use crate::{display_path, remove_tree, Tool};
 
 /// The workspace a script runs for: `CONDUCTOR_WORKSPACE_PATH`, or the cwd.
@@ -181,6 +182,7 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
             before,
             after,
             mode,
+            backup: None,
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Conductor workspace of \
@@ -189,6 +191,98 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
         )),
     ]);
     Ok(Plan::new(notes))
+}
+
+/// Whether `cmd` is exactly bale's script for `kind`, from any exe path.
+fn is_bale_script(cmd: &str, kind: &str) -> bool {
+    bale_call(cmd, &["hook", "conductor", kind]) == Some(BaleCall::Plain)
+}
+
+/// `value` split the way [`chain`] built it: the user's script (`None` when
+/// the value is bale's alone) and bale's command. `None` when the value is
+/// not in that shape.
+fn unchain<'v>(kind: &str, value: &'v str) -> Option<(Option<&'v str>, &'v str)> {
+    if is_bale_script(value, kind) {
+        return Some((None, value));
+    }
+    let sep = if kind == "setup" { "\n) && " } else { "\n); " };
+    let (user, bale) = value.strip_prefix("( ")?.rsplit_once(sep)?;
+    is_bale_script(bale, kind).then_some((Some(user), bale))
+}
+
+/// Takes bale out of `<repo>/.conductor/settings.toml`'s `[scripts]` setup
+/// and archive: a chained value gets the user's script back, a value that
+/// was bale's alone goes, and so does a `[scripts]` table or file left empty.
+/// A value that runs bale in a shape install does not write is left alone.
+pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
+    let path = repo.join(".conductor").join("settings.toml");
+    let none = || {
+        Plan::new(vec![Step::Note(format!(
+            "{}: no bale Conductor scripts to remove",
+            display_path(&path)
+        ))])
+    };
+    let Some((before, mode)) = read_config(&path)? else {
+        return Ok(none());
+    };
+    let mut doc: DocumentMut = before
+        .parse()
+        .with_context(|| format!("{} is not valid TOML; leaving it unchanged", path.display()))?;
+    let Some(scripts) = doc.get_mut("scripts").and_then(|s| s.as_table_like_mut()) else {
+        return Ok(none());
+    };
+    let mut changed = false;
+    let mut steps = Vec::new();
+    for kind in ["setup", "archive"] {
+        let Some(value) = scripts.get_mut(kind).and_then(|i| i.as_value_mut()) else {
+            continue;
+        };
+        let Some(current) = value.as_str() else {
+            continue;
+        };
+        match unchain(kind, current) {
+            Some((None, _)) => {
+                scripts.remove(kind);
+                changed = true;
+            }
+            Some((Some(user), _)) => {
+                let decor = value.decor().clone();
+                *value = Value::from(user.to_string());
+                *value.decor_mut() = decor;
+                changed = true;
+            }
+            None if bale_call(current, &["hook", "conductor", kind]).is_some() => {
+                steps.push(Step::Note(format!(
+                    "note: left unchanged in {}: scripts.{kind} `{current}` runs bale in a \
+                     form bale did not write; remove it by hand",
+                    display_path(&path)
+                )));
+            }
+            None => {}
+        }
+    }
+    if !changed {
+        if steps.is_empty() {
+            return Ok(none());
+        }
+        return Ok(Plan::new(steps));
+    }
+    if scripts.is_empty() {
+        doc.remove("scripts");
+    }
+    let after = doc.to_string();
+    if after.trim().is_empty() {
+        steps.push(Step::Remove(path));
+    } else {
+        steps.push(Step::Settings {
+            path,
+            before: Some(before),
+            after,
+            mode: Some(mode),
+            backup: None,
+        });
+    }
+    Ok(Plan::new(steps))
 }
 
 #[cfg(test)]

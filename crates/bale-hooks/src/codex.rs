@@ -74,3 +74,13 @@ pub fn install_plan(exe: &Path) -> Result<Plan> {
         ),
     ]))
 }
+
+/// Install wrote nothing for Codex, so there is nothing to remove; says
+/// where the user added bale's command.
+pub fn uninstall_plan() -> Plan {
+    Plan::new(vec![Step::Note(
+        "note: bale wrote nothing for Codex; remove the `bale hook codex setup` command from \
+         the setup script of your Codex local environment (Codex app Settings) by hand"
+            .to_string(),
+    )])
+}

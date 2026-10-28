@@ -32,7 +32,7 @@ use bale_core::registry::Origin;
 use bale_core::BaleHome;
 use serde_json::{json, Map, Value};
 
-use crate::install::{Plan, Step};
+use crate::install::{backup_path, json_uninstall_steps, read_config, Plan, Step};
 use crate::{display_path, remove_tree, Tool};
 
 /// Reads the hook's JSON payload from stdin.
@@ -476,6 +476,7 @@ pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
                 .to_path_buf(),
         ),
         Step::Settings {
+            backup: Some(backup_path(&path)),
             path,
             before,
             after,
@@ -483,6 +484,78 @@ pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
         },
     ]);
     Ok(Plan::new(notes))
+}
+
+/// Removes bale's own WorktreeCreate and WorktreeRemove entries from
+/// `<home>/.claude/settings.json`, as install recognises them; a command the
+/// user wrapped around bale stays. Groups, events and `hooks` emptied by the
+/// removal go too, and the file when nothing is left.
+pub fn uninstall_plan(home: &Path) -> Result<Plan> {
+    let path = home.join(".claude").join("settings.json");
+    let Some((before, mode)) = read_config(&path)? else {
+        return Ok(Plan::new(vec![Step::Note(format!(
+            "{}: no Claude Code hooks to remove",
+            display_path(&path)
+        ))]));
+    };
+    let mut root: Value = serde_json::from_str(&before)
+        .with_context(|| format!("{} is not valid JSON; leaving it unchanged", path.display()))?;
+    let obj = root
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", path.display()))?;
+    let mut changed = false;
+    let mut steps = Vec::new();
+    if let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
+        for (event, kind) in HOOKS {
+            let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let mut emptied = vec![false; groups.len()];
+            for (i, group) in groups.iter_mut().enumerate() {
+                let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                let n = entries.len();
+                entries.retain(|h| {
+                    let Some(cmd) = h["command"].as_str() else {
+                        return true;
+                    };
+                    if bale_hook_path(cmd, kind).is_some() {
+                        return false;
+                    }
+                    if mentions_hook(cmd, kind) {
+                        steps.push(Step::Note(format!(
+                            "note: left unchanged in {}: {event} hook `{cmd}` runs bale but \
+                             is not bale's plain entry; remove it by hand",
+                            display_path(&path)
+                        )));
+                    }
+                    true
+                });
+                emptied[i] = entries.len() != n && entries.is_empty();
+                changed |= entries.len() != n;
+            }
+            if emptied.contains(&true) {
+                let mut flags = emptied.into_iter();
+                groups.retain(|_| !flags.next().unwrap_or(false));
+                if groups.is_empty() {
+                    hooks.shift_remove(event);
+                }
+            }
+        }
+        if changed && hooks.is_empty() {
+            obj.shift_remove("hooks");
+        }
+    }
+    if !changed {
+        steps.push(Step::Note(format!(
+            "{}: no bale Claude Code hooks to remove",
+            display_path(&path)
+        )));
+        return Ok(Plan::new(steps));
+    }
+    steps.extend(json_uninstall_steps(&path, before, mode, &root)?);
+    Ok(Plan::new(steps))
 }
 
 #[cfg(test)]

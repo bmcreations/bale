@@ -22,7 +22,8 @@ use bale_core::BaleHome;
 use serde_json::{Map, Value};
 
 use crate::claude::sh_quote;
-use crate::install::{windows_quote, Plan, Step};
+use crate::cmdline::{bale_call, BaleCall};
+use crate::install::{backup_path, json_uninstall_steps, read_config, windows_quote, Plan, Step};
 use crate::{as_hook, display_path, Tool};
 
 /// setup: registers the worktree Cursor ran it in (the cwd) and records
@@ -171,6 +172,7 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
             before,
             after,
             mode,
+            backup: Some(backup_path(&path)),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Cursor worktree of this \
@@ -179,6 +181,75 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
             display_path(&path)
         )),
     ]))
+}
+
+/// The keys Cursor reads setup commands from.
+const SETUP_KEYS: [&str; 3] = [
+    "setup-worktree",
+    "setup-worktree-unix",
+    "setup-worktree-windows",
+];
+
+/// The words of bale's setup command after the exe.
+const HOOK_ARGS: [&str; 3] = ["hook", "cursor", "setup"];
+
+/// Removes bale's setup entry from each setup array of
+/// `<repo>/.cursor/worktrees.json`; an entry the user wrapped around bale
+/// stays. A key emptied by the removal goes, and the file when nothing is
+/// left.
+pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
+    let path = repo.join(".cursor").join("worktrees.json");
+    let Some((before, mode)) = read_config(&path)? else {
+        return Ok(Plan::new(vec![Step::Note(format!(
+            "{}: no Cursor hook to remove",
+            display_path(&path)
+        ))]));
+    };
+    let mut root: Value = serde_json::from_str(&before)
+        .with_context(|| format!("{} is not valid JSON; leaving it unchanged", path.display()))?;
+    let obj = root
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", path.display()))?;
+    let mut changed = false;
+    let mut steps = Vec::new();
+    for key in SETUP_KEYS {
+        let Some(commands) = obj.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let n = commands.len();
+        commands.retain(|c| {
+            match c
+                .as_str()
+                .and_then(|c| Some((c, bale_call(c, &HOOK_ARGS)?)))
+            {
+                Some((_, BaleCall::Plain)) => false,
+                Some((c, BaleCall::Wrapped)) => {
+                    steps.push(Step::Note(format!(
+                        "note: left unchanged in {}: {key} entry `{c}` runs bale but is not \
+                     bale's plain entry; remove it by hand",
+                        display_path(&path)
+                    )));
+                    true
+                }
+                None => true,
+            }
+        });
+        if commands.len() != n {
+            changed = true;
+            if commands.is_empty() {
+                obj.shift_remove(key);
+            }
+        }
+    }
+    if !changed {
+        steps.push(Step::Note(format!(
+            "{}: no bale Cursor hook to remove",
+            display_path(&path)
+        )));
+        return Ok(Plan::new(steps));
+    }
+    steps.extend(json_uninstall_steps(&path, before, mode, &root)?);
+    Ok(Plan::new(steps))
 }
 
 #[cfg(test)]

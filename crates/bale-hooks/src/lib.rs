@@ -14,6 +14,7 @@ use bale_core::registry::Record;
 use bale_core::BaleHome;
 
 pub mod claude;
+mod cmdline;
 pub mod codex;
 pub mod conductor;
 pub mod cursor;
@@ -134,6 +135,22 @@ pub fn install_plan<'a>(
         Tool::Conductor => conductor::install_plan(need(repo)?, exe),
         Tool::Cursor => cursor::install_plan(need(repo)?, exe),
         Tool::Codex => codex::install_plan(exe),
+    }
+}
+
+/// The plan that removes what [`install_plan`] added for `tool`, found the
+/// way install finds it. Arguments as for [`install_plan`].
+pub fn uninstall_plan(tool: Tool, home: &Path, repo: Option<&Path>) -> Result<Plan> {
+    let need = |repo: Option<&'_ Path>| {
+        repo.map(Path::to_path_buf)
+            .with_context(|| format!("--repo is required for {}", tool.name()))
+    };
+    match tool {
+        Tool::Claude => claude::uninstall_plan(home),
+        Tool::Git => git::uninstall_plan(&need(repo)?),
+        Tool::Conductor => conductor::uninstall_plan(&need(repo)?),
+        Tool::Cursor => cursor::uninstall_plan(&need(repo)?),
+        Tool::Codex => Ok(codex::uninstall_plan()),
     }
 }
 

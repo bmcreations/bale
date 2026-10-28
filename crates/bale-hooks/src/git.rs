@@ -67,8 +67,7 @@ fn git_hook_script(exe: &Path) -> String {
 /// hook that is not bale's to `post-checkout.pre-bale` and chaining to it.
 pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     let g = Git::at(repo);
-    let dir = g.run(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?;
-    let dir = PathBuf::from(dir.trim_end_matches(['\n', '\r']));
+    let dir = hooks_dir(&g)?;
     // `<scope>\t<value>`, e.g. `global\t~/.githooks`.
     let scope = g
         .run(&["config", "--show-scope", "--get", "core.hooksPath"])
@@ -105,7 +104,7 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     match fs::read(&hook) {
         Ok(bytes) => {
             let current = String::from_utf8_lossy(&bytes);
-            if current.contains(GIT_HOOK_MARKER) {
+            if is_bale_hook(&current) {
                 if current == script {
                     return Ok(Plan::new(vec![Step::Note(format!(
                         "{}: bale post-checkout hook already installed",
@@ -135,6 +134,50 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
         content: script,
         executable: true,
     });
+    Ok(Plan::new(steps))
+}
+
+/// The repo's hooks dir, absolute, honouring `core.hooksPath`.
+fn hooks_dir(g: &Git) -> Result<PathBuf> {
+    let dir = g.run(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?;
+    Ok(PathBuf::from(dir.trim_end_matches(['\n', '\r'])))
+}
+
+/// Whether `script` is a post-checkout hook bale wrote.
+fn is_bale_hook(script: &str) -> bool {
+    script.lines().any(|l| l == GIT_HOOK_MARKER)
+}
+
+/// Removes bale's post-checkout hook from `repo`'s hooks dir and moves the
+/// hook it chained to, `post-checkout.pre-bale`, back. A hook without bale's
+/// marker is the user's and stays.
+pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
+    let dir = hooks_dir(&Git::at(repo))?;
+    let hook = dir.join("post-checkout");
+    let prev = dir.join("post-checkout.pre-bale");
+    let script = match fs::read(&hook) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Plan::new(vec![Step::Note(format!(
+                "{}: no bale post-checkout hook to remove",
+                display_path(&hook)
+            ))]));
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", hook.display())),
+    };
+    if !is_bale_hook(&script) {
+        return Ok(Plan::new(vec![Step::Note(format!(
+            "note: left unchanged: {} is not bale's",
+            display_path(&hook)
+        ))]));
+    }
+    let mut steps = vec![Step::Remove(hook.clone())];
+    if fs::symlink_metadata(&prev).is_ok() {
+        steps.push(Step::Rename {
+            from: prev,
+            to: hook,
+        });
+    }
     Ok(Plan::new(steps))
 }
 

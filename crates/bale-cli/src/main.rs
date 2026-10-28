@@ -104,6 +104,19 @@ enum Command {
         #[arg(long)]
         print_only: bool,
     },
+    /// Remove the sweep schedule, or with --hooks only bale's entries in those tools' hooks.
+    /// Saved state and cold worktrees are kept.
+    Uninstall {
+        /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex.
+        #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
+        hooks: Vec<bale_hooks::Tool>,
+        /// The repo whose hooks to edit; required for git, conductor and cursor.
+        #[arg(long, value_name = "REPO", requires = "hooks")]
+        repo: Option<PathBuf>,
+        /// Print the files and commands without changing anything.
+        #[arg(long)]
+        print_only: bool,
+    },
     /// Keep sweep from upping or colding a worktree.
     Pin {
         /// Worktree path or workspace id (default: the current directory).
@@ -304,14 +317,13 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             hooks,
             repo,
             print_only,
-        } => install::plan(&hooks, repo.as_deref()).and_then(|plan| {
-            if print_only {
-                plan.print();
-                Ok(ExitCode::SUCCESS)
-            } else {
-                plan.apply().map(|()| ExitCode::SUCCESS)
-            }
-        }),
+        } => install::plan(&hooks, repo.as_deref()).and_then(|plan| run_plan(&plan, print_only)),
+        Command::Uninstall {
+            hooks,
+            repo,
+            print_only,
+        } => install::uninstall_plan(&hooks, repo.as_deref(), &home)
+            .and_then(|plan| run_plan(&plan, print_only)),
         Command::Pin { target } => cmd_pin(&home, &target, true),
         Command::Unpin { target } => cmd_pin(&home, &target, false),
         Command::Show { target } => cmd_show(&home, &target).map(|()| ExitCode::SUCCESS),
@@ -322,6 +334,16 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             println!("{}", home.trace_dir().display());
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Prints `plan` with `print_only`, else applies it.
+fn run_plan(plan: &bale_hooks::install::Plan, print_only: bool) -> Result<ExitCode> {
+    if print_only {
+        plan.print();
+        Ok(ExitCode::SUCCESS)
+    } else {
+        plan.apply().map(|()| ExitCode::SUCCESS)
     }
 }
 
