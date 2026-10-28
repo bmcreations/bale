@@ -195,14 +195,15 @@ against what was captured before it is used.
 ### `bale up` (to `baled`)
 
 1. Take the workspace's lock. Refuse if another `bale` operation holds it.
-2. Check it is idle. Refuse if any process has its cwd or an open file inside the tree. On Windows a delete
+2. Skip the tree if git has it locked with a reason other than bale's. Someone else locked it on purpose.
+3. Check it is idle. Refuse if any process has its cwd or an open file inside the tree. On Windows a delete
    would also fail with a sharing violation, so check there first rather than relying on it. Never stop
    another session's Gradle daemon, Xcode or IDE.
-3. `git worktree lock --reason "baled by bale"`, so `git worktree prune` and `gc.worktreePruneExpire`
-   never remove its metadata.
 4. Write the registry record as `baling`.
 5. Rename each regenerable directory to a trash name inside the workspace, then delete the trash names.
    This makes a crash leave either a full directory or a trash name that the next run finishes deleting.
+   A directory with a regenerable name that holds files git tracks, or untracked files that are not
+   ignored, is kept and reported: it is source, not build output.
 6. Remove the workspace's external build output too. That includes Xcode DerivedData folders under
    `~/Library/Developer/Xcode/DerivedData` whose `info.plist` `WorkspacePath` points into this workspace.
    A folder with a missing or unreadable `WorkspacePath` is left alone. So is global DerivedData that matches
@@ -218,20 +219,31 @@ The regenerable set is a list per build system, not a guess.
 
 The list is configurable per repo. Anything not on it is never touched in this level.
 
+`up` does not lock the worktree in git. The git lock only stops `git worktree prune` and
+`gc.worktreePruneExpire` from erasing the metadata of a worktree whose directory is gone, and a baled tree's
+directory is still there. Leaving it unlocked means a tool that runs `git worktree remove` (Claude Code, T3)
+can remove a baled tree; `bale gc` then collects its record. Trees baled by an earlier version still carry
+bale's lock, and `open`, `cold` and `gc` handle them as before.
+
 ### `bale cold`
 
 Everything in `bale up`, then:
 
-1. Save uncommitted changes, both tracked and untracked, as a commit object under `refs/bale/<id>/wip`, with
+1. `git worktree lock --reason "baled by bale"`, so `git worktree prune` and `gc.worktreePruneExpire` never
+   remove its metadata once the directory is gone. Write the registry record as `cooling`, with the branch
+   checked out now (not the one at registration), so `open` returns to it.
+2. Save uncommitted changes, both tracked and untracked, as a commit object under `refs/bale/<id>/wip`, with
    `refs/bale/<id>/head` pointing to the commit it sits on. Do not put them on the user's branch. Several of
    these worktrees use a detached HEAD, and commits that nothing references are eventually garbage collected.
-2. Save ignored files that are not regenerable to `~/.bale/<id>/files/`. Selection uses a denylist: every
+3. Save ignored files that are not regenerable to `~/.bale/<id>/files/`. Selection uses a denylist: every
    ignored file except the regenerable directories, `node_modules`, and similar entries from a configurable
    list. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
    shared store.
-3. Verify the saved state by hashing it against the tree.
-4. Remove the checkout directory. The worktree stays locked in git.
-5. Write the registry record as `cold`.
+4. Verify the saved state by hashing it against the tree.
+5. Rename the checkout directory to a trash name and verify the moved tree again. A process that opened the
+   tree after the busy check could have written to it; on any change, move it back, return the record to
+   `baled` and report the tree busy. Otherwise remove the trash directory. The worktree stays locked in git.
+6. Write the registry record as `cold`.
 
 ### `bale open`
 
@@ -239,13 +251,17 @@ Everything in `bale up`, then:
 2. Apply `refs/bale/<id>/wip` and restore the saved files, checking hashes.
 3. Rewrite machine-specific absolute paths that are known to break, such as `sdk.dir` in
    `local.properties`. This only matters if the path or machine changed.
-4. Unlock the worktree and mark it hot.
+4. Release bale's git lock (a lock with any other reason stays) and mark it hot.
 
 ### Idle
 
 A workspace is idle when nothing has its cwd or a file open inside it, and no source file has changed for the
 threshold. Defaults are 4 hours to `baled` and 7 days to `cold`, both configurable. Gradle expires local build
 cache entries that go unused (7 days by default), so a workspace baled longer than that resumes colder.
+
+A sweep also bales a `baled` workspace again when it has been idle for the `baled` threshold and its
+regenerable directories have come back, for example after a build with no `bale open`. This applies to
+dirty trees too, since `up` touches no source.
 
 A busy workspace is skipped and reported, never forced. Long-lived daemons do not usually block this. An
 `lsof` snapshot of the 29 worktrees on this machine, taken while Gradle daemons, a JetBrains IDE and several
