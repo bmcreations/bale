@@ -265,9 +265,10 @@ Everything in `bale up`, then:
    it will at `open`. The walk skips only the root's `.git`, the regenerable directories `up` removed, and
    what step 3 skips (`node_modules` and the denylist). A skipped directory still has every path the wip
    commit holds under it walked and compared, since `open` writes those. Any entry with an extended
-   attribute other than the ones the OS sets on its own (`com.apple.provenance`, `com.apple.quarantine`,
-   `com.apple.lastuseddate#PS`, `com.apple.macl`, `security.selinux`) counts as a difference: nothing
-   saves xattrs, and a Finder tag is the user's.
+   attribute other than the ones the OS or apps set on their own (`com.apple.provenance`,
+   `com.apple.quarantine`, `com.apple.lastuseddate#PS`, `com.apple.macl`, `com.apple.TextEncoding`,
+   `security.selinux`, and `com.apple.FinderInfo` on `.DS_Store` only) counts as a difference: nothing
+   saves xattrs, and a Finder tag or colour label is the user's.
 
    Each checked-out submodule, nested ones too, is restored the same way: its commit in the wip tree is
    checked out from the submodule's own git dir (so its own config applies, as it will for `git submodule
@@ -369,12 +370,12 @@ the source it saves is about 1 GB per Android worktree.)*
 
 ### Recovering an interrupted `cold`
 
-A record left `cooling` by a crash resumes on the next `cold` or sweep.
+A record left `cooling` by a crash resumes on the next `cold` or sweep. Before anything else, stale
+`.bale-check-<id>-*` dirs beside the path are removed.
 
 - If the checkout is still at its path, `cold` saves and verifies it again from step 2.
 - If the checkout is gone and `refs/bale/<id>/wip` does not resolve, or the saved manifest is missing,
   nothing is deleted: `cold` reports an error and leaves any trash directory beside the path.
-- Stale `.bale-check-<id>-*` dirs beside the path are removed first.
 - Otherwise each trash directory beside the path is handled in turn:
   - If step 5 recorded it (both the trash name and the wip commit match), it was already checked and is
     deleted.
