@@ -12,7 +12,7 @@ use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
-use bale_core::ops::up::{resolve, up, Outcome};
+use bale_core::ops::up::{resolve, up_report, Outcome};
 use bale_core::registry::Registry;
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
@@ -117,9 +117,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = BaleHome::from_env();
     let result = match cli.command {
-        Command::Up { target } => {
-            resolve(&home, &target).and_then(|id| Ok(report(&id, up(&home, &id)?)))
-        }
+        Command::Up { target } => resolve(&home, &target).and_then(|id| {
+            let baled = up_report(&home, &id)?;
+            let code = report(&id, baled.outcome);
+            for dir in baled.kept {
+                println!("  kept {}: {KEPT_WHY}", dir.display());
+            }
+            Ok(code)
+        }),
         Command::Cold { target } => {
             resolve(&home, &target).and_then(|id| Ok(report(&id, cold(&home, &id)?)))
         }
@@ -182,6 +187,9 @@ fn main() -> ExitCode {
         ExitCode::from(1)
     })
 }
+
+/// Why `up` left a regenerable-named dir in place.
+const KEPT_WHY: &str = "holds files git tracks or does not ignore";
 
 /// Prints the outcome; exit 0 done, 3 busy, 4 skipped.
 fn report(id: &str, outcome: Outcome) -> ExitCode {

@@ -315,3 +315,22 @@ fn malformed_config_does_not_hide_level_only_actions() {
     );
     assert_eq!(row(&rows, &cold_id).1, Action::Keep);
 }
+
+#[test]
+fn up_row_names_a_build_dir_it_kept() {
+    let fx = Fixture::new();
+    ignore_build(&fx);
+    global_config(&fx.home(), "idle_baled_hours = 0\n");
+    let wt = gradle_worktree(&fx, "wt");
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/notes.md"), "notes\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let (_, action, result) = row(&rows, &id);
+    assert_eq!(*action, Action::Up);
+    assert!(result.starts_with("baled; kept "), "{result}");
+    assert!(result.contains("build"), "{result}");
+    assert!(wt.join("build/notes.md").exists());
+    assert!(!wt.join("app/build").exists());
+}

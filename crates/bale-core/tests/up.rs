@@ -2,15 +2,22 @@ mod support;
 
 use bale_core::derived_data::derived_data_for;
 use bale_core::git::worktrees;
-use bale_core::ops::up::{register, up, Outcome};
+use bale_core::ops::up::{register, up, up_report, Outcome};
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
 use support::Fixture;
 
-/// A linked Gradle worktree with `app/build/big.bin` (1 MB) and `src/Main.kt`.
+/// A `.gitignore` in `wt` that ignores Gradle's output dirs.
+fn ignore_build(wt: &Path) {
+    fs::write(wt.join(".gitignore"), "build/\n.gradle/\n").unwrap();
+}
+
+/// A linked Gradle worktree with ignored `app/build/big.bin` (1 MB) and
+/// `src/Main.kt`.
 fn gradle_worktree(fx: &Fixture) -> PathBuf {
     let wt = fx.add_worktree("wt", "feature");
+    ignore_build(&wt);
     fs::write(wt.join("settings.gradle.kts"), "").unwrap();
     fs::create_dir_all(wt.join("app/build")).unwrap();
     fs::write(wt.join("app/build/big.bin"), vec![0u8; 1024 * 1024]).unwrap();
@@ -87,6 +94,8 @@ fn up_without_record_is_an_error() {
 fn symlinked_build_dir_removes_link_only() {
     let fx = Fixture::new();
     let wt = fx.add_worktree("wt", "feature");
+    // `build/` would match only a dir; the link must be ignored to go.
+    fs::write(wt.join(".gitignore"), "build\n").unwrap();
     fs::write(wt.join("settings.gradle.kts"), "").unwrap();
     fs::create_dir_all(wt.join("app")).unwrap();
     let outside = fx.home().0.parent().unwrap().join("outside");
@@ -329,4 +338,47 @@ fn unreadable_unrelated_dir_does_not_block_baling() {
     drop(guard);
     assert!(wt.join("secret/inner/s.txt").exists());
     assert!(trash_left(&wt).is_empty());
+}
+
+/// A regenerable-named dir holding a file git tracks, or an untracked file
+/// that is not ignored, is real content: up keeps it and says so.
+#[test]
+fn build_dir_with_real_content_is_kept() {
+    for case in ["tracked", "untracked"] {
+        let fx = Fixture::new();
+        let wt = gradle_worktree(&fx);
+        // Ignores `app/build/` only, so a top-level `build/` is not ignored.
+        fs::write(wt.join(".gitignore"), "app/build/\n").unwrap();
+        fs::create_dir_all(wt.join("build")).unwrap();
+        if case == "tracked" {
+            fs::write(wt.join("build/keep.txt"), "keep\n").unwrap();
+            support::git(&wt, &["add", "build/keep.txt"]);
+            support::git(&wt, &["commit", "-qm", "keep"]);
+        } else {
+            fs::write(wt.join("build/notes.md"), "notes\n").unwrap();
+        }
+        let id = register(&fx.home(), &wt).unwrap().id;
+
+        let report = up_report(&fx.home(), &id).unwrap();
+        assert_eq!(report.outcome, Outcome::Done(Level::Baled), "{case}");
+        let build = fs::canonicalize(wt.join("build")).unwrap();
+        assert_eq!(report.kept, vec![build], "{case}");
+        assert!(wt.join("build").is_dir(), "{case}");
+        assert!(!wt.join("app/build").exists(), "{case}");
+        assert!(trash_left(&wt).is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn build_dir_with_only_ignored_files_goes() {
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx);
+    fs::write(wt.join(".gitignore"), "build/\n*.log\n").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/run.log"), "log\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let report = up_report(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Baled));
+    assert!(report.kept.is_empty(), "{:?}", report.kept);
+    assert!(!wt.join("build").exists());
 }

@@ -116,17 +116,43 @@ pub fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
         .with_context(|| format!("{arg} is neither an existing path nor a registered workspace"))
 }
 
+/// What `up` did, plus the regenerable-named dirs it left in place because
+/// they hold real content (see [`bale_able`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpReport {
+    pub outcome: Outcome,
+    pub kept: Vec<PathBuf>,
+}
+
+impl UpReport {
+    fn plain(outcome: Outcome) -> UpReport {
+        UpReport {
+            outcome,
+            kept: Vec::new(),
+        }
+    }
+}
+
 /// Removes the worktree's regenerable output in place and marks it `Baled`.
 /// A record left `Baling` by a crash resumes at trash removal.
 pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
+    up_report(home, id).map(|r| r.outcome)
+}
+
+/// `up`, also naming the regenerable-named dirs it kept.
+pub fn up_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(Outcome::Skipped("locked".into()));
+        return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
     };
-    up_locked(home, id)
+    up_locked_report(home, id)
 }
 
 /// `up` for a caller that already holds the `WorkspaceLock` for `id`.
 pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
+    up_locked_report(home, id).map(|r| r.outcome)
+}
+
+fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     let registry = Registry::open(home.clone());
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
@@ -134,25 +160,29 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
     let root = fs::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
 
+    let skip = |reason: &str| Ok(UpReport::plain(Outcome::Skipped(reason.into())));
+    let mut kept = Vec::new();
     match record.level {
-        Level::Cooling | Level::Cold => return Ok(Outcome::Skipped("cold".into())),
-        Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
+        Level::Cooling | Level::Cold => return skip("cold"),
+        Level::Opening => return skip(OPENING),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
             if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
-                return Ok(Outcome::Skipped(reason));
+                return skip(&reason);
             }
             let holders = busy_holders(&root)?;
             if !holders.is_empty() {
-                return Ok(Outcome::Busy(holders));
+                return Ok(UpReport::plain(Outcome::Busy(holders)));
             }
+            let (dirs, real) = bale_able(home, &root)?;
+            kept = real;
             record.level = Level::Baling;
             registry.put(&record)?;
 
-            if let Err(failure) = move_to_trash(home, &root) {
+            if let Err(failure) = move_all(&dirs, |from, to| fs::rename(from, to)) {
                 record.level = Level::Hot;
                 registry.put(&record)?;
-                return rename_failure(failure);
+                return rename_failure(failure).map(UpReport::plain);
             }
         }
     }
@@ -176,7 +206,10 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
 
     record.level = Level::Baled;
     registry.put(&record)?;
-    Ok(Outcome::Done(Level::Baled))
+    Ok(UpReport {
+        outcome: Outcome::Done(Level::Baled),
+        kept,
+    })
 }
 
 /// Turns a failed move into the outcome. Dirs stranded in trash are an error
@@ -218,15 +251,59 @@ struct MoveFailure {
     stranded: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Renames each regenerable dir to `<parent>/.bale-trash-<name>-<nanos>`.
-fn move_to_trash(home: &BaleHome, root: &Path) -> Result<(), MoveFailure> {
-    let mut dirs = regenerable(home, root).map_err(|e| MoveFailure {
-        cause: io::Error::other(format!("{e:#}")),
-        stranded: Vec::new(),
-    })?;
+/// The regenerable dirs under `root` that `up` may remove, and those it must
+/// keep because git tracks a file in them or sees an untracked file there
+/// that is not ignored. Both sorted; trash dirs are left out.
+pub(crate) fn bale_able(home: &BaleHome, root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut dirs = regenerable(home, root)?;
     dirs.retain(|d| !in_trash(root, d));
     dirs.sort();
-    move_all(&dirs, |from, to| fs::rename(from, to))
+    let rels: Vec<PathBuf> = dirs
+        .iter()
+        .map(|d| d.strip_prefix(root).unwrap_or(d).to_path_buf())
+        .collect();
+    let mut real = vec![false; dirs.len()];
+    for (chunk, start) in rels.chunks(100).zip((0..).step_by(100)) {
+        let mut args: Vec<String> = [
+            "--no-optional-locks",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(
+            chunk
+                .iter()
+                .map(|rel| format!(":(literal){}", slashed(rel))),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = git::Git::at(root).run(&args)?;
+        for listed in out.split('\0').filter(|p| !p.is_empty()) {
+            let listed = Path::new(listed);
+            for (i, rel) in chunk.iter().enumerate() {
+                if listed.starts_with(rel) {
+                    real[start + i] = true;
+                }
+            }
+        }
+    }
+    let (kept, trash): (Vec<_>, Vec<_>) = dirs.into_iter().zip(real).partition(|(_, r)| *r);
+    Ok((
+        trash.into_iter().map(|(d, _)| d).collect(),
+        kept.into_iter().map(|(d, _)| d).collect(),
+    ))
+}
+
+/// `rel` with `/` between components, as git pathspecs want.
+fn slashed(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Moves each dir to a trash name with `rename`. On the first failure every

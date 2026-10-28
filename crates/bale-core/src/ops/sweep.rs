@@ -11,7 +11,7 @@ use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
-use crate::ops::up::{up, Outcome};
+use crate::ops::up::{up_report, Outcome};
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
 
@@ -75,7 +75,17 @@ fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String
         Action::Report(text) => text.replace("<id>", &record.id),
         Action::Keep => "nothing to do".into(),
         _ if dry_run => "dry run, not applied".into(),
-        Action::Up => outcome_text(up(home, &record.id)),
+        Action::Up => match up_report(home, &record.id) {
+            Ok(r) if !r.kept.is_empty() => {
+                let kept: Vec<String> = r.kept.iter().map(|d| d.display().to_string()).collect();
+                format!(
+                    "{}; kept (holds files git tracks or does not ignore): {}",
+                    outcome_text(Ok(r.outcome)),
+                    kept.join(", ")
+                )
+            }
+            other => outcome_text(other.map(|r| r.outcome)),
+        },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
     };
     (action, result)

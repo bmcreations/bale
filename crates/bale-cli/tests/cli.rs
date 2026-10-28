@@ -934,3 +934,18 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
     assert!(text.contains("left unchanged"), "{text}");
     assert!(text.contains("nice '/old/bale'"), "{text}");
 }
+
+#[test]
+fn up_names_a_build_dir_it_kept() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/notes.md"), "notes\n").unwrap();
+    let out = env.bale(&env.repo, &["up", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains(": baled"), "{text}");
+    assert!(text.contains("kept ") && text.contains("build"), "{text}");
+    assert!(wt.join("build/notes.md").exists());
+}
