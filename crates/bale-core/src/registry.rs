@@ -46,6 +46,10 @@ pub struct Record {
     pub level: Level,
     pub last_activity: SystemTime,
     pub note: Option<String>,
+    /// The trash paths `up` is about to move regenerable dirs to, recorded
+    /// before the first move so a resumed `up` removes exactly these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trash: Vec<PathBuf>,
 }
 
 /// First 12 hex characters of the sha256 of the canonicalized path, falling

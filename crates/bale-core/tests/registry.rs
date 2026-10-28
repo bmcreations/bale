@@ -16,6 +16,7 @@ fn record(id: &str) -> Record {
         level: Level::Baled,
         last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         note: None,
+        trash: Vec::new(),
     }
 }
 

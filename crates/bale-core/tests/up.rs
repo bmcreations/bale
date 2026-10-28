@@ -123,6 +123,7 @@ fn trash_symlink_is_unlinked_not_followed() {
 
     let mut rec = register(&fx.home(), &wt).unwrap();
     rec.level = Level::Baling;
+    rec.trash = vec![rec.path.join("app/.bale-trash-build-1")];
     Registry::open(fx.home()).put(&rec).unwrap();
     up(&fx.home(), &rec.id).unwrap();
     assert!(fs::symlink_metadata(wt.join("app/.bale-trash-build-1")).is_err());
@@ -135,6 +136,8 @@ fn recovers_from_crash() {
     let wt = gradle_worktree(&fx);
     let mut rec = register(&fx.home(), &wt).unwrap();
     rec.level = Level::Baling;
+    // A crash after the moves: `up` recorded the name before moving.
+    rec.trash = vec![rec.path.join("app/.bale-trash-build-1")];
     Registry::open(fx.home()).put(&rec).unwrap();
     fs::create_dir_all(wt.join("app/.bale-trash-build-1")).unwrap();
     fs::write(wt.join("app/.bale-trash-build-1/x"), "x").unwrap();
@@ -143,6 +146,42 @@ fn recovers_from_crash() {
     assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
     assert!(!wt.join("app/.bale-trash-build-1").exists());
     assert_eq!(level(&fx, &rec.id), Level::Baled);
+}
+
+/// `up` removes only the trash it made: a user file named like trash and
+/// another worktree's trash inside this tree stay.
+#[test]
+fn up_keeps_trash_it_did_not_make() {
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx);
+    fs::write(wt.join(".bale-trash-notes"), "mine").unwrap();
+    // Another checkout's interrupted cold, nested in this tree.
+    let other = wt.join("nested/.bale-trash-other-1234");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("work.txt"), "work").unwrap();
+
+    let rec = register(&fx.home(), &wt).unwrap();
+    let out = up(&fx.home(), &rec.id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!wt.join("app/build").exists());
+    assert_eq!(fs::read_to_string(wt.join(".bale-trash-notes")).unwrap(), "mine");
+    assert_eq!(fs::read_to_string(other.join("work.txt")).unwrap(), "work");
+}
+
+/// A resumed `up` leaves a trash-named dir it did not record.
+#[test]
+fn resumed_up_keeps_unrecorded_trash() {
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx);
+    let mut rec = register(&fx.home(), &wt).unwrap();
+    rec.level = Level::Baling;
+    Registry::open(fx.home()).put(&rec).unwrap();
+    fs::create_dir_all(wt.join("app/.bale-trash-build-7")).unwrap();
+    fs::write(wt.join("app/.bale-trash-build-7/x"), "x").unwrap();
+
+    let out = up(&fx.home(), &rec.id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(wt.join("app/.bale-trash-build-7/x").exists());
 }
 
 fn lock(fx: &Fixture, wt: &Path, reason: Option<&str>) {

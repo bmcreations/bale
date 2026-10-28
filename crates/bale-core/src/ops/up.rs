@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use walkdir::WalkDir;
 
 use crate::busy::{busy_holders, Holder};
 use crate::config::load_config;
@@ -84,6 +83,7 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
                 level: Level::Hot,
                 last_activity,
                 note: None,
+                trash: Vec::new(),
             }
         }
     };
@@ -176,10 +176,13 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
             }
             let (dirs, real) = bale_able(home, &root)?;
             kept = real;
+            let moves = trash_names(&dirs);
+            record.trash = moves.iter().map(|(_, to)| to.clone()).collect();
             record.level = Level::Baling;
             registry.put(&record)?;
 
-            if let Err(failure) = move_all(&dirs, |from, to| fs::rename(from, to)) {
+            if let Err(failure) = move_all(&moves, |from, to| fs::rename(from, to)) {
+                record.trash.clear();
                 record.level = Level::Hot;
                 registry.put(&record)?;
                 return rename_failure(failure).map(UpReport::plain);
@@ -187,7 +190,8 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
         }
     }
 
-    remove_trash(&root)?;
+    remove_trash(&root, &record.trash)?;
+    record.trash.clear();
     #[cfg(target_os = "macos")]
     {
         let failures = dirs::home_dir()
@@ -325,22 +329,39 @@ fn slashed(rel: &Path) -> String {
         .join("/")
 }
 
-/// Moves each dir to a trash name with `rename`. On the first failure every
-/// dir already moved is renamed back; restores that fail are reported.
+/// `(dir, trash)` for each dir: `<parent>/.bale-trash-<name>-<nanos>`.
+fn trash_names(dirs: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dirs.iter()
+        .filter_map(|dir| {
+            let (parent, name) = (dir.parent()?, dir.file_name()?);
+            let trash = parent.join(format!("{TRASH_PREFIX}{}-{nanos}", name.to_string_lossy()));
+            Some((dir.clone(), trash))
+        })
+        .collect()
+}
+
+/// Whether `name` is a trash name bale makes: `.bale-trash-<name>-<digits>`.
+pub(crate) fn is_trash_name(name: &str) -> bool {
+    name.strip_prefix(TRASH_PREFIX)
+        .and_then(|rest| rest.rsplit_once('-'))
+        .is_some_and(|(orig, digits)| {
+            !orig.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Moves each dir to its trash name with `rename`. On the first failure
+/// every dir already moved is renamed back; restores that fail are reported.
 fn move_all(
-    dirs: &[PathBuf],
+    moves: &[(PathBuf, PathBuf)],
     mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), MoveFailure> {
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for dir in dirs {
-        let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
-            continue;
-        };
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let trash = parent.join(format!("{TRASH_PREFIX}{}-{nanos}", name.to_string_lossy()));
+    for (dir, trash) in moves {
+        let trash = trash.clone();
         if let Err(cause) = rename(dir, &trash) {
             let stranded = moved
                 .into_iter()
@@ -362,39 +383,30 @@ fn in_trash(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// Removes every `.bale-trash-*` entry under `root`. Symlinks are never
-/// followed: a trash entry that is a link has only the link removed. An
-/// unreadable entry elsewhere in the tree is skipped; only failing to read
-/// the root or to remove a trash entry is an error.
-fn remove_trash(root: &Path) -> Result<()> {
-    let mut found = Vec::new();
-    let mut it = WalkDir::new(root).follow_links(false).into_iter();
-    while let Some(entry) = it.next() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) if err.depth() == 0 => {
-                return Err(err).with_context(|| format!("walking {}", root.display()))
-            }
-            Err(_) => continue,
-        };
-        if entry.depth() == 0 {
+/// Removes the trash entries `up` recorded for the tree at `root`, and
+/// nothing else. Each must have bale's trash name, sit under `root` outside
+/// any nested repo, and hold no `.git`; one that does not is an error and
+/// stays. One already gone is fine. Symlinks are never followed: a trash
+/// entry that is a link has only the link removed.
+fn remove_trash(root: &Path, recorded: &[PathBuf]) -> Result<()> {
+    for path in recorded {
+        if fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy();
-        let is_dir = entry.file_type().is_dir();
-        if is_dir && name == ".git" {
-            it.skip_current_dir();
-            continue;
+        let name = path.file_name().map(|n| n.to_string_lossy());
+        let rel = path.strip_prefix(root).ok();
+        let parent_rel = rel.and_then(Path::parent);
+        let ok = name.is_some_and(|n| is_trash_name(&n))
+            && parent_rel.is_some_and(|p| !in_nested_repo(root, p))
+            && fs::symlink_metadata(path.join(".git")).is_err();
+        if !ok {
+            bail!(
+                "keeping {}: it is not trash bale made in {}",
+                path.display(),
+                root.display()
+            );
         }
-        if name.starts_with(TRASH_PREFIX) {
-            found.push(entry.path().to_path_buf());
-            if is_dir {
-                it.skip_current_dir();
-            }
-        }
-    }
-    for path in found {
-        remove_entry(&path).with_context(|| format!("removing {}", path.display()))?;
+        remove_entry(path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
 }
@@ -480,7 +492,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dirs = dirs_in(tmp.path(), &["one", "two"]);
         let calls = Cell::new(0);
-        let failure = move_all(&dirs, |from, to| {
+        let failure = move_all(&trash_names(&dirs), |from, to| {
             calls.set(calls.get() + 1);
             if from == dirs[1] {
                 // The first dir really moved before this rename fails.
@@ -503,7 +515,7 @@ mod tests {
     fn failed_restore_is_reported_as_stranded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dirs = dirs_in(tmp.path(), &["one", "two"]);
-        let failure = move_all(&dirs, |from, to| {
+        let failure = move_all(&trash_names(&dirs), |from, to| {
             let is_restore = from
                 .file_name()
                 .unwrap()
