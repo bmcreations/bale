@@ -383,6 +383,29 @@ fn build_dir_with_only_ignored_files_goes() {
     assert!(!wt.join("build").exists());
 }
 
+/// Root's git stops at an untracked nested repo, so a regenerable-named dir
+/// inside one is kept rather than judged from the outside.
+#[test]
+fn build_dir_inside_a_nested_repo_is_kept() {
+    let fx = Fixture::new();
+    let wt = gradle_worktree(&fx);
+    let nested = wt.join("vendor/x");
+    fs::create_dir_all(nested.join("build")).unwrap();
+    support::git(&nested, &["init", "-q"]);
+    fs::write(nested.join("build/notes.txt"), "notes\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let report = up_report(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Baled));
+    let kept = fs::canonicalize(nested.join("build")).unwrap();
+    assert_eq!(report.kept, vec![kept]);
+    assert_eq!(
+        fs::read_to_string(nested.join("build/notes.txt")).unwrap(),
+        "notes\n"
+    );
+    assert!(!wt.join("app/build").exists());
+}
+
 /// Root's ls-files can't see inside a submodule, so a regenerable-named dir
 /// there is kept rather than judged from the outside.
 #[test]
