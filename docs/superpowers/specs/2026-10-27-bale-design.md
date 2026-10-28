@@ -368,6 +368,13 @@ the source it saves is about 1 GB per Android worktree.)*
   workspace was on a branch and that branch still points to the same commit, it checks out the branch
   instead. If the branch has moved, it stays detached at the saved commit and says so.
 - If the branch is checked out in another worktree, `open` stays detached at the saved commit and reports it.
+- Before anything else, `cold` checks that the folder at the recorded path is the worktree's own
+  checkout: git run there must use the worktree's admin dir, the same check `open` makes before it
+  restores. A folder recreated at the path with no `.git` would let git climb into an enclosing repo and
+  save that repo's state over the record. Such a folder, or one where git fails, is skipped, naming the
+  path, with no ref or `$BALE_HOME` write and the record unchanged. `bale gc` makes the same check before
+  it releases bale's lock on a `hot` workspace or deletes its leftover saved state, and leaves both alone
+  when it fails.
 - `cold` skips a tree, before saving anything, when any of these hold: a submodule (nested ones too) has
   uncommitted changes or untracked files, ignored files that are not regenerable, or its own `.git`
   directory; a submodule is checked out at a commit other than the one HEAD records (a commit made inside
@@ -387,7 +394,14 @@ the source it saves is about 1 GB per Android worktree.)*
 A record left `cooling` by a crash resumes on the next `cold` or sweep. Before anything else, stale
 `.bale-check-<id>-*` dirs beside the path are removed.
 
-- If the checkout is still at its path, `cold` saves and verifies it again from step 2.
+- If something is at the path and a trash directory sits beside it, the checkout was already moved
+  aside, so the folder at the path was made since (an editor recreating `.idea/workspace.xml`, say).
+  Saving it would replace the save of the trash. `cold` skips, naming the path and the trash directory,
+  and asks the user to move the folder away and run `cold` again; the record stays `cooling` and nothing
+  is written.
+- If the folder at the path is not the worktree's own checkout (the checkout check above),
+  `cold` skips, naming the path, and the record stays `cooling`.
+- Otherwise the checkout is still at its path, and `cold` saves and verifies it again from step 2.
 - If the checkout is gone and `refs/bale/<id>/wip` does not resolve, or the saved manifest is missing,
   nothing is deleted: `cold` reports an error and leaves any trash directory beside the path.
 - Otherwise each trash directory beside the path is handled in turn:
