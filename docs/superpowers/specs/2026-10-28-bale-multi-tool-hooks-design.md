@@ -1,17 +1,19 @@
-# bale: tool integrations as a layer over bale
+# bale: tool integrations as a layer over an agnostic core
 
 Addendum to `2026-10-27-bale-design.md`. Two changes: every tool integration, Claude Code's included, moves
-out of `bale` into a separate layer, and that layer gains adapters for Conductor, Cursor and Codex.
+into a `bale-hooks` crate layered over `bale-core`, and that layer gains adapters for Conductor, Cursor and
+Codex. It all still ships as one `bale` binary.
 
 ## Problem
 
-`bale-cli` today contains the Claude Code hooks (`bale hook claude-worktree-create|remove`), the git
-`post-checkout` hook, and `bale install --claude-hooks|--git-hook`, which edits `~/.claude/settings.json`
-and `.git/hooks`. So the core binary knows one tool's payload format, its process names (`claude`, `node`)
-and its config file. Adding three more tools the same way puts four tools' formats in the core.
+`bale-core` is already tool-agnostic: it knows git and the filesystem, nothing about any agent tool. The
+tool knowledge sits in `bale-cli`, mixed in with the core's own commands: `hook.rs` parses Claude Code's
+payload and knows its process names (`claude`, `node`), and `install.rs` edits `~/.claude/settings.json`
+next to the scheduler setup. Adding three more tools the same way spreads four tools' formats through the
+CLI crate.
 
-The core should not know which tool called it. Integrations are a layer on top that translate a tool's
-event into `bale` commands, the same way any user or script would call them.
+Organizationally the integrations are a layer over an agnostic core. They can still ship in the same
+binary and be set up by `bale install`.
 
 ## What each tool offers
 
@@ -34,57 +36,50 @@ Conductor passes `CONDUCTOR_WORKSPACE_PATH` and `CONDUCTOR_ROOT_PATH`. Cursor do
 
 ### The boundary
 
-`bale` (crates `bale-core`, `bale-cli`) keeps only tool-agnostic commands. Nothing in it names a tool, reads
-a tool's payload or edits a tool's config.
+Three crates, one binary:
 
-`bale-hooks` (new crate, binary `bale-hooks`) holds every integration: one module per tool, each a thin
-adapter that parses the tool's input and runs `bale` commands. It talks to the core only through the
-`bale` CLI and its exit codes, so an adapter could be rewritten in any language, and a harness that adopts
-bale natively needs no adapter at all.
+| Crate | Holds | May depend on |
+|---|---|---|
+| `bale-core` | registry, up, cold, open, sweep, migrate, new, gc, busy detection | nothing tool-specific |
+| `bale-hooks` (new, library) | one module per tool: parse its input, compute its caller pids, edit its config | `bale-core` public API |
+| `bale-cli` (binary `bale`) | argument parsing and output; wires core commands and hook adapters | both |
 
-`bale` forwards an unknown subcommand `x` to a `bale-x` executable on `PATH`, as git and cargo do, so
-`bale hooks ...` runs `bale-hooks ...`. The core knows the convention, not the layer.
+`bale-core` never names a tool. A grep for tool names in `crates/bale-core/src` (outside tests) is part of
+the gate. `bale-hooks` uses only `bale-core`'s public API, so anything an adapter needs is a core feature
+any caller could use.
 
 ### What the core exposes
 
-The adapters need three things the CLI does not offer today. They are generic, not per tool:
+Generic pieces the adapters need, usable by any caller:
 
-```
-bale new <name> [--repo R] [--branch B] [--print-path]   # create + register; prints only the path
-bale adopt [<path>]                                      # register an existing worktree; default cwd
-bale cold <target> [--ignore-pid <pid>]...               # busy check ignores these pids
-```
-
-- `adopt` is the `register` the git hook calls today, with its admin-dir checks.
-- `--ignore-pid` replaces the in-process `busy::exclude_pids` call the Claude hook makes. Which pids to
-  ignore is the caller's business; the core just honours the list.
-- `cold`'s exit codes become a documented contract: 0 cold or already gone, 3 busy (holders on stderr),
-  4 skipped (reason on stderr), 1 error. Today they are the Claude hook's private contract.
-
-`bale install` keeps only the scheduled sweep (launchd, systemd timer, schtasks). `--claude-hooks` and
-`--git-hook` move to the layer.
+- **`register`** is public as `bale adopt [<path>]`, with its admin-dir checks. Default path is the cwd.
+- **Busy exclusion as a parameter.** The global `busy::exclude_pids` becomes an `ignore_pids` argument on
+  cold (CLI: `bale cold --ignore-pid <pid>`). Which pids to ignore is the caller's business.
+- **`new` returns the path** (CLI: `bale new --print-path`), for callers that must print only the path.
+- **Cold's outcomes are a documented contract**: exit 0 cold or already gone, 3 busy (holders on
+  stderr), 4 skipped (reason on stderr), 1 error.
 
 ### The layer
 
 ```
-bale-hooks claude create | remove      # stdin JSON, as today's bale hook claude-worktree-*
-bale-hooks git post-checkout ...       # today's bale hook git-post-checkout
-bale-hooks conductor setup | archive   # reads CONDUCTOR_WORKSPACE_PATH
-bale-hooks cursor setup                # cwd, or ROOT_WORKTREE_PATH for the project
-bale-hooks codex setup                 # path argument
+bale hook claude create | remove      # stdin JSON (was claude-worktree-create|remove)
+bale hook git post-checkout ...
+bale hook conductor setup | archive   # reads CONDUCTOR_WORKSPACE_PATH
+bale hook cursor setup                # cwd
+bale hook codex setup [<path>]
 
-bale-hooks install claude              # ~/.claude/settings.json, as today
-bale-hooks install git <REPO>          # .git/hooks/post-checkout, as today
-bale-hooks install conductor <REPO>    # <REPO>/.conductor/settings.toml
-bale-hooks install cursor <REPO>       # <REPO>/.cursor/worktrees.json
-bale-hooks install codex               # prints the setup command; edits nothing
+bale install                          # scheduled sweep, as today
+bale install --hooks claude,conductor,cursor,codex [--repo <REPO>]
+bale install --git-hook <REPO>        # as today
 ```
 
-- **setup / post-checkout** call `bale adopt`. They never fail the caller: errors go to stderr, exit 0,
+`--repo` is required for conductor and cursor, whose config lives in the repo
+(`.conductor/settings.toml`, `.cursor/worktrees.json`). Codex prints the setup command and edits nothing.
+
+- **setup / post-checkout** adopt the tree. They never fail the caller: errors go to stderr, exit 0,
   because a failing setup script can break workspace creation in the tool.
-- **remove / archive** compute the caller's pids, call `bale cold --ignore-pid ...` and map its exit code
-  to what the tool expects. The pid walk goes up from the adapter and stops at the first ancestor whose
-  name is in the tool's list:
+- **remove / archive** compute the caller's pids and cold with them ignored. The walk goes up from the
+  hook process and stops at the first ancestor whose name is in the tool's list:
 
   | Tool | Names that end the walk |
   |---|---|
@@ -94,19 +89,19 @@ bale-hooks install codex               # prints the setup command; edits nothing
   | codex | `codex`, `Codex` |
 
   The non-Claude lists are a guess until checked against the running tool.
-- **claude create** calls `bale new --print-path`. No other tool lets a command replace worktree creation.
+- **claude create** calls core `new`. No other tool lets a command replace worktree creation.
 - **install** edits keep the commands already in the file and run bale's after them, for setup, or before
   them, for archive. It prints the diff first, and `--print-only` writes nothing. Conductor and Cursor
   files are usually committed, so the output says so.
 
-Tools without a remove hook (Cursor, Codex) get `adopt` on setup, the git hook and the scheduled sweep. An
+Tools without a remove hook (Cursor, Codex) get adopt on setup, the git hook and the scheduled sweep. An
 idle tree is baled within one sweep interval. No `git` wrapper; the parent spec's reasons stand.
 
 ### Migration
 
 `bale install --claude-hooks` has not been run on any machine yet, so nothing installed points at
-`bale hook claude-worktree-*`. The old `bale hook` subcommand is removed, not kept as an alias. The
-extraction lands before the first `bale-hooks install claude`.
+`bale hook claude-worktree-*`. Those names change to `bale hook claude create|remove` with no alias, and
+`--claude-hooks` becomes `--hooks claude`. The move lands before the first hooks install.
 
 ## Risks
 
@@ -122,7 +117,7 @@ extraction lands before the first `bale-hooks install claude`.
 ## Verification before each adapter ships
 
 Only Codex is installed on the development machine. The Claude and git adapters keep today's tests, moved
-to the new crate and run through the `bale` binary. Each new adapter is marked unverified until run against
+to `bale-hooks`. Each new adapter is marked unverified until run against
 the real tool:
 
 1. Create a workspace in the tool and confirm `bale ls` shows it registered.
