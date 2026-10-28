@@ -371,6 +371,7 @@ fn finish(
         if snapshot.changed()?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
+        record_hashes(&dest, snapshot.hashes)?;
         write_trash_marker(&dest, &wip, &trash)?;
         Ok(None)
     })();
@@ -487,7 +488,10 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
                 Ok(match restore_check(&trash, wip, &dest, &ex.regen, &ex.deny)? {
-                    Verdict::Same(snapshot) if snapshot.changed()?.is_none() => None,
+                    Verdict::Same(snapshot) if snapshot.changed()?.is_none() => {
+                        record_hashes(&dest, snapshot.hashes)?;
+                        None
+                    }
                     Verdict::Same(_) => Some(Outcome::Busy(Vec::new())),
                     Verdict::Differs(reason) => Some(Outcome::Skipped(not_restorable(&reason))),
                 })
@@ -512,6 +516,14 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
+}
+
+/// Adds the check's content hashes to `dest`'s manifest, for open to check
+/// the bytes it writes against.
+fn record_hashes(dest: &Path, hashes: Vec<disk::SavedHash>) -> Result<()> {
+    let mut manifest = read_manifest(dest)?;
+    manifest.hashes = hashes;
+    write_manifest(dest, &manifest)
 }
 
 /// Writes `dest/trash` (tmp + rename, 0600 on unix) naming `trash` and the
@@ -887,6 +899,8 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
             dirs: tree.dirs,
             dir_modes: tree.dir_modes,
             root_mode: tree.root_mode,
+            // Filled in by cold's check, from the moved tree.
+            hashes: Vec::new(),
         },
     )?;
     Ok(saved)

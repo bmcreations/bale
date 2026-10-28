@@ -1038,3 +1038,50 @@ fn open_checks_out_under_the_branchs_config() {
         "hello world\n"
     );
 }
+
+/// A filter added to config between cold and open changes the bytes the
+/// checkout writes, and git's own diff (cleaning them back) sees no change.
+/// open must compare raw bytes with what cold saw and stop, keeping the
+/// saved state.
+#[cfg(unix)]
+#[test]
+fn open_refuses_bytes_changed_by_config_added_after_cold() {
+    let env = Env::new();
+    fs::write(env.repo.join(".gitattributes"), "*.txt filter=rev\n").unwrap();
+    env.git(&env.repo, &["add", ".gitattributes"]);
+    env.git(&env.repo, &["commit", "-q", "-m", "attrs"]);
+    let wt = env.add_worktree("feat");
+    fs::write(wt.join("notes.txt"), "hello world\n").unwrap();
+    let wt_arg = wt.to_str().unwrap();
+    for args in [["up", wt_arg], ["cold", wt_arg]] {
+        let out = env.bale(&env.repo, &args, None);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert!(!wt.exists(), "cold did not go through");
+
+    fs::write(
+        env.home().join(".gitconfig"),
+        "[filter \"rev\"]\n\tclean = rev\n\tsmudge = rev\n",
+    )
+    .unwrap();
+    let out = env.bale(&env.repo, &["open", wt_arg], None);
+    assert!(!out.status.success(), "open went through");
+    assert!(stderr(&out).contains("notes.txt"), "{}", stderr(&out));
+
+    let out = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rec = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| canon(Path::new(r["path"].as_str().unwrap())) == canon(&wt))
+        .unwrap()
+        .clone();
+    assert_eq!(rec["level"], "opening");
+    let id = rec["id"].as_str().unwrap();
+    env.git(
+        &env.repo,
+        &["rev-parse", "--verify", &format!("refs/bale/{id}/wip")],
+    );
+    assert!(env.bale_home().join(id).join("manifest.json").exists());
+}

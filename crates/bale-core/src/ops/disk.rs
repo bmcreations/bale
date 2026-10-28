@@ -8,10 +8,13 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::git::Git;
-use crate::ops::cold::{copy_file, copy_symlink, create_private, SavedFile, FILES, MANIFEST};
+use crate::ops::cold::{
+    copy_file, copy_symlink, create_private, hex, SavedFile, FILES, MANIFEST,
+};
 use crate::ops::up::TRASH_PREFIX;
 
 /// `dest/manifest.json`.
@@ -34,6 +37,19 @@ pub struct Manifest {
     /// Permission bits of the tree's root dir (unix only).
     #[serde(default)]
     pub root_mode: Option<u32>,
+    /// The sha256 of every regular file open writes (tracked and saved),
+    /// taken from the tree's raw bytes by cold's check. Open compares the
+    /// raw bytes it wrote against these, so a change in git config between
+    /// cold and open fails instead of changing a file. Empty in saves made
+    /// before these were recorded; open then skips the check.
+    #[serde(default)]
+    pub hashes: Vec<SavedHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedHash {
+    pub rel: PathBuf,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +387,8 @@ pub(crate) struct Snapshot {
     skip: Skip,
     seen: BTreeMap<PathBuf, (Kind, Stamp)>,
     root: Stamp,
+    /// The sha256 of every regular file the compare read.
+    pub(crate) hashes: Vec<SavedHash>,
 }
 
 impl Snapshot {
@@ -516,7 +534,8 @@ fn check_in(
             )));
         }
     }
-    if let Some(reason) = compare(tree, work, &skip, &seen)? {
+    let mut hashes = Vec::new();
+    if let Some(reason) = compare(tree, work, &skip, &seen, &mut hashes)? {
         return Ok(Verdict::Differs(reason));
     }
     Ok(Verdict::Same(Snapshot {
@@ -524,6 +543,7 @@ fn check_in(
         skip,
         seen,
         root,
+        hashes,
     }))
 }
 
@@ -566,6 +586,7 @@ fn compare(
     restored: &Path,
     skip: &Skip,
     seen: &BTreeMap<PathBuf, (Kind, Stamp)>,
+    hashes: &mut Vec<SavedHash>,
 ) -> Result<Option<String>> {
     let have: BTreeMap<&PathBuf, Kind> = seen.iter().map(|(r, (k, _))| (r, *k)).collect();
     let want: BTreeMap<PathBuf, Kind> = entries(restored, skip)?
@@ -631,11 +652,18 @@ fn compare(
                         )));
                     }
                 }
-                if ma.len() != mb.len() || !same_bytes(&a, &b)? {
-                    return Ok(Some(format!(
-                        "{} would be restored with different bytes",
-                        rel.display()
-                    )));
+                match (ma.len() == mb.len()).then(|| same_bytes(&a, &b)) {
+                    Some(Ok(Some(sha256))) => hashes.push(SavedHash {
+                        rel: (*rel).clone(),
+                        sha256,
+                    }),
+                    Some(Err(e)) => return Err(e),
+                    None | Some(Ok(None)) => {
+                        return Ok(Some(format!(
+                            "{} would be restored with different bytes",
+                            rel.display()
+                        )))
+                    }
                 }
             }
             Kind::Other => {}
@@ -644,19 +672,23 @@ fn compare(
     Ok(None)
 }
 
-fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+/// The sha256 of `a`'s bytes if `b` holds the same bytes, from one read of
+/// each, so the hash is of exactly the bytes compared.
+fn same_bytes(a: &Path, b: &Path) -> Result<Option<String>> {
     let mut fa = fs::File::open(a).with_context(|| format!("opening {}", a.display()))?;
     let mut fb = fs::File::open(b).with_context(|| format!("opening {}", b.display()))?;
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    let mut hasher = Sha256::new();
     loop {
         let na = read_full(&mut fa, &mut ba)?;
         let nb = read_full(&mut fb, &mut bb)?;
         if na != nb || ba[..na] != bb[..nb] {
-            return Ok(false);
+            return Ok(None);
         }
         if na == 0 {
-            return Ok(true);
+            return Ok(Some(hex(&hasher.finalize())));
         }
+        hasher.update(&ba[..na]);
     }
 }
 

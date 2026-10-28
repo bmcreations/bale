@@ -390,6 +390,18 @@ fn restage_ignored_additions(g: &Git, saved: &Saved) -> Result<()> {
 /// Every saved file, dir and mode matches the manifest, and every other path
 /// matches the wip tree.
 fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
+    // Raw bytes against what cold's check read: git config that changed
+    // since (a filter, eol rules) would otherwise pass git's own diff.
+    for h in &saved.manifest.hashes {
+        let path = record.path.join(&h.rel);
+        let is_file = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+        if !is_file || sha_file(&path)? != h.sha256 {
+            bail!(
+                "restored {} differs from the file that went cold (did git config change since?)",
+                h.rel.display()
+            );
+        }
+    }
     for f in &saved.manifest.files {
         check_entry(&record.path.join(&f.rel), f)
             .with_context(|| format!("restored {} does not match", f.rel.display()))?;
