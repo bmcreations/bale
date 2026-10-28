@@ -256,7 +256,13 @@ Everything in `bale up`, then:
    separate file with the same bytes, so no data is lost.
 4. Verify the saved state by hashing it against the tree. This in-place check is an early refusal; the
    safety of the delete rests on step 5.
-5. Rename the checkout directory to a trash name and check the moved tree against what `open` would give
+5. Check there is room for the check below: it writes a copy of the tree beside the trash, so cold peaks
+   near twice the tree's size on its volume. If the volume's free space is under the bytes of every file
+   in the tree that the save does not leave out (the regenerable directories `up` removed, `node_modules`
+   and the denylist) plus 1 GiB, return the record to `baled` and skip, naming the space needed and the
+   space free. Recovery checks the same before it checks an unmarked trash, and moves the trash back
+   when there is not room.
+   Rename the checkout directory to a trash name and check the moved tree against what `open` would give
    back. bale runs `open`'s own restore (the wip commit read into a private index and checked out, then the
    saved files, modes and empty directories) into a directory beside the trash, and compares the two with
    plain file reads, not through git: the path set both ways by exact name, file types, bytes, modes on
