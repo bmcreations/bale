@@ -179,7 +179,8 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         "--quiet",
         "foreach",
         "--recursive",
-        r#"test -z "$(git status --porcelain)" || echo "$displaypath""#,
+        // Explicit flags: each submodule's own config could hide files.
+        r#"test -z "$(git status --porcelain --untracked-files=all --ignore-submodules=none)" || echo "$displaypath""#,
     ])?;
     let dirty: Vec<&str> = dirty.lines().filter(|l| !l.is_empty()).collect();
     if !dirty.is_empty() {
@@ -671,6 +672,7 @@ fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
             "status",
             "--porcelain",
             "-z",
+            "--untracked-files=all",
             "--ignore-submodules=dirty",
         ])?;
         let status: Vec<&str> = status.split('\0').filter(|e| !e.is_empty()).collect();
@@ -1501,6 +1503,138 @@ mod tests {
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
+    }
+
+    /// A worktree with submodule `lib`, `setup` run on it, registered.
+    fn submodule_case(setup: impl Fn(&Path)) -> (tempfile::TempDir, PathBuf, BaleHome, String) {
+        let (tmp, repo) = repo();
+        let wt = with_submodule(tmp.path(), &repo);
+        setup(&wt);
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        (tmp, wt, home, id)
+    }
+
+    /// `cold` on a `submodule_case`, with `write` run just before the rename.
+    fn cold_late(
+        setup: impl Fn(&Path),
+        write: impl Fn(&Path) + 'static,
+    ) -> (tempfile::TempDir, PathBuf, Result<Outcome>) {
+        let (tmp, wt, home, id) = submodule_case(setup);
+        let seam = set_seam(&BEFORE_RENAME, write);
+        let out = cold(&home, &id);
+        drop(seam);
+        (tmp, wt, out)
+    }
+
+    fn hide_untracked(dir: &Path) {
+        git(dir, &["config", "status.showUntrackedFiles", "no"]);
+    }
+
+    /// `.gitmodules` says `ignore = all` for `lib`, committed.
+    fn ignore_all(wt: &Path) {
+        git(
+            wt,
+            &["config", "-f", ".gitmodules", "submodule.lib.ignore", "all"],
+        );
+        git(
+            wt,
+            &["-c", "commit.gpgsign=false", "commit", "-qam", "ignore"],
+        );
+    }
+
+    /// The user's `status.showUntrackedFiles=no` in the submodule must not
+    /// hide an untracked file there from the refusal.
+    #[test]
+    fn untracked_file_hidden_by_config_in_submodule_is_refused() {
+        let (_tmp, wt, home, id) = submodule_case(|wt| {
+            hide_untracked(&wt.join("lib"));
+            fs::write(wt.join("lib/pre.txt"), "pre\n").unwrap();
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert!(wt.join("lib/pre.txt").is_file());
+    }
+
+    #[test]
+    fn late_write_hidden_by_config_in_submodule_moves_the_tree_back() {
+        let (_tmp, wt, out) = cold_late(
+            |wt| hide_untracked(&wt.join("lib")),
+            |root| fs::write(root.join("lib/late.txt"), "late\n").unwrap(),
+        );
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("lib/late.txt").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_write_hidden_by_config_at_root_moves_the_tree_back() {
+        let (_tmp, wt, out) = cold_late(hide_untracked, |root| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
+        });
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("late.txt").is_file());
+    }
+
+    /// An untracked file at the root under `showUntrackedFiles=no` goes in
+    /// the wip commit, so the tree may go cold.
+    #[test]
+    fn untracked_file_hidden_by_config_at_root_is_saved() {
+        let (tmp, _wt, home, id) = submodule_case(|wt| {
+            hide_untracked(wt);
+            fs::write(wt.join("pre.txt"), "pre\n").unwrap();
+        });
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+        let blob = Git::at(tmp.path().join("r"))
+            .run(&["show", &format!("refs/bale/{id}/wip:pre.txt")])
+            .unwrap();
+        assert_eq!(blob, "pre\n");
+    }
+
+    #[test]
+    fn submodule_commit_under_ignore_all_moves_the_tree_back() {
+        let (_tmp, wt, out) = cold_late(ignore_all, |root| {
+            git(
+                &root.join("lib"),
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "late",
+                ],
+            )
+        });
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("lib/.git").exists());
+    }
+
+    #[test]
+    fn submodule_edit_under_ignore_all_moves_the_tree_back() {
+        let (_tmp, wt, out) = cold_late(ignore_all, |root| {
+            fs::write(root.join("lib/a.txt"), "edited\n").unwrap()
+        });
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(
+            fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    #[test]
+    fn submodule_edit_under_ignore_all_is_refused() {
+        let (_tmp, wt, home, id) = submodule_case(|wt| {
+            ignore_all(wt);
+            fs::write(wt.join("lib/a.txt"), "edited\n").unwrap();
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert_eq!(
+            fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
+            "edited\n"
+        );
     }
 
     /// The trash marker lets `recover` delete the trash without checking

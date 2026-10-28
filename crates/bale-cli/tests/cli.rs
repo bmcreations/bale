@@ -949,3 +949,52 @@ fn up_names_a_build_dir_it_kept() {
     assert!(text.contains("kept ") && text.contains("build"), "{text}");
     assert!(wt.join("build/notes.md").exists());
 }
+
+/// `status.showUntrackedFiles=no` in the user's global config must not hide
+/// an untracked file inside a submodule from `cold`.
+#[test]
+fn cold_keeps_a_submodule_file_hidden_by_global_config() {
+    let env = Env::new();
+    let sub = env.tmp.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    env.git(&sub, &["init", "-q", "-b", "main"]);
+    env.git(&sub, &["config", "user.name", "Bale Test"]);
+    env.git(&sub, &["config", "user.email", "bale@example.com"]);
+    fs::write(sub.join("a.txt"), "a\n").unwrap();
+    env.git(&sub, &["add", "a.txt"]);
+    env.git(
+        &sub,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "s"],
+    );
+    let wt = env.add_worktree("feat");
+    env.git(
+        &wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    env.git(&wt, &["commit", "-q", "-m", "sub"]);
+    fs::write(
+        env.home().join(".gitconfig"),
+        "[status]\n\tshowUntrackedFiles = no\n",
+    )
+    .unwrap();
+    fs::write(wt.join("lib/pre.txt"), "pre\n").unwrap();
+
+    let up = env.bale(&env.repo, &["up", wt.to_str().unwrap()], None);
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let out = env.bale(&env.repo, &["cold", wt.to_str().unwrap()], None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("dirty submodule: lib"), "{stdout}");
+    assert_eq!(fs::read_to_string(wt.join("lib/pre.txt")).unwrap(), "pre\n");
+}

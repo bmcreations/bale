@@ -10,6 +10,20 @@ pub const LOCK_REASON: &str = "baled by bale";
 
 const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
 
+/// Config every bale git call overrides. A user's or repo's setting must not
+/// make bale see an unchanged tree where files exist: `status` must list
+/// every untracked file and every submodule change, and no cache or
+/// fsmonitor may stand in for reading the disk. `-c` outranks every config
+/// file and `GIT_CONFIG_PARAMETERS`, and reaches the git processes `git
+/// submodule foreach` starts. It does not outrank `submodule.<name>.ignore`
+/// from `.gitmodules`, so status calls also pass `--ignore-submodules`.
+const OVERRIDES: [&str; 4] = [
+    "status.showUntrackedFiles=all",
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    "diff.ignoreSubmodules=none",
+];
+
 #[derive(Debug, Clone)]
 pub struct Git {
     dir: PathBuf,
@@ -34,6 +48,7 @@ impl Git {
 
     fn output(&self, args: &[&str]) -> Result<std::process::Output> {
         Command::new("git")
+            .args(OVERRIDES.iter().flat_map(|o| ["-c", o]))
             .args(args)
             .current_dir(&self.dir)
             .env("LC_ALL", "C")
@@ -167,7 +182,8 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
     ))
 }
 
-/// True when `status --porcelain` shows anything, untracked files included.
+/// True when `status --porcelain` shows anything, untracked files and
+/// submodule changes included.
 pub fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(!Git::at(dir)
         .run(&[
@@ -175,6 +191,7 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
             "status",
             "--porcelain",
             "--untracked-files=all",
+            "--ignore-submodules=none",
         ])?
         .trim()
         .is_empty())
