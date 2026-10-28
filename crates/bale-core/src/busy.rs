@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use anyhow::Context;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -15,31 +17,47 @@ pub struct Holder {
 /// Processes (other than this one) with cwd or an open file under `root`.
 /// Windows returns empty: busy is detected by the rename in the cold path.
 pub fn busy_holders(root: &Path) -> Result<Vec<Holder>> {
+    Ok(busy_holders_many(&[root.to_path_buf()])?
+        .pop()
+        .unwrap_or_default())
+}
+
+/// `busy_holders` for each of `roots`, in order, from one scan of the
+/// process table. Errs when any root cannot be canonicalized or the scan fails.
+pub fn busy_holders_many(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
+    #[cfg(unix)]
+    let roots = roots
+        .iter()
+        .map(|r| {
+            r.canonicalize()
+                .with_context(|| format!("canonicalizing {}", r.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     #[cfg(target_os = "linux")]
     {
-        linux::holders(root)
+        linux::holders(&roots)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        lsof::holders(root)
+        lsof::holders(&roots)
     }
     #[cfg(not(unix))]
     {
-        let _ = root;
-        Ok(Vec::new())
+        Ok(vec![Vec::new(); roots.len()])
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
 mod lsof {
     use super::*;
-    use anyhow::{bail, Context};
+    use anyhow::bail;
     use std::process::Command;
 
-    pub fn holders(root: &Path) -> Result<Vec<Holder>> {
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {}", root.display()))?;
+    /// Holders per canonical root, from one `lsof` run.
+    pub fn holders(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
         let out = Command::new("lsof")
             .args(["-n", "-w", "-F", "pcfn"])
             .output()
@@ -54,7 +72,8 @@ mod lsof {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(parse(&stdout, &root, std::process::id()))
+        let own = std::process::id();
+        Ok(roots.iter().map(|r| parse(&stdout, r, own)).collect())
     }
 
     /// Parses `lsof -F pcfn` output. One Holder per pid, first matching path.
@@ -120,7 +139,6 @@ mod lsof {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use anyhow::Context;
     use std::fs;
     use std::io::ErrorKind;
 
@@ -130,12 +148,13 @@ mod linux {
             || e.raw_os_error() == Some(3)
     }
 
-    pub fn holders(root: &Path) -> Result<Vec<Holder>> {
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {}", root.display()))?;
+    /// Holders per canonical root, from one pass over `/proc`.
+    pub fn holders(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
+        let mut result = vec![Vec::new(); roots.len()];
+        if roots.is_empty() {
+            return Ok(result);
+        }
         let own = std::process::id();
-        let mut result = Vec::new();
         for entry in fs::read_dir("/proc").context("reading /proc")? {
             let entry = match entry {
                 Ok(e) => e,
@@ -152,18 +171,31 @@ mod linux {
             if pid == own {
                 continue;
             }
-            if let Some(path) = first_match(&entry.path(), &root)? {
-                let command = fs::read_to_string(entry.path().join("comm"))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
-                result.push(Holder { pid, command, path });
+            let targets = link_targets(&entry.path())?;
+            let mut command: Option<String> = None;
+            for (root, held) in roots.iter().zip(result.iter_mut()) {
+                let Some(path) = targets.iter().find(|t| t.starts_with(root)) else {
+                    continue;
+                };
+                let command = command
+                    .get_or_insert_with(|| {
+                        fs::read_to_string(entry.path().join("comm"))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default()
+                    })
+                    .clone();
+                held.push(Holder {
+                    pid,
+                    command,
+                    path: path.clone(),
+                });
             }
         }
         Ok(result)
     }
 
-    /// First of cwd, exe, or an open fd that resolves under `root`.
-    fn first_match(proc_dir: &Path, root: &Path) -> Result<Option<PathBuf>> {
+    /// The resolved targets of cwd, exe and each open fd, in that order.
+    fn link_targets(proc_dir: &Path) -> Result<Vec<PathBuf>> {
         let mut links = vec![proc_dir.join("cwd"), proc_dir.join("exe")];
         match fs::read_dir(proc_dir.join("fd")) {
             Ok(rd) => {
@@ -178,6 +210,7 @@ mod linux {
             Err(e) if skippable(&e) => {}
             Err(e) => return Err(e).context("reading /proc fd dir"),
         }
+        let mut targets = Vec::new();
         for link in links {
             let target = match fs::read_link(&link) {
                 Ok(t) => t,
@@ -185,11 +218,8 @@ mod linux {
                 Err(e) => return Err(e).with_context(|| format!("reading {}", link.display())),
             };
             // Deleted files read as "<path> (deleted)"; canonicalize fails, use raw target.
-            let target = target.canonicalize().unwrap_or(target);
-            if target.starts_with(root) {
-                return Ok(Some(target));
-            }
+            targets.push(target.canonicalize().unwrap_or(target));
         }
-        Ok(None)
+        Ok(targets)
     }
 }

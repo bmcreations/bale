@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use bale_core::busy::busy_holders;
+use bale_core::busy::{busy_holders, busy_holders_many};
 use bale_core::idle::last_source_change;
 use std::fs;
 use std::path::Path;
@@ -144,4 +144,28 @@ fn symlinks_are_not_followed() {
 fn missing_root_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(last_source_change(&tmp.path().join("nope"), &[]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn many_roots_from_one_scan_match_each_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let held = tmp.path().join("held");
+    let free = tmp.path().join("free");
+    fs::create_dir_all(held.join("app")).unwrap();
+    fs::create_dir_all(&free).unwrap();
+    let child = sleep_in(&held.join("app"));
+    let pid = child.0.id();
+
+    let lists = busy_holders_many(&[free.clone(), held.clone(), held.clone()]).unwrap();
+    assert_eq!(lists.len(), 3);
+    assert!(lists[0].iter().all(|h| h.pid != pid), "{lists:?}");
+    assert_eq!(
+        lists[1].iter().filter(|h| h.pid == pid).count(),
+        1,
+        "{lists:?}"
+    );
+    assert_eq!(lists[1], lists[2]);
+    assert!(busy_holders_many(&[]).unwrap().is_empty());
+    assert!(busy_holders_many(&[tmp.path().join("missing")]).is_err());
 }

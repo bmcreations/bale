@@ -109,3 +109,20 @@ fn id_stable_for_same_path() {
     std::fs::remove_dir_all(&p).unwrap();
     assert_eq!(workspace_id(&nested), nid);
 }
+
+#[test]
+fn level_name_matches_stored_name() {
+    for level in [
+        Level::Hot,
+        Level::Baling,
+        Level::Baled,
+        Level::Cooling,
+        Level::Cold,
+        Level::Opening,
+    ] {
+        assert_eq!(
+            serde_json::to_string(&level).unwrap(),
+            format!("\"{}\"", level.name())
+        );
+    }
+}

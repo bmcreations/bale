@@ -8,7 +8,7 @@ use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{resolve, up, Outcome};
-use bale_core::registry::{Level, Registry};
+use bale_core::registry::Registry;
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
 
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
 fn report(id: &str, outcome: Outcome) -> ExitCode {
     match outcome {
         Outcome::Done(level) => {
-            println!("{id}: {}", level_name(level));
+            println!("{id}: {}", level.name());
             ExitCode::SUCCESS
         }
         Outcome::Busy(holders) => {
@@ -149,6 +149,9 @@ fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<Exi
     for line in plan_lines(&rows) {
         println!("{line}");
     }
+    if cfg!(target_os = "macos") {
+        println!("note: regenerable excludes global Xcode DerivedData, which bale also removes");
+    }
     if !do_apply {
         println!("dry run: nothing changed; re-run with --apply");
         return Ok(ExitCode::SUCCESS);
@@ -179,7 +182,7 @@ fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<Exi
 /// The plan table followed by a totals line.
 fn plan_lines(rows: &[PlanRow]) -> Vec<String> {
     let mut lines = vec![format!(
-        "{:<10}  {:<11}  {:<22}  {:<20}  PATH",
+        "{:<10}  {:<11}  {:<24}  {:<20}  PATH",
         "TOTAL", "REGENERABLE", "FLAGS", "ACTION"
     )];
     for r in rows {
@@ -198,7 +201,7 @@ fn plan_lines(rows: &[PlanRow]) -> Vec<String> {
             flags.join(",")
         };
         lines.push(format!(
-            "{:<10}  {:<11}  {:<22}  {:<20}  {}",
+            "{:<10}  {:<11}  {:<24}  {:<20}  {}",
             human(r.total_bytes),
             human(r.regenerable_bytes),
             flags,
@@ -247,24 +250,13 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
         println!(
             "{:<12}  {:<7}  {:<10}  {:<20}  {}",
             r.id,
-            level_name(r.level),
+            r.level.name(),
             ago(r.last_activity),
             r.branch.as_deref().unwrap_or("(detached)"),
             r.path.display()
         );
     }
     Ok(())
-}
-
-fn level_name(level: Level) -> &'static str {
-    match level {
-        Level::Hot => "hot",
-        Level::Baling => "baling",
-        Level::Baled => "baled",
-        Level::Cooling => "cooling",
-        Level::Cold => "cold",
-        Level::Opening => "opening",
-    }
 }
 
 fn ago(t: SystemTime) -> String {
@@ -314,6 +306,7 @@ mod tests {
     #[test]
     fn plan_table_shows_flags_and_totals() {
         let row = |action: &str, dirty: bool, regen: u64| PlanRow {
+            repo: PathBuf::from("/r"),
             path: PathBuf::from("/w"),
             total_bytes: 2048,
             regenerable_bytes: regen,
@@ -330,6 +323,19 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[2].contains("report (temp)"), "{lines:?}");
+        let all = PlanRow {
+            dirty: true,
+            busy: true,
+            temp_location: true,
+            prunable: true,
+            ..row("x", true, 0)
+        };
+        let line = &plan_lines(&[all])[1];
+        let action_at = line.find("  x  ").expect(line);
+        assert!(
+            line[..action_at].ends_with("dirty,busy,temp,prunable"),
+            "{line}"
+        );
         assert_eq!(lines[3], "2 worktrees, 1.0 KiB regenerable, 1 to bale");
     }
 

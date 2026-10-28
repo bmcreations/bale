@@ -21,6 +21,20 @@ pub enum Level {
     Opening,
 }
 
+impl Level {
+    /// The lowercase name, as stored in records.
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Hot => "hot",
+            Level::Baling => "baling",
+            Level::Baled => "baled",
+            Level::Cooling => "cooling",
+            Level::Cold => "cold",
+            Level::Opening => "opening",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub id: String,

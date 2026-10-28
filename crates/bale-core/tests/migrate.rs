@@ -176,6 +176,7 @@ fn busy_tree_is_registered_but_not_baled() {
         .current_dir(&wt)
         .spawn()
         .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let home = fx.home();
 
     let result = plan(&home, std::slice::from_ref(&fx.repo)).and_then(|rows| {
@@ -198,4 +199,145 @@ fn busy_tree_is_registered_but_not_baled() {
             .level,
         Level::Hot
     );
+}
+
+#[test]
+fn corrupt_record_gives_error_row_and_others_still_plan() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, dirty) = three_worktrees(&fx);
+    let home = fx.home();
+    fs::create_dir_all(home.records_dir()).unwrap();
+    fs::write(
+        home.records_dir()
+            .join(format!("{}.json", workspace_id(&normal))),
+        "{not json",
+    )
+    .unwrap();
+
+    let rows = plan(&home, std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    let n = row(&rows, &normal);
+    assert!(n.action.starts_with("report (error: "), "{n:#?}");
+    assert!(n.action.contains("corrupt record"), "{n:#?}");
+    assert_eq!(row(&rows, &dirty).action, "bale");
+
+    let report = apply(&home, &rows).unwrap();
+    assert_eq!((report.baled, report.reported), (1, 2), "{report:?}");
+    assert!(normal.join("app/build/out.bin").exists());
+}
+
+#[test]
+fn bad_repo_arg_gives_error_row_and_other_repos_continue() {
+    let fx = Fixture::outside_temp();
+    three_worktrees(&fx);
+    // Missing, so git cannot climb to an enclosing repo.
+    let bad = fx.repo.parent().unwrap().join("no such repo");
+    let rows = plan(&fx.home(), &[bad.clone(), fx.repo.clone()]).unwrap();
+    assert_eq!(rows.len(), 4, "{rows:#?}");
+    assert_eq!(rows[0].path, bad);
+    assert!(rows[0].action.starts_with("report (error: "), "{rows:#?}");
+}
+
+#[test]
+fn two_repos_give_rows_from_both() {
+    let a = Fixture::outside_temp();
+    let b = Fixture::outside_temp();
+    let (a_normal, _, _) = three_worktrees(&a);
+    ignore_build(&b);
+    let b_tree = gradle_worktree(&b, "other");
+    let rows = plan(&a.home(), &[a.repo.clone(), b.repo.clone()]).unwrap();
+    assert_eq!(rows.len(), 4, "{rows:#?}");
+    assert_eq!(row(&rows, &a_normal).action, "bale");
+    assert_eq!(row(&rows, &b_tree).action, "bale");
+    assert_eq!(row(&rows, &b_tree).repo, b.repo);
+}
+
+#[test]
+fn registered_hot_plans_as_bale() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, _) = three_worktrees(&fx);
+    register(&fx.home(), &normal).unwrap();
+    let rows = plan(&fx.home(), std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(row(&rows, &normal).action, "bale");
+}
+
+#[test]
+fn user_locked_worktree_is_reported_never_baled() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, _) = three_worktrees(&fx);
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "mine",
+            normal.to_str().unwrap(),
+        ],
+    );
+    let home = fx.home();
+    let rows = plan(&home, std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(row(&rows, &normal).action, "report (locked: mine)");
+
+    let report = apply(&home, &rows).unwrap();
+    assert_eq!(report.baled, 1, "{report:?}");
+    assert!(normal.join("app/build/out.bin").exists());
+    assert!(Registry::open(home)
+        .get(&workspace_id(&normal))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn missing_dir_not_prunable_to_git_plans_as_prunable() {
+    let fx = Fixture::outside_temp();
+    ignore_build(&fx);
+    let wt = gradle_worktree(&fx, "locked-gone");
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    fs::remove_dir_all(&wt).unwrap();
+    let rows = plan(&fx.home(), std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert!(rows[0].prunable);
+    assert_eq!(rows[0].action, "report (prunable)");
+}
+
+#[test]
+fn prunable_temp_row_has_both_flags() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("tmp-gone", "tmp-gone");
+    fs::remove_dir_all(&wt).unwrap();
+    let rows = plan(&fx.home(), std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].prunable && rows[0].temp_location, "{rows:#?}");
+    assert_eq!(rows[0].action, "report (prunable)");
+}
+
+#[test]
+fn apply_records_row_error_and_continues() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, dirty) = three_worktrees(&fx);
+    let home = fx.home();
+    let mut rows = plan(&home, std::slice::from_ref(&fx.repo)).unwrap();
+    let not_a_worktree = fx.repo.parent().unwrap().join("plain");
+    fs::create_dir_all(&not_a_worktree).unwrap();
+    let mut bogus = rows[0].clone();
+    bogus.path = not_a_worktree.clone();
+    bogus.action = "bale".into();
+    rows.insert(0, bogus);
+
+    let report = apply(&home, &rows).unwrap();
+    assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert_eq!(report.errors[0].0, not_a_worktree);
+    assert_eq!(report.baled, 2);
+    assert!(!normal.join("app/build").exists());
+    assert!(!dirty.join("app/build").exists());
 }
