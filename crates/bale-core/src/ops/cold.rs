@@ -1776,6 +1776,46 @@ mod tests {
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
     }
 
+    /// The in-place verify looks inside submodules: the wip commit holds
+    /// only `lib`'s HEAD, so the root tree can't show this file.
+    #[test]
+    fn verify_catches_untracked_file_in_submodule() {
+        let (tmp, wt, _home, _id) = submodule_case(|_| {});
+        let dest = tmp.path().join("dest");
+        save_wip(&wt, "x").unwrap();
+        save_ignored(&wt, &dest, &none()).unwrap();
+        verify(&wt, "x", &dest, &none()).unwrap();
+        fs::write(wt.join("lib/late.txt"), "late\n").unwrap();
+        let err = verify(&wt, "x", &dest, &none()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("submodule lib changed while saving"),
+            "{err:#}"
+        );
+    }
+
+    /// `recover` checks an unmarked trash inside its submodules too.
+    #[test]
+    fn crash_after_rename_keeps_a_late_write_in_a_submodule() {
+        let (_tmp, wt, home, id) = submodule_case(|_| {});
+        let before = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("lib/late.txt"), "late\n").unwrap()
+        });
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop((before, after));
+        assert!(crashed.is_err());
+        assert_eq!(trash_siblings(&wt).unwrap().len(), 1);
+
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(
+            fs::read_to_string(wt.join("lib/late.txt")).unwrap(),
+            "late\n"
+        );
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+    }
+
     /// The trash marker lets `recover` delete the trash without checking
     /// it, so it must not exist until the moved tree has been checked.
     #[test]
