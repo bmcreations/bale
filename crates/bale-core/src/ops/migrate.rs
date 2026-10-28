@@ -19,8 +19,8 @@ pub const REPORT_TEMP: &str = "report (temp)";
 /// One linked worktree and what `apply` would do with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRow {
-    /// The repo argument this row came from; `apply` reads free space on
-    /// the first row's repo volume.
+    /// The main checkout of the row's repo (the argument itself when it
+    /// could not be listed); `apply` reads free space on the first row's.
     pub repo: PathBuf,
     pub path: PathBuf,
     pub total_bytes: u64,
@@ -65,11 +65,18 @@ pub fn plan(home: &BaleHome, repos: &[PathBuf]) -> Result<Vec<PlanRow>> {
         });
         match listed {
             Ok(None) => {}
-            Ok(Some(list)) => rows.extend(
-                list.iter()
-                    .filter(|w| !w.is_main)
-                    .map(|w| plan_row(home, &registry, &temp_roots, repo, w)),
-            ),
+            Ok(Some(list)) => {
+                // git lists the main checkout first, even from a linked path.
+                let main = list
+                    .iter()
+                    .find(|w| w.is_main)
+                    .map_or_else(|| repo.clone(), |w| w.path.clone());
+                rows.extend(
+                    list.iter()
+                        .filter(|w| !w.is_main)
+                        .map(|w| plan_row(home, &registry, &temp_roots, &main, w)),
+                );
+            }
             Err(e) => {
                 let mut row = empty_row(repo, repo);
                 row.action = error_action(&e.context(format!("listing {}", repo.display())));
@@ -152,13 +159,28 @@ fn decide(
     Ok(BALE.into())
 }
 
-/// Marks `bale` rows busy from one scan of the process table. A failed scan
-/// turns each of those rows into an error row.
+/// Marks `bale` rows busy from one scan of the process table. A row whose
+/// path no longer resolves becomes an error row on its own; a failed scan
+/// turns every remaining candidate into an error row.
 fn probe_busy(rows: &mut [PlanRow]) {
-    let candidates: Vec<usize> = (0..rows.len())
-        .filter(|&i| rows[i].action == BALE)
-        .collect();
-    let paths: Vec<PathBuf> = candidates.iter().map(|&i| rows[i].path.clone()).collect();
+    let mut candidates = Vec::new();
+    let mut paths = Vec::new();
+    for (i, row) in rows.iter_mut().enumerate() {
+        if row.action != BALE {
+            continue;
+        }
+        match fs::canonicalize(&row.path) {
+            Ok(p) => {
+                candidates.push(i);
+                paths.push(p);
+            }
+            Err(e) => {
+                let e = anyhow::Error::from(e)
+                    .context(format!("canonicalizing {}", row.path.display()));
+                row.action = error_action(&e);
+            }
+        }
+    }
     match busy_holders_many(&paths) {
         Ok(lists) => {
             for (&i, holders) in candidates.iter().zip(lists) {
@@ -192,6 +214,17 @@ pub fn apply(home: &BaleHome, rows: &[PlanRow]) -> Result<MigrateReport> {
             report.reported += 1;
             continue;
         }
+        match foreign_lock(row) {
+            Ok(true) => {
+                report.reported += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                report.errors.push((row.path.clone(), format!("{e:#}")));
+                continue;
+            }
+        }
         match register(home, &row.path).and_then(|rec| up(home, &rec.id)) {
             Ok(Outcome::Done(_)) => report.baled += 1,
             Ok(Outcome::Busy(_)) => report.busy += 1,
@@ -206,6 +239,19 @@ pub fn apply(home: &BaleHome, rows: &[PlanRow]) -> Result<MigrateReport> {
             .push((volume.unwrap_or_default(), format!("{e:#}"))),
     }
     Ok(report)
+}
+
+/// True when git now shows the row's worktree locked with a reason other
+/// than bale's, for example a lock the user added after `plan`.
+fn foreign_lock(row: &PlanRow) -> Result<bool> {
+    let want = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+    let list = git::worktrees(&row.repo)
+        .with_context(|| format!("re-reading locks in {}", row.repo.display()))?;
+    Ok(list
+        .iter()
+        .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == want)
+        .and_then(|w| w.locked.as_deref())
+        .is_some_and(|reason| reason != LOCK_REASON))
 }
 
 /// Free bytes on the volume holding `path`; 0 when there is no path.
@@ -258,4 +304,24 @@ fn existing_ancestor(path: &Path) -> PathBuf {
         .find(|p| p.exists())
         .unwrap_or(&absolute)
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vanished_dir_fails_only_its_own_busy_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kept = tmp.path().join("kept");
+        let gone = tmp.path().join("gone");
+        fs::create_dir_all(&kept).unwrap();
+        let mut rows = vec![empty_row(tmp.path(), &kept), empty_row(tmp.path(), &gone)];
+        for r in &mut rows {
+            r.action = BALE.into();
+        }
+        probe_busy(&mut rows);
+        assert_eq!(rows[0].action, BALE, "{rows:#?}");
+        assert!(rows[1].action.starts_with("report (error: "), "{rows:#?}");
+    }
 }

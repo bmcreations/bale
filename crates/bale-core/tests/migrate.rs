@@ -327,7 +327,10 @@ fn apply_records_row_error_and_continues() {
     let (normal, _, dirty) = three_worktrees(&fx);
     let home = fx.home();
     let mut rows = plan(&home, std::slice::from_ref(&fx.repo)).unwrap();
-    let not_a_worktree = fx.repo.parent().unwrap().join("plain");
+    // System temp has no git repo above it, so register fails the same way
+    // wherever this checkout lives.
+    let plain_tmp = tempfile::TempDir::new().unwrap();
+    let not_a_worktree = plain_tmp.path().join("plain");
     fs::create_dir_all(&not_a_worktree).unwrap();
     let mut bogus = rows[0].clone();
     bogus.path = not_a_worktree.clone();
@@ -340,4 +343,54 @@ fn apply_records_row_error_and_continues() {
     assert_eq!(report.baled, 2);
     assert!(!normal.join("app/build").exists());
     assert!(!dirty.join("app/build").exists());
+}
+
+#[test]
+fn lock_without_reason_plans_as_locked() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, _) = three_worktrees(&fx);
+    git(&fx.repo, &["worktree", "lock", normal.to_str().unwrap()]);
+    let rows = plan(&fx.home(), std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(row(&rows, &normal).action, "report (locked)");
+}
+
+#[test]
+fn lock_added_between_plan_and_apply_is_respected() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, dirty) = three_worktrees(&fx);
+    let home = fx.home();
+    let rows = plan(&home, std::slice::from_ref(&fx.repo)).unwrap();
+    assert_eq!(row(&rows, &normal).action, "bale");
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "mine",
+            normal.to_str().unwrap(),
+        ],
+    );
+
+    let report = apply(&home, &rows).unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!((report.baled, report.reported), (1, 2), "{report:?}");
+    assert!(normal.join("app/build/out.bin").exists());
+    assert!(!dirty.join("app/build").exists());
+    assert!(Registry::open(home)
+        .get(&workspace_id(&normal))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn repo_names_main_checkout_for_linked_path_arg() {
+    let fx = Fixture::outside_temp();
+    let (normal, _, _) = three_worktrees(&fx);
+    let rows = plan(&fx.home(), std::slice::from_ref(&normal)).unwrap();
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    let main = fs::canonicalize(&fx.repo).unwrap();
+    for r in &rows {
+        assert_eq!(fs::canonicalize(&r.repo).unwrap(), main, "{r:#?}");
+    }
 }

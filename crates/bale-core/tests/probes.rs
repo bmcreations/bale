@@ -150,8 +150,10 @@ fn missing_root_is_an_error() {
 #[test]
 fn many_roots_from_one_scan_match_each_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let held = tmp.path().join("held");
-    let free = tmp.path().join("free");
+    // busy_holders_many takes canonical roots.
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let held = base.join("held");
+    let free = base.join("free");
     fs::create_dir_all(held.join("app")).unwrap();
     fs::create_dir_all(&free).unwrap();
     let child = sleep_in(&held.join("app"));
@@ -167,5 +169,50 @@ fn many_roots_from_one_scan_match_each_root() {
     );
     assert_eq!(lists[1], lists[2]);
     assert!(busy_holders_many(&[]).unwrap().is_empty());
-    assert!(busy_holders_many(&[tmp.path().join("missing")]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn many_roots_prefix_cwd_outside_and_symlinked_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let wt = base.join("wt");
+    let wt2 = base.join("wt2");
+    let files = base.join("files");
+    let elsewhere = base.join("elsewhere");
+    for d in [&wt, &wt2, &files, &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&wt, &link).unwrap();
+    let file = files.join("out.bin");
+    fs::write(&file, "x").unwrap();
+
+    let in_wt = sleep_in(&wt);
+    let holds_file = Child(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&elsewhere)
+            .stdin(fs::File::open(&file).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let (a, b) = (in_wt.0.id(), holds_file.0.id());
+
+    let roots = [
+        wt.clone(),
+        wt2.clone(),
+        files.clone(),
+        fs::canonicalize(&link).unwrap(),
+    ];
+    let lists = busy_holders_many(&roots).unwrap();
+    let pids = |i: usize| lists[i].iter().map(|h| h.pid).collect::<Vec<_>>();
+    assert!(pids(0).contains(&a) && !pids(0).contains(&b), "{lists:?}");
+    // wt2 shares a string prefix with wt but is a different dir.
+    assert!(!pids(1).contains(&a) && !pids(1).contains(&b), "{lists:?}");
+    assert!(pids(2).contains(&b) && !pids(2).contains(&a), "{lists:?}");
+    assert!(pids(3).contains(&a), "{lists:?}");
+    // busy_holders canonicalizes a symlinked root itself.
+    assert!(busy_holders(&link).unwrap().iter().any(|h| h.pid == a));
 }

@@ -152,6 +152,13 @@ fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<Exi
     if cfg!(target_os = "macos") {
         println!("note: regenerable excludes global Xcode DerivedData, which bale also removes");
     }
+    // The table truncates error text; print it whole.
+    for r in rows
+        .iter()
+        .filter(|r| r.action.starts_with("report (error: "))
+    {
+        eprintln!("bale: {}: {}", r.path.display(), r.action);
+    }
     if !do_apply {
         println!("dry run: nothing changed; re-run with --apply");
         return Ok(ExitCode::SUCCESS);
@@ -177,6 +184,24 @@ fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<Exi
     } else {
         ExitCode::from(1)
     })
+}
+
+/// Widest action cell before truncation.
+const ACTION_WIDTH: usize = 60;
+
+/// `action` on one line (newlines become spaces), cut to `ACTION_WIDTH`
+/// characters with a trailing `...`.
+fn action_cell(action: &str) -> String {
+    let flat: String = action
+        .split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() <= ACTION_WIDTH {
+        return flat;
+    }
+    let cut: String = flat.chars().take(ACTION_WIDTH - 3).collect();
+    format!("{cut}...")
 }
 
 /// The plan table followed by a totals line.
@@ -205,7 +230,7 @@ fn plan_lines(rows: &[PlanRow]) -> Vec<String> {
             human(r.total_bytes),
             human(r.regenerable_bytes),
             flags,
-            r.action,
+            action_cell(&r.action),
             r.path.display()
         ));
     }
@@ -337,6 +362,28 @@ mod tests {
             "{line}"
         );
         assert_eq!(lines[3], "2 worktrees, 1.0 KiB regenerable, 1 to bale");
+    }
+
+    #[test]
+    fn error_action_stays_on_one_bounded_line() {
+        let long = format!("report (error: first\nsecond\r\n{})", "x".repeat(300));
+        let row = PlanRow {
+            repo: PathBuf::from("/r"),
+            path: PathBuf::from("/w"),
+            total_bytes: 0,
+            regenerable_bytes: 0,
+            dirty: false,
+            busy: false,
+            temp_location: false,
+            prunable: false,
+            action: long,
+        };
+        let lines = plan_lines(&[row]);
+        let line = &lines[1];
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(line.contains("first second"), "{line:?}");
+        assert!(line.ends_with("  /w"), "{line:?}");
+        assert!(line.chars().count() < 160, "{line:?}");
     }
 
     #[test]

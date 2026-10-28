@@ -17,29 +17,26 @@ pub struct Holder {
 /// Processes (other than this one) with cwd or an open file under `root`.
 /// Windows returns empty: busy is detected by the rename in the cold path.
 pub fn busy_holders(root: &Path) -> Result<Vec<Holder>> {
-    Ok(busy_holders_many(&[root.to_path_buf()])?
-        .pop()
-        .unwrap_or_default())
+    #[cfg(unix)]
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", root.display()))?;
+    #[cfg(not(unix))]
+    let root = root.to_path_buf();
+    Ok(busy_holders_many(&[root])?.pop().unwrap_or_default())
 }
 
 /// `busy_holders` for each of `roots`, in order, from one scan of the
-/// process table. Errs when any root cannot be canonicalized or the scan fails.
+/// process table. Roots must already be canonical (paths are matched as
+/// given). Errs only when the scan fails.
 pub fn busy_holders_many(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
-    #[cfg(unix)]
-    let roots = roots
-        .iter()
-        .map(|r| {
-            r.canonicalize()
-                .with_context(|| format!("canonicalizing {}", r.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
     #[cfg(target_os = "linux")]
     {
-        linux::holders(&roots)
+        linux::holders(roots)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        lsof::holders(&roots)
+        lsof::holders(roots)
     }
     #[cfg(not(unix))]
     {
