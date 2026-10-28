@@ -309,8 +309,12 @@ Everything in `bale up`, then:
 
    Because the compare reads the disk, a tree whose files git would not give back byte for byte stays:
    a clean filter that changes content, `core.autocrlf=input` on a CRLF file, a new `ident` file holding an
-   unexpanded `$Id$` (checkout would expand it), a case variant of `.git` such as `d/.GIT` (which `add -A`
-   drops), and a fifo, socket or device. A repo with `core.autocrlf=true` and `text=auto` still goes cold, because checkout writes the
+   unexpanded `$Id$` (checkout would expand it), and a fifo, socket or device. A case variant of `.git`
+   such as `d/.GIT` stays too: git refuses it as a path on every platform (`add -A` drops it on macOS and
+   Windows and fails on it on Linux), so cold walks the tree for one before `up` runs, outside the
+   regenerable directories `up` removes, and skips naming it. The moved tree, and an unmarked trash in
+   recovery, are walked again before git runs in them; one found there moves the tree back as a
+   difference. A repo with `core.autocrlf=true` and `text=auto` still goes cold, because checkout writes the
    CRLF bytes back.
 6. Write the registry record as `cold`.
 
