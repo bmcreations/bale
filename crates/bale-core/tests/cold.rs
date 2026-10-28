@@ -511,7 +511,7 @@ fn cold_refuses_repo_inside_ignored_dir() {
     let id = register(&fx.home(), &wt).unwrap().id;
     let out = cold(&fx.home(), &id).unwrap();
     assert!(
-        matches!(&out, Outcome::Skipped(r) if r.contains(".worktrees/x")),
+        matches!(&out, Outcome::Skipped(r) if r.contains(&native(".worktrees/x"))),
         "{out:?}"
     );
     assert!(wt.join(".worktrees/x/.git").is_dir());
@@ -529,7 +529,10 @@ fn save_ignored_refuses_nested_repo() {
         &exclusions(&fx.home(), &wt).unwrap(),
     )
     .unwrap_err();
-    assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains(&native("vendor/lib")),
+        "{err:#}"
+    );
 }
 
 /// Recovering an interrupted cold removes the check dir the crash left
@@ -1242,6 +1245,23 @@ fn wip_resolves(fx: &Fixture, id: &str) -> bool {
         .success()
 }
 
+/// `path` as bale reports it: canonical, so with long names and native
+/// separators on Windows.
+fn canonical(path: &Path) -> String {
+    bale_core::paths::canonicalize(path)
+        .unwrap()
+        .display()
+        .to_string()
+}
+
+/// A relative `a/b` path with the platform's separator, as bale prints it.
+fn native(rel: &str) -> String {
+    rel.split('/')
+        .collect::<std::path::PathBuf>()
+        .display()
+        .to_string()
+}
+
 /// Replaces the checkout at `wt` with a folder an editor might recreate.
 fn replace_with_stray(wt: &Path) {
     fs::remove_dir_all(wt).unwrap();
@@ -1255,8 +1275,9 @@ fn assert_cold_refuses_stray(fx: &Fixture, wt: &Path) {
     let id = register(&fx.home(), wt).unwrap().id;
     replace_with_stray(wt);
     let out = cold(&fx.home(), &id).unwrap();
+    let shown = canonical(wt);
     assert!(
-        matches!(&out, Outcome::Skipped(r) if r.contains(&wt.display().to_string())),
+        matches!(&out, Outcome::Skipped(r) if r.contains(&shown)),
         "{out:?}"
     );
     assert_eq!(level(fx, &id), Level::Hot);
@@ -1302,10 +1323,7 @@ fn resolve_keeps_admin_dir_when_the_folder_is_not_the_checkout() {
     replace_with_stray(&wt);
 
     let err = resolve(&fx.home(), wt.to_str().unwrap()).unwrap_err();
-    assert!(
-        format!("{err:#}").contains(&wt.display().to_string()),
-        "{err:#}"
-    );
+    assert!(format!("{err:#}").contains(&canonical(&wt)), "{err:#}");
     assert!(register(&fx.home(), &wt).is_err());
     let after = Registry::open(fx.home()).get(&before.id).unwrap().unwrap();
     assert_eq!(after.admin_dir, before.admin_dir);

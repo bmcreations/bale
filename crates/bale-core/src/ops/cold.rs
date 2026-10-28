@@ -2275,6 +2275,8 @@ mod tests {
     /// the next run must check the trash, find the write and keep it.
     /// Recovery checks an unmarked trash for holders before deleting it, as
     /// `finish` does: a process that has the moved tree open moves it back.
+    /// Unix only: holders are not listed on Windows (`busy_holders`).
+    #[cfg(unix)]
     #[test]
     fn recovery_keeps_an_unmarked_trash_a_process_holds() {
         struct KillOnDrop(std::process::Child);
@@ -2435,7 +2437,9 @@ mod tests {
     /// `.env`, registered.
     fn nested_worktree() -> (tempfile::TempDir, PathBuf, PathBuf, BaleHome, String) {
         let (tmp, repo) = repo();
-        let wt = repo.join(".claude/worktrees/w");
+        // Joined part by part: on Windows a `/` would stay in the path and
+        // never match the canonical path bale reports.
+        let wt = repo.join(".claude").join("worktrees").join("w");
         git(
             &repo,
             &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
@@ -2748,6 +2752,8 @@ mod tests {
         drop(seam);
 
         let text = format!("{err:#}");
+        // bale reports the canonical path (no 8.3 short names on Windows).
+        let wt = crate::paths::canonicalize(&wt).unwrap();
         assert!(text.contains(&trash[0].display().to_string()), "{text}");
         assert!(text.contains(&wt.display().to_string()), "{text}");
         assert!(trash[0].join("late.txt").is_file());

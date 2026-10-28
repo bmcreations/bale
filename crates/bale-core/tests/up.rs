@@ -503,8 +503,12 @@ fn up_leaves_a_folder_that_is_not_the_checkout() {
     fs::write(wt.join("app/build/keep.bin"), "mine").unwrap();
 
     let out = up(&fx.home(), &id);
+    let shown = bale_core::paths::canonicalize(&wt)
+        .unwrap()
+        .display()
+        .to_string();
     assert!(
-        matches!(&out, Ok(Outcome::Skipped(r)) if r.contains(&wt.display().to_string())),
+        matches!(&out, Ok(Outcome::Skipped(r)) if r.contains(&shown)),
         "{out:?}"
     );
     assert_eq!(
