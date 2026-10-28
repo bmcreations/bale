@@ -334,3 +334,27 @@ fn up_row_names_a_build_dir_it_kept() {
     assert!(wt.join("build/notes.md").exists());
     assert!(!wt.join("app/build").exists());
 }
+
+#[test]
+fn baled_tree_with_regrown_output_is_baled_again() {
+    let fx = Fixture::new();
+    ignore_build(&fx);
+    global_config(&fx.home(), "idle_baled_hours = 0\n");
+    let wt = gradle_worktree(&fx, "wt");
+    // Dirty, which must not stop a re-bale.
+    fs::write(wt.join("f"), "edited\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_level(&fx, &id, Level::Baled);
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(row(&rows, &id).1, Action::Up, "{rows:?}");
+    assert!(!wt.join("app/build").exists());
+    assert_eq!(level(&fx, &id), Level::Baled);
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "edited\n");
+
+    // Nothing regrew, and a dir with real content does not count.
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/notes.md"), "notes\n").unwrap();
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(row(&rows, &id).1, Action::Keep, "{rows:?}");
+}

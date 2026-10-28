@@ -11,7 +11,7 @@ use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
-use crate::ops::up::{up_report, Outcome};
+use crate::ops::up::{bale_able, up_report, Outcome};
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
 
@@ -28,13 +28,26 @@ pub enum Action {
 }
 
 /// The idle policy. `dirty` must be `true` whenever cleanliness is unknown.
-pub fn decide(level: Level, idle_for: Duration, dirty: bool, cfg: &Config) -> Action {
+/// `has_regen` says whether a `Baled` tree has regrown output `up` would
+/// remove; it is ignored for other levels.
+pub fn decide(
+    level: Level,
+    idle_for: Duration,
+    dirty: bool,
+    has_regen: bool,
+    cfg: &Config,
+) -> Action {
     if let Some(action) = level_action(level) {
         return action;
     }
+    let up_due = match level {
+        Level::Hot => true,
+        Level::Baled => has_regen,
+        _ => false,
+    };
     if !dirty && idle_for >= cfg.idle_cold {
         Action::Cold
-    } else if level == Level::Hot && idle_for >= cfg.idle_baled {
+    } else if up_due && idle_for >= cfg.idle_baled {
         Action::Up
     } else {
         Action::Keep
@@ -126,7 +139,13 @@ fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
     // Only a tree past the cold threshold needs the (costly) dirty probe;
     // below it, dirty = true changes nothing.
     let dirty = idle_for < cfg.idle_cold || git::is_dirty(&root)?;
-    Ok(decide(record.level, idle_for, dirty, &cfg))
+    // Only a Baled tree past the baled threshold needs to know whether its
+    // output regrew; the same filter as `up` keeps sweep from re-running up
+    // on a tree whose only regenerable-named dirs hold real content.
+    let has_regen = record.level == Level::Baled
+        && idle_for >= cfg.idle_baled
+        && !bale_able(home, &root)?.0.is_empty();
+    Ok(decide(record.level, idle_for, dirty, has_regen, &cfg))
 }
 
 /// `now` minus the later of the two times; zero when that lies in the future.
@@ -174,58 +193,106 @@ mod tests {
 
     #[test]
     fn hot_idle_5h_goes_up() {
-        assert_eq!(decide(Level::Hot, h(5), false, &cfg()), Action::Up);
+        assert_eq!(decide(Level::Hot, h(5), false, true, &cfg()), Action::Up);
     }
 
     #[test]
     fn hot_idle_3h_keeps() {
-        assert_eq!(decide(Level::Hot, h(3), false, &cfg()), Action::Keep);
+        assert_eq!(decide(Level::Hot, h(3), false, true, &cfg()), Action::Keep);
     }
 
     #[test]
     fn hot_at_threshold_goes_up() {
-        assert_eq!(decide(Level::Hot, h(4), false, &cfg()), Action::Up);
+        assert_eq!(decide(Level::Hot, h(4), false, true, &cfg()), Action::Up);
     }
 
     #[test]
-    fn baled_idle_5h_keeps() {
-        assert_eq!(decide(Level::Baled, h(5), false, &cfg()), Action::Keep);
+    fn baled_idle_with_regrown_output_goes_up() {
+        assert_eq!(decide(Level::Baled, h(5), false, true, &cfg()), Action::Up);
+        // up does not touch source, so a dirty tree qualifies too.
+        assert_eq!(decide(Level::Baled, h(5), true, true, &cfg()), Action::Up);
+    }
+
+    #[test]
+    fn baled_idle_without_regenerable_output_keeps() {
+        assert_eq!(
+            decide(Level::Baled, h(5), false, false, &cfg()),
+            Action::Keep
+        );
+        assert_eq!(
+            decide(Level::Baled, d(8), true, false, &cfg()),
+            Action::Keep
+        );
+    }
+
+    #[test]
+    fn baled_not_idle_keeps() {
+        assert_eq!(
+            decide(Level::Baled, h(3), false, true, &cfg()),
+            Action::Keep
+        );
+        assert_eq!(decide(Level::Baled, h(3), true, true, &cfg()), Action::Keep);
+    }
+
+    #[test]
+    fn baled_idle_past_cold_threshold_and_clean_goes_cold() {
+        assert_eq!(
+            decide(Level::Baled, d(8), false, true, &cfg()),
+            Action::Cold
+        );
+        assert_eq!(
+            decide(Level::Baled, d(8), false, false, &cfg()),
+            Action::Cold
+        );
     }
 
     #[test]
     fn clean_8d_goes_cold() {
-        assert_eq!(decide(Level::Baled, d(8), false, &cfg()), Action::Cold);
-        assert_eq!(decide(Level::Hot, d(8), false, &cfg()), Action::Cold);
+        assert_eq!(
+            decide(Level::Baled, d(8), false, true, &cfg()),
+            Action::Cold
+        );
+        assert_eq!(decide(Level::Hot, d(8), false, true, &cfg()), Action::Cold);
     }
 
     #[test]
     fn dirty_8d_never_cold() {
-        assert_ne!(decide(Level::Baled, d(8), true, &cfg()), Action::Cold);
-        assert_eq!(decide(Level::Baled, d(8), true, &cfg()), Action::Keep);
-        assert_eq!(decide(Level::Hot, d(8), true, &cfg()), Action::Up);
+        assert_ne!(decide(Level::Baled, d(8), true, true, &cfg()), Action::Cold);
+        assert_eq!(decide(Level::Baled, d(8), true, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Baled, d(8), true, false, &cfg()),
+            Action::Keep
+        );
+        assert_eq!(decide(Level::Hot, d(8), true, true, &cfg()), Action::Up);
     }
 
     #[test]
     fn interrupted_resumes() {
-        assert_eq!(decide(Level::Baling, h(0), false, &cfg()), Action::Up);
+        assert_eq!(decide(Level::Baling, h(0), false, true, &cfg()), Action::Up);
     }
 
     #[test]
     fn cooling_resumes_cold_even_when_dirty() {
-        assert_eq!(decide(Level::Cooling, h(0), true, &cfg()), Action::Cold);
+        assert_eq!(
+            decide(Level::Cooling, h(0), true, true, &cfg()),
+            Action::Cold
+        );
     }
 
     #[test]
     fn opening_is_reported_not_restored() {
         assert_eq!(
-            decide(Level::Opening, d(30), false, &cfg()),
+            decide(Level::Opening, d(30), false, true, &cfg()),
             Action::Report("interrupted open: run `bale open <id>`".into())
         );
     }
 
     #[test]
     fn cold_keeps() {
-        assert_eq!(decide(Level::Cold, d(30), false, &cfg()), Action::Keep);
+        assert_eq!(
+            decide(Level::Cold, d(30), false, true, &cfg()),
+            Action::Keep
+        );
     }
 
     #[test]
@@ -235,7 +302,7 @@ mod tests {
             idle_cold: d(1),
             ..cfg()
         };
-        assert_eq!(decide(Level::Hot, h(30), false, &c), Action::Cold);
+        assert_eq!(decide(Level::Hot, h(30), false, true, &c), Action::Cold);
     }
 
     #[test]
