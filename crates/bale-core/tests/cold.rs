@@ -113,6 +113,13 @@ fn cold_saves_everything_and_removes_dir() {
         assert_eq!(mode & 0o777, 0o600);
         let dir_mode = fs::metadata(&files).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o700);
+        let marker = fx.home().saved_dir(&id).join("trash");
+        let marker_mode = fs::metadata(&marker).unwrap().permissions().mode();
+        assert_eq!(marker_mode & 0o777, 0o600);
+        let wip_sha = git(&fx.repo, &["rev-parse", &wip]);
+        assert!(fs::read_to_string(&marker)
+            .unwrap()
+            .contains(wip_sha.trim()));
         let link = files.join(".env.local");
         assert!(fs::symlink_metadata(&link)
             .unwrap()
@@ -485,9 +492,10 @@ fn save_ignored_refuses_nested_repo() {
     assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
 }
 
-/// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`.
+/// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`
+/// and `build/`.
 fn worktree_with_submodule(fx: &Fixture, sub: &Fixture) -> PathBuf {
-    fs::write(sub.repo.join(".gitignore"), ".env\n").unwrap();
+    fs::write(sub.repo.join(".gitignore"), ".env\nbuild/\n").unwrap();
     git(&sub.repo, &["add", ".gitignore"]);
     git(&sub.repo, &["commit", "-m", "ignore"]);
     let wt = fx.add_worktree("wt", "feature");
@@ -511,6 +519,8 @@ fn cold_refuses_submodule_with_ignored_files() {
     let fx = Fixture::new();
     let sub = Fixture::new();
     let wt = worktree_with_submodule(&fx, &sub);
+    // Regenerable output beside the secret must not hide it.
+    gradle_with_built_submodule(&wt);
     fs::write(wt.join("lib/.env"), "SECRET=1\n").unwrap();
     let id = register(&fx.home(), &wt).unwrap().id;
     let out = cold(&fx.home(), &id).unwrap();
@@ -602,5 +612,153 @@ fn recovery_keeps_trash_that_fails_verify() {
     let err = cold(&fx.home(), &id).unwrap_err();
     assert!(format!("{err:#}").contains("changed"), "{err:#}");
     assert_eq!(fs::read_to_string(trash.join("f")).unwrap(), "newer\n");
+    assert_eq!(level(&fx, &id), Level::Cooling);
+}
+
+/// Makes `wt` a Gradle build and gives its submodule `lib` a `build/` dir.
+fn gradle_with_built_submodule(wt: &Path) {
+    fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+    git(wt, &["add", "settings.gradle.kts"]);
+    git(wt, &["commit", "-m", "gradle"]);
+    fs::create_dir_all(wt.join("lib/build")).unwrap();
+    fs::write(wt.join("lib/build/out.bin"), "regen").unwrap();
+}
+
+#[test]
+fn submodule_with_only_regenerable_output_goes_cold() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = worktree_with_submodule(&fx, &sub);
+    gradle_with_built_submodule(&wt);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
+    assert_eq!(level(&fx, &id), Level::Cold);
+}
+
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_skips_unreadable_dir_under_untracked_dir() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::create_dir_all(wt.join("u/locked")).unwrap();
+    fs::write(wt.join("u/a"), "a\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    // A nested repo could hide in a dir the walk cannot read.
+    chmod(&wt.join("u/locked"), 0o000);
+    let out = cold(&fx.home(), &id);
+    if wt.join("u/locked").exists() {
+        chmod(&wt.join("u/locked"), 0o755);
+    }
+    let out = out.unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("unreadable") && r.contains("locked")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("u/a")).unwrap(), "a\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_finishes_partly_removed_trash() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    // remove_dir_all empties `locked/inner`, then cannot unlink it from
+    // `locked`, so the trash no longer matches the wip.
+    fs::create_dir_all(wt.join("locked/inner")).unwrap();
+    fs::write(wt.join("locked/inner/x"), "x\n").unwrap();
+    chmod(&wt.join("locked"), 0o500);
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let first = cold(&fx.home(), &id);
+    for t in trash_beside(&wt) {
+        if t.join("locked").exists() {
+            chmod(&t.join("locked"), 0o755);
+        }
+    }
+    if wt.join("locked").exists() {
+        chmod(&wt.join("locked"), 0o755);
+    }
+    assert!(first.is_err(), "{first:?}");
+    assert!(!wt.exists());
+    assert_eq!(trash_beside(&wt).len(), 1);
+    assert_eq!(level(&fx, &id), Level::Cooling);
+
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(trash_beside(&wt).is_empty());
+    assert_eq!(level(&fx, &id), Level::Cold);
+    assert_eq!(
+        show(&fx, &format!("refs/bale/{id}/wip:locked/inner/x")),
+        "x\n"
+    );
+}
+
+/// Every file under `dir`, relative to it.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                out.push(e.path().strip_prefix(dir).unwrap().to_path_buf());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn recovery_keeps_trash_without_git_entry() {
+    let fx = Fixture::new();
+    // Something `add -A` in the main repo would write a blob for.
+    fs::write(fx.repo.join("main-only.txt"), "main only\n").unwrap();
+    let wt = fx.repo.join("nest").join("wt");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+    );
+    fs::write(wt.join("b.txt"), "untracked\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    save_wip(&wt, &id).unwrap();
+    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    let trash = wt.with_file_name(".bale-trash-wt-123");
+    fs::rename(&wt, &trash).unwrap();
+    // A removal that got as far as the `.git` file: git run in the trash
+    // would walk up to the main repo.
+    fs::remove_file(trash.join(".git")).unwrap();
+    set_level(&fx, &id, Level::Cooling);
+    let git_dir = fx.repo.join(".git");
+    let index = fs::read(git_dir.join("index")).unwrap();
+    let objects = files_under(&git_dir.join("objects"));
+
+    let err = cold(&fx.home(), &id).unwrap_err();
+    assert_eq!(fs::read(git_dir.join("index")).unwrap(), index);
+    assert_eq!(files_under(&git_dir.join("objects")), objects);
+    assert!(format!("{err:#}").contains("no .git"), "{err:#}");
+    assert_eq!(
+        fs::read_to_string(trash.join("b.txt")).unwrap(),
+        "untracked\n"
+    );
     assert_eq!(level(&fx, &id), Level::Cooling);
 }

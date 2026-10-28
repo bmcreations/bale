@@ -22,6 +22,15 @@ use crate::BaleHome;
 
 const MANIFEST: &str = "manifest.json";
 const FILES: &str = "files";
+/// Names the trash dir `finish` verified and the wip commit it verified
+/// against, so recovery can delete what is left of it without git.
+const TRASH_MARKER: &str = "trash";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TrashMarker {
+    name: String,
+    wip: String,
+}
 
 /// One saved ignored file, relative to the worktree root. A symlink has
 /// `symlink_target` set and `sha256` is the hash of the target path text.
@@ -129,33 +138,41 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
     }
 
     // Nothing in a submodule's checkout is saved except what its own commits
-    // hold, so its ignored files or an embedded git dir would be lost.
-    let ignored = g.run(&[
+    // hold, so its ignored files (other than regenerable output) or an
+    // embedded git dir would be lost.
+    let subs = g.run(&[
         "submodule",
         "--quiet",
         "foreach",
         "--recursive",
-        r#"test -z "$(git ls-files --others --ignored --exclude-standard --directory)" || echo "$displaypath""#,
+        r#"echo "$displaypath""#,
     ])?;
-    let ignored: Vec<&str> = ignored.lines().filter(|l| !l.is_empty()).collect();
-    if !ignored.is_empty() {
-        return Ok(Some(format!(
-            "submodule with ignored files: {}",
-            ignored.join(", ")
-        )));
+    let root_regen = regen_dirs(root);
+    let mut ignored = Vec::new();
+    let mut embedded = Vec::new();
+    for sub in subs.lines().filter(|l| !l.is_empty()) {
+        let dir = root.join(sub);
+        if fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir()) {
+            embedded.push(sub);
+            continue;
+        }
+        let mut regen = regen_dirs(&dir);
+        regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
+        let scan = scan_ignored_with(&dir, deny, &regen)?;
+        if !scan.entries.is_empty() || !scan.nested.is_empty() {
+            ignored.push(sub);
+        }
     }
-    let embedded = g.run(&[
-        "submodule",
-        "--quiet",
-        "foreach",
-        "--recursive",
-        r#"test -d .git && echo "$displaypath" || true"#,
-    ])?;
-    let embedded: Vec<&str> = embedded.lines().filter(|l| !l.is_empty()).collect();
     if !embedded.is_empty() {
         return Ok(Some(format!(
             "submodule with its own .git dir: {}",
             embedded.join(", ")
+        )));
+    }
+    if !ignored.is_empty() {
+        return Ok(Some(format!(
+            "submodule with ignored files: {}",
+            ignored.join(", ")
         )));
     }
 
@@ -176,7 +193,15 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
             .follow_root_links(false)
             .into_iter();
         while let Some(item) = it.next() {
-            let Ok(item) = item else { continue };
+            // An unreadable dir could hide a nested repo.
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => {
+                    let path = e.path().unwrap_or(&root.join(entry)).to_path_buf();
+                    let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                    return Ok(Some(format!("unreadable: {}", rel.display())));
+                }
+            };
             if item.depth() > 0 && item.file_name() == ".git" {
                 if let Ok(rel) = item.path().strip_prefix(root) {
                     nested.push(rel.parent().unwrap_or(rel).to_path_buf());
@@ -226,6 +251,11 @@ fn finish(
     }
 
     let trash = trash_path(root)?;
+    if let Err(e) = write_trash_marker(&home.saved_dir(&id), root, &id, &trash) {
+        record.level = Level::Baled;
+        registry.put(&record)?;
+        return Err(e);
+    }
     if let Err(e) = fs::rename(root, &trash) {
         record.level = Level::Baled;
         registry.put(&record)?;
@@ -265,13 +295,13 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
         "--quiet",
         &format!("{wip}^{{commit}}"),
     ]);
-    if resolved.is_err() {
+    let Ok(wip_sha) = resolved else {
         bail!(
             "{} is gone and {wip} does not resolve in {}; leaving any .bale-trash dir beside it",
             path.display(),
             record.repo_common_dir.display()
         );
-    }
+    };
     let manifest = home.saved_dir(&record.id).join(MANIFEST);
     if !manifest.is_file() {
         bail!(
@@ -281,17 +311,75 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
         );
     }
     let dest = home.saved_dir(&record.id);
+    let marker = read_trash_marker(&dest)?;
     for trash in trash_siblings(&path)? {
-        // The trash is still a working checkout: prove the saved state covers
-        // it (and is not stale) before deleting it.
-        let deny = deny_list(home, &trash)?;
-        verify(&trash, &record.id, &dest, &deny)
-            .with_context(|| format!("keeping {}", trash.display()))?;
+        // `finish` verified this trash against this wip just before moving
+        // it; a removal that failed partway can't be verified again.
+        let verified = marker.as_ref().is_some_and(|m| {
+            trash.file_name().and_then(|n| n.to_str()) == Some(m.name.as_str())
+                && m.wip == wip_sha.trim()
+        });
+        if !verified {
+            // Without its `.git`, git would run in whatever repo encloses it.
+            if fs::symlink_metadata(trash.join(".git")).is_err() {
+                bail!(
+                    "keeping {}: it has no .git, so it cannot be checked against {wip}",
+                    trash.display()
+                );
+            }
+            // Still a working checkout: prove the saved state covers it (and
+            // is not stale) before deleting it.
+            let deny = deny_list(home, &trash)?;
+            verify(&trash, &record.id, &dest, &deny)
+                .with_context(|| format!("keeping {}", trash.display()))?;
+        }
         remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
     }
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
+}
+
+/// Writes `dest/trash` (tmp + rename, 0600 on unix) naming `trash` and the
+/// current `refs/bale/<id>/wip` commit.
+fn write_trash_marker(dest: &Path, root: &Path, id: &str, trash: &Path) -> Result<()> {
+    let wip = Git::at(root).run(&[
+        "rev-parse",
+        "--verify",
+        &format!("refs/bale/{id}/wip^{{commit}}"),
+    ])?;
+    let name = trash
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{} is not valid UTF-8", trash.display()))?;
+    let marker = TrashMarker {
+        name: name.to_string(),
+        wip: wip.trim().to_string(),
+    };
+    let path = dest.join(TRASH_MARKER);
+    let tmp = dest.join(format!("{TRASH_MARKER}.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clearing {}", tmp.display())),
+    }
+    let mut f = create_private(&tmp)?;
+    f.write_all(&serde_json::to_vec(&marker)?)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn read_trash_marker(dest: &Path) -> Result<Option<TrashMarker>> {
+    let path = dest.join(TRASH_MARKER);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let marker =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(marker))
 }
 
 fn trash_path(root: &Path) -> Result<PathBuf> {
@@ -458,8 +546,18 @@ struct IgnoredScan {
 }
 
 fn scan_ignored(dir: &Path, deny: &[String]) -> Result<IgnoredScan> {
-    let regen: Vec<PathBuf> = regenerable_dirs(dir, &detect(dir), &no_extras())
-        .into_iter()
+    scan_ignored_with(dir, deny, &regen_dirs(dir))
+}
+
+/// Regenerable dirs under `dir` for the build systems detected there.
+fn regen_dirs(dir: &Path) -> Vec<PathBuf> {
+    regenerable_dirs(dir, &detect(dir), &no_extras())
+}
+
+/// `scan_ignored` with the regenerable dirs (absolute) given by the caller.
+fn scan_ignored_with(dir: &Path, deny: &[String], regen: &[PathBuf]) -> Result<IgnoredScan> {
+    let regen: Vec<PathBuf> = regen
+        .iter()
         .filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf))
         .collect();
     let denied = |rel: &Path| -> bool {
