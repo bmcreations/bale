@@ -167,12 +167,7 @@ fn check_preconditions(home: &BaleHome, record: &Record) -> Result<Saved> {
 
     let dest = home.saved_dir(id);
     let manifest = read_manifest(&dest).context("reading the manifest")?;
-    for rel in manifest
-        .modes
-        .iter()
-        .map(|m| &m.rel)
-        .chain(&manifest.dirs)
-    {
+    for rel in manifest.modes.iter().map(|m| &m.rel).chain(&manifest.dirs) {
         if !is_plain_relative(rel) {
             bail!("manifest entry {} is not a relative path", rel.display());
         }
