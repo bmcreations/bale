@@ -160,7 +160,7 @@ fn dirty_probe_failure_is_reported_never_cold() {
 }
 
 #[test]
-fn error_in_one_workspace_does_not_stop_the_next() {
+fn skip_in_one_workspace_does_not_stop_the_next() {
     let fx = Fixture::new();
     ignore_build(&fx);
     global_config(&fx.home(), "idle_baled_hours = 0\n");
@@ -364,4 +364,26 @@ fn baled_tree_with_regrown_output_is_baled_again() {
     fs::write(wt.join("build/notes.md"), "notes\n").unwrap();
     let rows = sweep(&fx.home(), false).unwrap();
     assert_eq!(row(&rows, &id).1, Action::Keep, "{rows:?}");
+}
+
+#[test]
+fn up_error_in_one_workspace_does_not_stop_the_next() {
+    let fx = Fixture::new();
+    ignore_build(&fx);
+    global_config(&fx.home(), "idle_baled_hours = 0\n");
+    let bad = gradle_worktree(&fx, "bad");
+    let good = gradle_worktree(&fx, "good");
+    let bad_rec = register(&fx.home(), &bad).unwrap();
+    let good_id = register(&fx.home(), &good).unwrap().id;
+    // The checkout check passes; up's git read of the index then fails.
+    fs::write(bad_rec.admin_dir.join("index"), "x").unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let (_, action, result) = row(&rows, &bad_rec.id);
+    assert_eq!(*action, Action::Up);
+    assert!(result.starts_with("error: "), "{result}");
+    assert!(bad.join("app/build/out.bin").exists());
+    assert_eq!(row(&rows, &good_id).1, Action::Up);
+    assert_eq!(level(&fx, &good_id), Level::Baled);
+    assert!(!good.join("app/build").exists());
 }
