@@ -551,10 +551,14 @@ fn gc_removes_stale_check_dirs_of_the_workspace() {
     let theirs = plant_check_dir(&wt, ".bale-check-0123456789ab-a1B2c3");
     let lookalike = plant_check_dir(&wt, &format!(".bale-check-{id}-notes.d"));
 
-    gc(&fx.home(), true).unwrap();
+    // Reported beside the recorded (canonical) path.
+    let want = vec![(id.clone(), fs::canonicalize(&ours).unwrap())];
+    let dry = gc(&fx.home(), true).unwrap();
     assert!(ours.exists(), "a dry run removed it");
-    gc(&fx.home(), false).unwrap();
+    assert_eq!(dry.checks, want);
+    let real = gc(&fx.home(), false).unwrap();
     assert!(!ours.exists());
+    assert_eq!(real.checks, want);
     assert!(theirs.join("tree/ro/.env").exists());
     assert!(lookalike.join("tree/ro/.env").exists());
 }

@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
@@ -21,6 +22,8 @@ pub struct GcReport {
     pub unlocked: Vec<String>,
     /// Hot workspaces whose leftover refs or saved state were deleted.
     pub cleaned: Vec<String>,
+    /// `(id, path)` for each check dir a crashed cold left, removed.
+    pub checks: Vec<(String, PathBuf)>,
     /// `(id, error)` for each record gc could not check or act on.
     pub errors: Vec<(String, String)>,
 }
@@ -75,9 +78,14 @@ fn collect(
         return Ok(());
     };
     // Under the lock no check runs, so any check dir is a crashed cold's.
-    if !dry_run {
-        disk::remove_stale_checks(&record.path, id)?;
-    }
+    let checks = if dry_run {
+        disk::stale_checks(&record.path, id)?
+    } else {
+        disk::remove_stale_checks(&record.path, id)?
+    };
+    report
+        .checks
+        .extend(checks.into_iter().map(|p| (id.to_string(), p)));
     match record.level {
         Level::Hot | Level::Baled => {}
         // Their dir can be legitimately absent while cold or mid-operation.

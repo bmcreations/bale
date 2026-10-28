@@ -289,6 +289,12 @@ fn gc_lines(report: &GcReport, dry_run: bool) -> Vec<(bool, String)> {
                 .map(|id| (false, format!("{id}: {would}{verb}"))),
         );
     }
+    for (id, path) in &report.checks {
+        lines.push((
+            false,
+            format!("{id}: check dir {} {would}removed", path.display()),
+        ));
+    }
     for (id, err) in &report.errors {
         lines.push((true, format!("bale: {id}: {}", action_cell(err))));
     }
@@ -577,6 +583,7 @@ mod tests {
             removed: vec!["a".into()],
             unlocked: vec!["b".into()],
             cleaned: vec!["b".into()],
+            checks: vec![("d".into(), PathBuf::from("/w/.bale-check-d-a1B2c3"))],
             errors: vec![("c".into(), "boom\nmore".into())],
         };
         assert_eq!(
@@ -585,10 +592,18 @@ mod tests {
                 (false, "a: removed".to_string()),
                 (false, "b: unlocked".to_string()),
                 (false, "b: cleaned".to_string()),
+                (
+                    false,
+                    "d: check dir /w/.bale-check-d-a1B2c3 removed".to_string()
+                ),
                 (true, "bale: c: boom more".to_string()),
             ]
         );
         assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");
+        assert_eq!(
+            gc_lines(&report, true)[3].1,
+            "d: check dir /w/.bale-check-d-a1B2c3 would be removed"
+        );
     }
 
     #[test]

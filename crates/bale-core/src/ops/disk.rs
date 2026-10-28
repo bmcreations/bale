@@ -339,32 +339,29 @@ pub(crate) fn checkout_wip(g: &Git, wip: &str) -> Result<()> {
     Ok(())
 }
 
-/// Gives the owner full access to every dir under `root` (and `root`), so a
-/// check dir that copied a read-only dir mode can be removed.
-/// The name prefix of workspace `id`'s check dirs; `tempfile` adds six
-/// random alphanumerics.
 /// Random characters after the check dir prefix, set on the builder so the
 /// cleanup's match can't drift from what tempfile generates.
 const CHECK_SUFFIX_LEN: usize = 6;
 
+/// The name prefix of workspace `id`'s check dirs; [`CHECK_SUFFIX_LEN`]
+/// random alphanumerics follow it.
 fn check_prefix(id: &str) -> String {
     format!(".bale-check-{id}-")
 }
 
-/// Removes the check dirs a crashed cold of workspace `id` left beside
-/// `tree`: they hold copies of its files, saved secrets included. Only the
-/// holder of the workspace lock may call this; a check dir exists only
-/// while that holder is checking.
-pub(crate) fn remove_stale_checks(tree: &Path, id: &str) -> Result<()> {
+/// The check dirs of workspace `id` beside `tree`: dirs named
+/// `.bale-check-<id>-` plus exactly [`CHECK_SUFFIX_LEN`] alphanumerics.
+pub(crate) fn stale_checks(tree: &Path, id: &str) -> Result<Vec<PathBuf>> {
     let Some(parent) = tree.parent() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let rd = match fs::read_dir(parent) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", parent.display())),
     };
     let prefix = check_prefix(id);
+    let mut found = Vec::new();
     for entry in rd {
         let entry = entry.with_context(|| format!("reading {}", parent.display()))?;
         let name = entry.file_name();
@@ -375,15 +372,29 @@ pub(crate) fn remove_stale_checks(tree: &Path, id: &str) -> Result<()> {
             continue;
         }
         let path = entry.path();
-        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-            continue;
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            found.push(path);
         }
-        loosen(&path);
-        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
     }
-    Ok(())
+    found.sort();
+    Ok(found)
 }
 
+/// Removes the check dirs a crashed cold of workspace `id` left beside
+/// `tree` (see [`stale_checks`]) and returns them: they hold copies of its
+/// files, saved secrets included. Only the holder of the workspace lock may
+/// call this; a check dir exists only while that holder is checking.
+pub(crate) fn remove_stale_checks(tree: &Path, id: &str) -> Result<Vec<PathBuf>> {
+    let found = stale_checks(tree, id)?;
+    for path in &found {
+        loosen(path);
+        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(found)
+}
+
+/// Gives the owner full access to every dir under `root` (and `root`), so a
+/// check dir that copied a read-only dir mode can be removed.
 fn loosen(root: &Path) {
     #[cfg(unix)]
     {
