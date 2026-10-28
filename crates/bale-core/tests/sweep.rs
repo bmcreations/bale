@@ -173,7 +173,9 @@ fn error_in_one_workspace_does_not_stop_the_next() {
     let rows = sweep(&fx.home(), false).unwrap();
     let (_, action, result) = row(&rows, &bad_id);
     assert_eq!(*action, Action::Up);
-    assert!(result.starts_with("error: "), "{result}");
+    // A broken gitfile fails the checkout check, so up skips it unchanged.
+    assert!(result.contains("not the worktree's checkout"), "{result}");
+    assert!(bad.join("app/build/out.bin").exists());
     assert_eq!(row(&rows, &good_id).1, Action::Up);
     assert_eq!(level(&fx, &good_id), Level::Baled);
     assert!(!good.join("app/build").exists());

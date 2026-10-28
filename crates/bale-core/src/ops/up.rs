@@ -167,6 +167,14 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
         Level::Opening => return skip(OPENING),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
+            // A folder recreated at the path is not this worktree: git there
+            // may fall back to an enclosing repo, so remove nothing from it.
+            if let Err(e) = super::disk::ensure_checkout(&root, &record.admin_dir) {
+                return skip(&format!(
+                    "{} is not the worktree's checkout: {e:#}",
+                    root.display()
+                ));
+            }
             if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
                 return skip(&reason);
             }

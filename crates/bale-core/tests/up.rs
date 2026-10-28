@@ -484,3 +484,32 @@ fn build_dir_inside_a_submodule_is_kept() {
     );
     assert!(!wt.join("app/build").exists());
 }
+
+/// A folder recreated at a registered path is not the worktree: up must not
+/// remove output from it, even when git falls back to the enclosing repo.
+#[test]
+fn up_leaves_a_folder_that_is_not_the_checkout() {
+    let fx = Fixture::new();
+    let wt = fx.repo.join(".claude/worktrees/w");
+    support::git(
+        &fx.repo,
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+    let id = register(&fx.home(), &wt).unwrap().id;
+    fs::remove_dir_all(&wt).unwrap();
+    fs::create_dir_all(wt.join("app/build")).unwrap();
+    ignore_build(&wt);
+    fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+    fs::write(wt.join("app/build/keep.bin"), "mine").unwrap();
+
+    let out = up(&fx.home(), &id);
+    assert!(
+        matches!(&out, Ok(Outcome::Skipped(r)) if r.contains(&wt.display().to_string())),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("app/build/keep.bin")).unwrap(),
+        "mine"
+    );
+    assert_eq!(level(&fx, &id), Level::Hot);
+}
