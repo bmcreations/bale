@@ -4,7 +4,9 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use bale_core::ops::cold::cold;
+use bale_core::ops::gc::{gc, GcReport};
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
+use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{resolve, up, Outcome};
@@ -52,6 +54,23 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Create a linked worktree and register it.
+    New {
+        /// Worktree directory name.
+        name: String,
+        /// The repo to add it to (default: the current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Branch to check out, created when missing (default: the name).
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Forget worktrees that are gone, and clear stale leftovers on hot ones.
+    Gc {
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
@@ -83,6 +102,26 @@ fn main() -> ExitCode {
         }),
         Command::Sweep { dry_run } => cmd_sweep(&home, dry_run).map(|()| ExitCode::SUCCESS),
         Command::Migrate { repos, apply } => cmd_migrate(&home, &repos, apply),
+        Command::New { name, repo, branch } => {
+            new_workspace(&home, &repo, &name, branch.as_deref()).map(|r| {
+                println!("{}: {}", r.id, r.path.display());
+                ExitCode::SUCCESS
+            })
+        }
+        Command::Gc { dry_run } => gc(&home, dry_run).map(|report| {
+            for (to_stderr, line) in gc_lines(&report, dry_run) {
+                if to_stderr {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            if report.errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -140,6 +179,26 @@ fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
     } else {
         vec![(false, line)]
     }
+}
+
+/// One line per id in each list; errors are flagged `true` for stderr.
+fn gc_lines(report: &GcReport, dry_run: bool) -> Vec<(bool, String)> {
+    let would = if dry_run { "would be " } else { "" };
+    let mut lines = Vec::new();
+    for (list, verb) in [
+        (&report.removed, "removed"),
+        (&report.unlocked, "unlocked"),
+        (&report.cleaned, "cleaned"),
+    ] {
+        lines.extend(
+            list.iter()
+                .map(|id| (false, format!("{id}: {would}{verb}"))),
+        );
+    }
+    for (id, err) in &report.errors {
+        lines.push((true, format!("bale: {id}: {}", action_cell(err))));
+    }
+    lines
 }
 
 /// Prints the plan and totals; with `apply`, bales and prints the result.
@@ -386,6 +445,26 @@ mod tests {
         assert!(line.contains("first second"), "{line:?}");
         assert!(line.ends_with("  /w"), "{line:?}");
         assert!(line.chars().count() < 160, "{line:?}");
+    }
+
+    #[test]
+    fn gc_lines_list_each_id_and_send_errors_to_stderr() {
+        let report = GcReport {
+            removed: vec!["a".into()],
+            unlocked: vec!["b".into()],
+            cleaned: vec!["b".into()],
+            errors: vec![("c".into(), "boom\nmore".into())],
+        };
+        assert_eq!(
+            gc_lines(&report, false),
+            vec![
+                (false, "a: removed".to_string()),
+                (false, "b: unlocked".to_string()),
+                (false, "b: cleaned".to_string()),
+                (true, "bale: c: boom more".to_string()),
+            ]
+        );
+        assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");
     }
 
     #[test]

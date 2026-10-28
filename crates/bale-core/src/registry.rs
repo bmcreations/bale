@@ -56,6 +56,12 @@ pub fn workspace_id(path: &Path) -> String {
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
+/// True when `id` has the shape `workspace_id` produces: 12 lowercase hex
+/// characters. Gate anything that builds a ref name or a path from an id.
+pub fn is_workspace_id(id: &str) -> bool {
+    id.len() == 12 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Canonicalizes `path`; when it no longer exists, canonicalizes the nearest
 /// existing ancestor and re-joins the remaining components, so the result
 /// matches what canonicalize gave while the path existed.

@@ -14,7 +14,7 @@ use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
 use crate::ops::cold::{copy_file, copy_symlink, hex, sha_file, SavedFile, FILES, MANIFEST};
 use crate::ops::up::{remove_entry, Outcome};
-use crate::registry::{canonical_or_ancestor, Level, Record, Registry};
+use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,16 +518,39 @@ fn short(sha: &str) -> &str {
 
 /// Deletes every `refs/bale/<id>/*` ref and `$BALE_HOME/<id>`.
 fn delete_saved_state(home: &BaleHome, record: &Record) -> Result<()> {
-    let g = Git::at(&record.path);
-    let refs = g.run(&[
-        "for-each-ref",
-        "--format=%(refname)",
-        &format!("refs/bale/{}/", record.id),
-    ])?;
-    for r in refs.lines().filter(|l| !l.is_empty()) {
-        g.run(&["update-ref", "-d", r])?;
+    delete_saved(home, &Git::at(&record.path), &record.id)
+}
+
+/// Deletes `refs/bale/<id>/*`, running git with `g`, then `$BALE_HOME/<id>`.
+pub(crate) fn delete_saved(home: &BaleHome, g: &Git, id: &str) -> Result<()> {
+    for r in saved_refs(g, id)? {
+        g.run(&["update-ref", "-d", &r])?;
     }
-    let dest = home.saved_dir(&record.id);
+    delete_saved_dir(home, id)
+}
+
+/// The refs under exactly `refs/bale/<id>/`, listed with `g`. Errs when `id`
+/// is not a workspace id, so no broader pattern is ever passed to git.
+pub(crate) fn saved_refs(g: &Git, id: &str) -> Result<Vec<String>> {
+    if !is_workspace_id(id) {
+        bail!("{id:?} is not a workspace id");
+    }
+    let prefix = format!("refs/bale/{id}/");
+    let refs = g.run(&["for-each-ref", "--format=%(refname)", &prefix])?;
+    Ok(refs
+        .lines()
+        .filter(|l| l.starts_with(&prefix))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Removes `$BALE_HOME/<id>`; absent is fine. Errs when `id` is not a
+/// workspace id, so it never resolves to bale's own state dirs.
+pub(crate) fn delete_saved_dir(home: &BaleHome, id: &str) -> Result<()> {
+    if !is_workspace_id(id) {
+        bail!("{id:?} is not a workspace id");
+    }
+    let dest = home.saved_dir(id);
     match remove_entry(&dest) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
