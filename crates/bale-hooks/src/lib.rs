@@ -14,6 +14,7 @@ use bale_core::registry::Record;
 use bale_core::BaleHome;
 
 pub mod claude;
+pub mod codex;
 pub mod conductor;
 pub mod cursor;
 pub mod git;
@@ -117,7 +118,7 @@ impl FromStr for Tool {
 
 /// The plan that hooks `tool` up to bale at `exe`. Claude Code's settings
 /// live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
-/// they require.
+/// they require; Codex needs neither.
 pub fn install_plan(tool: Tool, exe: &Path, home: &Path, repo: Option<&Path>) -> Result<Plan> {
     let needs_repo = matches!(tool, Tool::Git | Tool::Conductor | Tool::Cursor);
     let repo = match repo {
@@ -129,6 +130,7 @@ pub fn install_plan(tool: Tool, exe: &Path, home: &Path, repo: Option<&Path>) ->
         (Tool::Git, Some(repo)) => git::install_plan(repo, exe),
         (Tool::Conductor, Some(repo)) => conductor::install_plan(repo, exe),
         (Tool::Cursor, Some(repo)) => cursor::install_plan(repo, exe),
+        (Tool::Codex, _) => codex::install_plan(exe),
         _ => bail!("{} hooks are not supported yet", tool.name()),
     }
 }
@@ -244,8 +246,6 @@ mod tests {
             let err = install_plan(t, p, p, None).err().unwrap().to_string();
             assert_eq!(err, format!("--repo is required for {}", t.name()));
         }
-        let err = install_plan(Tool::Codex, p, p, Some(p)).err().unwrap();
-        assert_eq!(err.to_string(), "codex hooks are not supported yet");
     }
 
     #[test]

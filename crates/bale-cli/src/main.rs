@@ -163,6 +163,11 @@ enum HookKind {
         #[command(subcommand)]
         event: CursorHook,
     },
+    /// Codex's environment setup script.
+    Codex {
+        #[command(subcommand)]
+        event: CodexHook,
+    },
 }
 
 #[derive(Subcommand)]
@@ -185,6 +190,15 @@ enum ConductorHook {
 enum CursorHook {
     /// setup: registers the cwd; always exits 0.
     Setup,
+}
+
+#[derive(Subcommand)]
+enum CodexHook {
+    /// setup: registers PATH (default: the cwd); always exits 0.
+    Setup {
+        /// The worktree to register.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -282,6 +296,9 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             HookKind::Cursor {
                 event: CursorHook::Setup,
             } => Ok(bale_hooks::cursor::setup(&home)),
+            HookKind::Codex {
+                event: CodexHook::Setup { path },
+            } => Ok(bale_hooks::codex::setup(&home, path)),
         },
         Command::Install {
             hooks,

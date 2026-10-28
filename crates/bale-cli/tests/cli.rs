@@ -2075,3 +2075,49 @@ fn install_cursor_twice_is_noop() {
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), first);
 }
+
+#[test]
+fn codex_setup_adopts_path_arg() {
+    let env = Env::new();
+    let wt = env.add_worktree("codex-ws");
+    let elsewhere = env.tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let out = env.bale(
+        &elsewhere,
+        &["hook", "codex", "setup", wt.to_str().unwrap()],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.is_registered(&wt));
+    let rec = json_record(&env, &wt);
+    assert_eq!(
+        rec["origin"],
+        serde_json::json!({"tool": "codex", "session": ""})
+    );
+}
+
+#[test]
+fn codex_setup_outside_worktree_exits_0() {
+    let env = Env::new();
+    let outside = env.tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let out = env.bale(&outside, &["hook", "codex", "setup"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("bale"), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+}
+
+#[test]
+fn install_codex_writes_nothing() {
+    let env = Env::new();
+    let before = listing(&env.home());
+    let out = env.bale(&env.repo, &["install", "--hooks", "codex"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.lines().any(|l| l.ends_with(" hook codex setup")),
+        "{text}"
+    );
+    assert!(text.contains("unconfirmed"), "{text}");
+    assert_eq!(listing(&env.home()), before);
+}
