@@ -26,10 +26,16 @@ problem less frequent but did not remove it.
 A tool, `bale`, that manages agent workspaces so disk use tracks the work that is active right now, not
 the number of features that exist.
 
-Success is one concrete test: with 4 or more agent sessions running (7 to 12 hot workspaces) the disk does
-not fill. The acceptance run is converting the existing worktrees on this machine with `bale migrate` and
-measuring free space before and after with `df`. `du` cannot be used for this because it counts
-copy-on-write clones twice.
+Success is one concrete test: with 4 or more agent sessions running (7 to 12 hot workspaces) for a working
+day, the disk does not fill. Reclaiming space from idle worktrees only counts if this holds.
+
+The acceptance run has two parts, both on this machine:
+
+1. `bale migrate --apply` on the existing worktrees, recording `df` free space before and after.
+2. A working day of 4 or more sessions creating workspaces through `bale`, sampling `df` free space every
+   15 minutes. It passes if free space never drops below 20 GB. *(My call on the 20 GB floor.)*
+
+`du` cannot be used for either because it counts copy-on-write clones twice.
 
 ### Non-goals
 
@@ -88,7 +94,17 @@ the default branch. Each new session's workspace is a copy-on-write clone of tha
 and shares source and native build blocks with it. Based on the spike, this is about 2 GB per hot Android
 workspace instead of 4.6 GB, and it is the only lever on the cost of hot workspaces. macOS ships first.
 
-Tier 1 ships first. Tier 2 is built after tier 1 is measured against the acceptance test.
+The first release needs both. Tier 1 alone cannot pass the acceptance run: every hot Android workspace
+still costs a full build, and 12 of them can exceed the free space on this machine. So the first release
+is tier 1 on macOS, Linux and Windows plus tier 2 on macOS. Tier 2 on the other platforms follows as each
+backend is tested.
+
+Build order:
+
+1. Run the iOS clone spike, the same experiment as the Android one, because its result decides whether iOS
+   gets tier 2.
+2. Build tier 1, then `bale migrate`, and run acceptance part 1.
+3. Build tier 2 on macOS, then run acceptance part 2.
 
 ### Two bale levels
 
@@ -281,7 +297,7 @@ schedule, at most daily, and reports how much space older generations still hold
 ### Platforms
 
 Tier 1 is required on macOS, Linux and Windows in the first release, and is tested on all three in CI. Tier 2
-ships per platform as each backend is tested.
+is required on macOS in the first release and ships on the other platforms as each backend is tested.
 
 | Platform | Tier 1 | Tier 2 copy-on-write |
 |---|---|---|
@@ -345,7 +361,9 @@ On this machine the regenerable total is 92.5 GB across 31 worktrees, plus 16 GB
 
 - **Hot workspaces still cost disk.** With tier 1 alone, every hot Android workspace costs a full build,
   1.5 to 7.9 GB on this machine. Twelve hot workspaces could exceed the 78 GB currently free even with every
-  idle one baled. Tier 2 is the mitigation, and only on filesystems with copy-on-write.
+  idle one baled. Tier 2 brings an Android workspace to about 2 GB, so 12 hot ones are about 24 GB. If iOS
+  does not qualify for tier 2, a mixed day of hot iOS workspaces at 4 to 12 GB each could still fail the
+  acceptance run. Linux on ext4 and Windows on NTFS have no tier 2 at all.
 - **Delete races.** A Gradle daemon or IDE can recreate `build/` while it is being deleted. The idle check
   reduces this. It does not remove it.
 - **Build-cache expiry.** Resumes after more than about 7 days are colder than "warm".
