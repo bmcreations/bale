@@ -126,7 +126,7 @@ fn main() -> ExitCode {
             Ok(code)
         }),
         Command::Cold { target } => {
-            resolve(&home, &target).and_then(|id| Ok(report(&id, cold(&home, &id)?)))
+            resolve(&home, &target).and_then(|id| Ok(report_cold(&id, cold(&home, &id)?)))
         }
         Command::Open { target } => resolve(&home, &target).and_then(|id| {
             let opened = open(&home, &id)?;
@@ -200,10 +200,7 @@ fn report(id: &str, outcome: Outcome) -> ExitCode {
             ExitCode::SUCCESS
         }
         Outcome::Busy(holders) => {
-            println!("{id}: busy, left untouched");
-            for h in holders {
-                println!("  pid {} {} {}", h.pid, h.command, h.path.display());
-            }
+            print!("{}", busy_report(id, &holders, false));
             ExitCode::from(3)
         }
         Outcome::Skipped(reason) => {
@@ -211,6 +208,35 @@ fn report(id: &str, outcome: Outcome) -> ExitCode {
             ExitCode::from(4)
         }
     }
+}
+
+/// `report` for `bale cold`, whose empty `Busy` means the tree changed or
+/// was in use while cold was saving it, not that nothing was found.
+fn report_cold(id: &str, outcome: Outcome) -> ExitCode {
+    match outcome {
+        Outcome::Busy(holders) => {
+            print!("{}", busy_report(id, &holders, true));
+            ExitCode::from(3)
+        }
+        other => report(id, other),
+    }
+}
+
+/// What `report` prints for a busy tree.
+fn busy_report(id: &str, holders: &[bale_core::busy::Holder], during_cold: bool) -> String {
+    if holders.is_empty() && during_cold {
+        return format!("{id}: {}\n", hook::CHANGED_DURING_COLD);
+    }
+    let mut text = format!("{id}: busy, left untouched\n");
+    for h in holders {
+        text.push_str(&format!(
+            "  pid {} {} {}\n",
+            h.pid,
+            h.command,
+            h.path.display()
+        ));
+    }
+    text
 }
 
 /// One line per workspace: on stdout, or on stderr when it needs attention.
@@ -429,6 +455,36 @@ fn ago(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_report_without_holders_says_the_tree_changed() {
+        assert_eq!(
+            busy_report("wt-1", &[], true),
+            format!("wt-1: {}\n", hook::CHANGED_DURING_COLD)
+        );
+    }
+
+    /// up's empty `Busy` is a rename refused by the OS, not a change.
+    #[test]
+    fn busy_report_outside_cold_stays_plain() {
+        assert_eq!(
+            busy_report("wt-1", &[], false),
+            "wt-1: busy, left untouched\n"
+        );
+    }
+
+    #[test]
+    fn busy_report_lists_holders() {
+        let holder = bale_core::busy::Holder {
+            pid: 7,
+            command: "gradle".into(),
+            path: PathBuf::from("/w/t"),
+        };
+        assert_eq!(
+            busy_report("wt-1", &[holder], true),
+            "wt-1: busy, left untouched\n  pid 7 gradle /w/t\n"
+        );
+    }
 
     fn count(lines: &[(bool, String)], text: &str) -> usize {
         lines.iter().filter(|(_, l)| l.contains(text)).count()

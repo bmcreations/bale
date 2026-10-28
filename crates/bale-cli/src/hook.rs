@@ -262,14 +262,18 @@ pub fn claude_worktree_remove(home: &BaleHome) -> Result<ExitCode> {
     Ok(code)
 }
 
+/// What bale says for cold's empty `Busy`, after the tree's path or id: the
+/// tree changed after it was saved, or the OS refused to move it because
+/// something had it open that lsof did not report.
+pub(crate) const CHANGED_DURING_COLD: &str =
+    "changed or was in use while bale was making it cold, left untouched; try again";
+
 /// What the remove hook prints for a busy tree. No holders means the tree
-/// changed while cold was saving it, not that a process holds it.
+/// changed or was in use while cold was saving it (see
+/// [`CHANGED_DURING_COLD`]).
 fn busy_text(path: &Path, holders: &[bale_core::busy::Holder]) -> String {
     if holders.is_empty() {
-        return format!(
-            "bale: {} changed while bale was making it cold, left untouched; try again\n",
-            path.display()
-        );
+        return format!("bale: {} {CHANGED_DURING_COLD}\n", path.display());
     }
     let mut text = format!(
         "bale: {} is busy, left untouched; these processes hold it \
@@ -316,10 +320,7 @@ mod tests {
     fn busy_without_holders_says_the_tree_changed() {
         let text = busy_text(Path::new("/w/t"), &[]);
         assert!(!text.contains("these processes hold it"), "{text}");
-        assert!(
-            text.contains("changed while bale was making it cold"),
-            "{text}"
-        );
+        assert!(text.contains(CHANGED_DURING_COLD), "{text}");
     }
 
     #[test]
