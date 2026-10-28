@@ -4,6 +4,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use bale_core::ops::cold::cold;
 use bale_core::ops::open::open;
+use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{resolve, up, Outcome};
 use bale_core::registry::{Level, Registry};
 use bale_core::BaleHome;
@@ -34,6 +35,12 @@ enum Command {
         /// Worktree path or workspace id.
         target: String,
     },
+    /// Apply the idle policy to every registered worktree.
+    Sweep {
+        /// Show what would run without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
@@ -63,6 +70,7 @@ fn main() -> ExitCode {
             }
             Ok(code)
         }),
+        Command::Sweep { dry_run } => cmd_sweep(&home, dry_run).map(|()| ExitCode::SUCCESS),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -90,6 +98,24 @@ fn report(id: &str, outcome: Outcome) -> ExitCode {
             ExitCode::from(4)
         }
     }
+}
+
+/// One line per workspace; rows needing attention also go to stderr.
+fn cmd_sweep(home: &BaleHome, dry_run: bool) -> Result<()> {
+    for (id, action, result) in sweep(home, dry_run)? {
+        let name = match action {
+            Action::Keep => "keep",
+            Action::Up => "up",
+            Action::Cold => "cold",
+            Action::Report(_) => "report",
+        };
+        let line = format!("{id}  {name}  {result}");
+        println!("{line}");
+        if matches!(action, Action::Report(_)) || result.starts_with("error: ") {
+            eprintln!("bale: {line}");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
