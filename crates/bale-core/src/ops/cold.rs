@@ -397,7 +397,7 @@ fn finish(
         }
     }
     // A failed removal leaves the record `Cooling`; the next run finishes it.
-    remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
+    remove_trash(&trash)?;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
@@ -523,11 +523,49 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 }
             }
         }
-        remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
+        remove_trash(&trash)?;
     }
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
+}
+
+/// Removes the moved-aside checkout. `remove_dir_all` doesn't say which
+/// entry it failed on, so after a failure the rest is removed one entry at
+/// a time and the error names the first that can't be. The record stays
+/// `Cooling`, so the next `bale cold` finishes the removal.
+fn remove_trash(trash: &Path) -> Result<()> {
+    if remove_entry(trash).is_ok() {
+        return Ok(());
+    }
+    let hint = |path: &Path| {
+        format!(
+            "removing {}: clear what blocks it (a dir without write permission, an immutable \
+             flag, an ACL that denies delete) and run `bale cold` again to finish",
+            path.display()
+        )
+    };
+    let walk = WalkDir::new(trash)
+        .contents_first(true)
+        .follow_links(false)
+        .follow_root_links(false);
+    for item in walk {
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                let path = e.path().unwrap_or(trash).to_path_buf();
+                return Err(anyhow::Error::new(e)).context(hint(&path));
+            }
+        };
+        let path = item.path();
+        let removed = if item.file_type().is_dir() {
+            fs::remove_dir(path)
+        } else {
+            remove_entry(path)
+        };
+        removed.with_context(|| hint(path))?;
+    }
+    Ok(())
 }
 
 /// Adds the check's content hashes and symlink targets to `dest`'s
@@ -2064,6 +2102,31 @@ mod tests {
 
     /// A crash right after the move, with a write that landed before it:
     /// the next run must check the trash, find the write and keep it.
+    /// A removal that fails partway names the entry it failed on, so the
+    /// user can see what blocks it.
+    #[cfg(unix)]
+    #[test]
+    fn failed_trash_removal_names_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"0\n"))
+        {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let trash = tmp.path().join(".bale-trash-wt-1");
+        fs::create_dir_all(trash.join("stuck")).unwrap();
+        fs::write(trash.join("stuck/held.txt"), "x").unwrap();
+        fs::set_permissions(trash.join("stuck"), fs::Permissions::from_mode(0o500)).unwrap();
+        let err = remove_trash(&trash).unwrap_err();
+        fs::set_permissions(trash.join("stuck"), fs::Permissions::from_mode(0o700)).unwrap();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stuck/held.txt"), "{msg}");
+        assert!(msg.contains("bale cold"), "{msg}");
+    }
+
     #[test]
     fn crash_after_rename_keeps_a_late_write() {
         let (tmp, repo) = repo();
