@@ -315,6 +315,7 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         return Ok(Plan::new(steps));
     }
     let key = backup_key(repo, &Path::new(".conductor").join("settings.toml"));
+    let has_backup = fs::symlink_metadata(backup_path(backups, &key)).is_ok();
     let backup = fs::read_to_string(backup_path(backups, &key)).ok();
     if scripts.is_empty() {
         let in_backup = backup
@@ -348,10 +349,10 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         }
     }
     let after = doc.to_string();
-    if after.trim().is_empty() && backup.is_none() && !tracked_by_git(&path) {
+    if after.trim().is_empty() && !has_backup && !tracked_by_git(&path) {
         steps.push(Step::Remove(path));
     } else {
-        if after.trim().is_empty() && backup.is_none() {
+        if after.trim().is_empty() && !has_backup {
             steps.push(tracked_note(&path));
         }
         steps.push(Step::Settings {

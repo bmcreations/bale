@@ -2852,3 +2852,28 @@ fn claude_repoint_prints_the_reformat_note() {
     );
     assert!(backups(&env).is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn uninstall_conductor_keeps_file_when_backup_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[scripts]\n").unwrap();
+    install(&env, "conductor", true);
+    let backups = env.bale_home().join("backups");
+    let entries: Vec<_> = fs::read_dir(&backups)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(!entries.is_empty());
+    for b in &entries {
+        fs::set_permissions(b, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let out = uninstall(&env, "conductor", true);
+    for b in &entries {
+        fs::set_permissions(b, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(path.is_file(), "{}", stdout(&out));
+}
