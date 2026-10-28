@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
 use crate::ops::cold::{hex, sha_file, SavedFile, FILES};
-use crate::ops::disk::{apply_manifest, checkout_wip, file_mode, read_manifest, Manifest};
+use crate::ops::disk::{
+    apply_manifest, checkout_wip, ensure_checkout, file_mode, read_manifest, Manifest,
+};
 use crate::ops::up::{remove_entry, Outcome};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
@@ -314,18 +316,9 @@ fn restore(home: &BaleHome, record: &Record, saved: &Saved) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("checking {}", dot_git.display())),
     }
 
-    let g = Git::at(path);
     // Nothing below may run in any other repository.
-    let found = g.run(&["rev-parse", "--absolute-git-dir"])?;
-    let found = PathBuf::from(found.trim_end_matches(['\n', '\r']));
-    if canonical_or_ancestor(&found) != canonical_or_ancestor(&record.admin_dir) {
-        bail!(
-            "git in {} uses {}, not {}",
-            path.display(),
-            found.display(),
-            record.admin_dir.display()
-        );
-    }
+    ensure_checkout(path, &record.admin_dir)?;
+    let g = Git::at(path);
     // Check out with HEAD as cold left it (on the recorded branch, or
     // detached), as cold's check did: config can depend on the branch.
     match &record.branch {

@@ -1178,15 +1178,20 @@ fn cold_if_clean_skips_dirty_tree_untouched() {
     assert!(!fx.home().saved_dir(&id).exists());
 }
 
+/// A `.git` that points elsewhere fails the checkout check before the
+/// dirty probe runs, so the tree is skipped untouched.
 #[test]
-fn cold_if_clean_treats_failed_probe_as_dirty() {
+fn cold_if_clean_skips_a_tree_whose_git_dir_is_wrong() {
     let fx = Fixture::new();
     let wt = fx.add_worktree("wt", "feature");
     let id = register(&fx.home(), &wt).unwrap().id;
     fs::write(wt.join(".git"), "gitdir: /nonexistent/bale-test\n").unwrap();
 
     let out = cold_if_clean(&fx.home(), &id).unwrap();
-    assert_eq!(out, Outcome::Skipped("dirty".into()));
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("not this worktree's checkout")),
+        "{out:?}"
+    );
     assert_eq!(level(&fx, &id), Level::Hot);
     assert!(wt.join("f").exists());
 }
@@ -1220,4 +1225,60 @@ fn failed_save_returns_to_baled_unlocked() {
     assert_eq!(level(&fx, &id), Level::Baled);
     assert_eq!(linked(&fx).locked, None);
     assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), "SECRET=1\n");
+}
+
+fn wip_resolves(fx: &Fixture, id: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/bale/{id}/wip"))
+        .current_dir(&fx.repo)
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Replaces the checkout at `wt` with a folder an editor might recreate.
+fn replace_with_stray(wt: &Path) {
+    fs::remove_dir_all(wt).unwrap();
+    fs::create_dir_all(wt.join(".idea")).unwrap();
+    fs::write(wt.join(".idea/workspace.xml"), "<x/>\n").unwrap();
+}
+
+/// Cold refuses a folder at the record's path that is not the worktree's
+/// checkout, and writes nothing.
+fn assert_cold_refuses_stray(fx: &Fixture, wt: &Path) {
+    let id = register(&fx.home(), wt).unwrap().id;
+    replace_with_stray(wt);
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains(&wt.display().to_string())),
+        "{out:?}"
+    );
+    assert_eq!(level(fx, &id), Level::Hot);
+    assert!(!wip_resolves(fx, &id));
+    assert!(!fx.home().saved_dir(&id).exists());
+    assert!(trash_beside(wt).is_empty());
+    assert_eq!(
+        fs::read_to_string(wt.join(".idea/workspace.xml")).unwrap(),
+        "<x/>\n"
+    );
+    assert_eq!(linked(fx).locked, None);
+}
+
+#[test]
+fn cold_refuses_a_folder_inside_the_repo_that_is_not_the_checkout() {
+    let fx = Fixture::new();
+    let wt = fx.repo.join(".claude/worktrees/w");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+    assert_cold_refuses_stray(&fx, &wt);
+}
+
+#[test]
+fn cold_refuses_a_folder_outside_any_repo() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    assert_cold_refuses_stray(&fx, &wt);
 }

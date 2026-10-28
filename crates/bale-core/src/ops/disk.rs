@@ -17,6 +17,7 @@ use crate::ops::cold::{
     submodule_deny, submodule_git_dir, Exclusions, SavedFile, FILES, MANIFEST,
 };
 use crate::ops::up::TRASH_PREFIX;
+use crate::registry::canonical_or_ancestor;
 
 /// `dest/manifest.json`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +348,23 @@ const CHECK_SUFFIX_LEN: usize = 6;
 /// random alphanumerics follow it.
 fn check_prefix(id: &str) -> String {
     format!(".bale-check-{id}-")
+}
+
+/// Errs unless git, run in `path`, uses `admin_dir` as its git dir: `path`
+/// is then that worktree's own checkout. A folder with no `.git` fails,
+/// since git in it would climb into whatever repo encloses it.
+pub(crate) fn ensure_checkout(path: &Path, admin_dir: &Path) -> Result<()> {
+    let found = Git::at(path).run(&["rev-parse", "--absolute-git-dir"])?;
+    let found = PathBuf::from(found.trim_end_matches(['\n', '\r']));
+    if canonical_or_ancestor(&found) != canonical_or_ancestor(admin_dir) {
+        bail!(
+            "git in {} uses {}, not {}",
+            path.display(),
+            found.display(),
+            admin_dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// The check dirs of workspace `id` beside `tree`: dirs named

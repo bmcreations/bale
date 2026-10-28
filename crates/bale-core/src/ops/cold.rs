@@ -79,6 +79,9 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
 
     let root = fs::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
+    if let Some(reason) = not_checkout(&root, &record) {
+        return Ok(Outcome::Skipped(reason));
+    }
     if require_clean && git::is_dirty(&root).unwrap_or(true) {
         return Ok(Outcome::Skipped("dirty".into()));
     }
@@ -403,6 +406,20 @@ fn finish(
     Ok(Outcome::Done(Level::Cold))
 }
 
+/// The skip reason for a folder at the record's path that is not the
+/// worktree's own checkout. Nothing may be saved from it, or run there: git
+/// in a folder with no `.git` works on whatever repo encloses it.
+fn not_checkout(root: &Path, record: &Record) -> Option<String> {
+    disk::ensure_checkout(root, &record.admin_dir)
+        .err()
+        .map(|e| {
+            format!(
+                "{} is not this worktree's checkout ({e:#}); leaving it and the saved state as they are",
+                record.path.display()
+            )
+        })
+}
+
 /// The skip reason for a tree `open` would not give back as it is.
 fn not_restorable(reason: &str) -> String {
     format!("open would not restore it as it is: {reason}")
@@ -440,8 +457,24 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
     // A check the crash interrupted left its copy of the tree.
     disk::remove_stale_checks(&path, &record.id)?;
     if fs::symlink_metadata(&path).is_ok() {
+        // The checkout was moved aside, so whatever is at the path now was
+        // put there since; saving it would replace the save of the trash.
+        let trash = trash_siblings(&path)?;
+        if !trash.is_empty() {
+            let names: Vec<String> = trash.iter().map(|t| t.display().to_string()).collect();
+            return Ok(Outcome::Skipped(format!(
+                "{} was recreated after the checkout was moved to {}; move {} away and run \
+                 `bale cold` again to finish",
+                path.display(),
+                names.join(", "),
+                path.display()
+            )));
+        }
         let root =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
+        if let Some(reason) = not_checkout(&root, &record) {
+            return Ok(Outcome::Skipped(reason));
+        }
         if let Some(reason) = refusal(&root, &exclusions(home, &root)?)? {
             back_to_baled(registry, &mut record, &root)?;
             return Ok(Outcome::Skipped(reason));
@@ -2270,6 +2303,134 @@ mod tests {
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
         assert_eq!(git::find_worktree(&repo, &wt).unwrap().locked, None);
+    }
+
+    /// A worktree at `r/.claude/worktrees/w` (inside the main checkout, which
+    /// does not ignore `.claude/`) with untracked `work.txt` and ignored
+    /// `.env`, registered.
+    fn nested_worktree() -> (tempfile::TempDir, PathBuf, PathBuf, BaleHome, String) {
+        let (tmp, repo) = repo();
+        let wt = repo.join(".claude/worktrees/w");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        fs::write(wt.join("work.txt"), "work\n").unwrap();
+        fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        (tmp, repo, wt, home, id)
+    }
+
+    fn wip_ref(repo: &Path, id: &str) -> String {
+        Git::at(repo)
+            .run(&["rev-parse", &format!("refs/bale/{id}/wip")])
+            .unwrap()
+    }
+
+    /// What an editor leaves when it recreates the path: a dir with no
+    /// `.git`, so git in it climbs into the enclosing repo.
+    fn recreate_as_stray(wt: &Path) {
+        fs::create_dir_all(wt.join(".idea")).unwrap();
+        fs::write(wt.join(".idea/workspace.xml"), "<x/>\n").unwrap();
+    }
+
+    /// The audit's F1: after a crash past the rename, a recreated folder at
+    /// the path is not re-saved over the record. Once it is moved away,
+    /// recovery finishes and open gives the work back.
+    #[test]
+    fn recovery_refuses_a_recreated_folder_beside_the_trash() {
+        let (_tmp, repo, wt, home, id) = nested_worktree();
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(after);
+        assert!(crashed.is_err());
+        let trash = trash_siblings(&wt).unwrap();
+        assert_eq!(trash.len(), 1);
+        let wip = wip_ref(&repo, &id);
+        let saved_env = home.saved_dir(&id).join(FILES).join(".env");
+        assert_eq!(fs::read_to_string(&saved_env).unwrap(), "SECRET=1\n");
+
+        recreate_as_stray(&wt);
+        let out = cold(&home, &id).unwrap();
+        let Outcome::Skipped(reason) = &out else {
+            panic!("{out:?}");
+        };
+        assert!(reason.contains(&wt.display().to_string()), "{reason}");
+        assert!(reason.contains(&trash[0].display().to_string()), "{reason}");
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Cooling);
+        assert_eq!(wip_ref(&repo, &id), wip);
+        assert_eq!(fs::read_to_string(&saved_env).unwrap(), "SECRET=1\n");
+        assert_eq!(trash_siblings(&wt).unwrap(), trash);
+        assert_eq!(
+            fs::read_to_string(trash[0].join("work.txt")).unwrap(),
+            "work\n"
+        );
+        assert_eq!(
+            fs::read_to_string(trash[0].join(".env")).unwrap(),
+            "SECRET=1\n"
+        );
+        assert_eq!(
+            git::find_worktree(&repo, &wt).unwrap().locked.as_deref(),
+            Some(git::LOCK_REASON)
+        );
+
+        fs::remove_dir_all(&wt).unwrap();
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        crate::ops::open::open(&home, &id).unwrap();
+        assert_eq!(fs::read(wt.join("work.txt")).unwrap(), b"work\n");
+        assert_eq!(fs::read(wt.join(".env")).unwrap(), b"SECRET=1\n");
+    }
+
+    /// A crash before the rename leaves the checkout at the path. If it is
+    /// then replaced by a folder that is not this worktree's checkout,
+    /// recovery refuses it and writes nothing.
+    #[test]
+    fn recovery_refuses_a_folder_that_is_not_the_checkout() {
+        let (_tmp, repo, wt, home, id) = nested_worktree();
+        let before = set_seam(&BEFORE_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(before);
+        assert!(crashed.is_err());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let wip = wip_ref(&repo, &id);
+        let saved_env = home.saved_dir(&id).join(FILES).join(".env");
+
+        fs::remove_dir_all(&wt).unwrap();
+        recreate_as_stray(&wt);
+        let out = cold(&home, &id).unwrap();
+        let Outcome::Skipped(reason) = &out else {
+            panic!("{out:?}");
+        };
+        assert!(reason.contains(&wt.display().to_string()), "{reason}");
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Cooling);
+        assert_eq!(wip_ref(&repo, &id), wip);
+        assert_eq!(fs::read_to_string(&saved_env).unwrap(), "SECRET=1\n");
+        assert!(wt.join(".idea/workspace.xml").is_file());
+        assert_eq!(
+            git::find_worktree(&repo, &wt).unwrap().locked.as_deref(),
+            Some(git::LOCK_REASON)
+        );
+    }
+
+    /// The checkout check accepts the real checkout: a crash before the
+    /// rename resumes and goes cold.
+    #[test]
+    fn recovery_of_the_checkout_itself_goes_cold() {
+        let (_tmp, _repo, wt, home, id) = nested_worktree();
+        let before = set_seam(&BEFORE_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(before);
+        assert!(crashed.is_err());
+
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+        assert!(!wt.exists());
+        crate::ops::open::open(&home, &id).unwrap();
+        assert_eq!(fs::read(wt.join("work.txt")).unwrap(), b"work\n");
+        assert_eq!(fs::read(wt.join(".env")).unwrap(), b"SECRET=1\n");
     }
 
     /// `add -A` drops a `.GIT` dir, so the git-side check of the moved
