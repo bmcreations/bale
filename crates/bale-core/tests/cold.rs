@@ -631,8 +631,9 @@ fn recovery_keeps_trash_that_fails_verify() {
     fs::rename(&wt, &trash).unwrap();
     set_level(&fx, &id, Level::Cooling);
 
-    let err = cold(&fx.home(), &id).unwrap_err();
-    assert!(format!("{err:#}").contains("changed"), "{err:#}");
+    // A changed tree is not an error: cold reports it busy and keeps it.
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Busy(Vec::new()));
     assert_eq!(fs::read_to_string(trash.join("f")).unwrap(), "newer\n");
     assert_eq!(level(&fx, &id), Level::Cooling);
 }
@@ -657,6 +658,20 @@ fn submodule_with_only_regenerable_output_goes_cold() {
     assert_eq!(out, Outcome::Done(Level::Cold));
     assert!(!wt.exists());
     assert_eq!(level(&fx, &id), Level::Cold);
+}
+
+/// A deleted submodule dir is what `add -A` saves (the gitlink removed);
+/// the check of the moved tree must agree instead of failing on it.
+#[test]
+fn tree_with_deleted_submodule_dir_goes_cold() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = worktree_with_submodule(&fx, &sub);
+    fs::remove_dir_all(wt.join("lib")).unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
 }
 
 /// Root ignores permission bits, so the chmod-based tests prove nothing.

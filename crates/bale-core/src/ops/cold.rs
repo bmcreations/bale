@@ -276,16 +276,8 @@ fn finish(
     }
 
     let trash = trash_path(root)?;
-    if let Err(e) = write_trash_marker(&home.saved_dir(&id), root, &id, &trash) {
-        back_to_baled(registry, &mut record, root)?;
-        return Err(e);
-    }
     #[cfg(test)]
-    tests::BEFORE_RENAME.with(|h| {
-        if let Some(hook) = h.get() {
-            hook(root)
-        }
-    });
+    tests::run_seam(&tests::BEFORE_RENAME, root);
     if let Err(e) = fs::rename(root, &trash) {
         back_to_baled(registry, &mut record, root)?;
         if is_busy_error(&e) {
@@ -293,28 +285,49 @@ fn finish(
         }
         return Err(e).with_context(|| format!("moving {} aside", root.display()));
     }
-    // A write between the check above and the rename (lsof saw no holder,
+    #[cfg(test)]
+    tests::run_seam(&tests::AFTER_RENAME, &trash);
+    // A write between the checks above and the rename (lsof saw no holder,
     // but a process can open the tree after it ran) would be lost. Check the
-    // moved tree again and move it back if anything changed.
-    if verify_in(&trash, &id, &dest, &deny, Place::Moved).is_err() {
-        // Drop the marker first: with it gone, `recover` checks the trash
-        // again before deleting it, so a failed move back (which leaves the
-        // record `Cooling`) cannot lose the late change.
-        let cleared = match fs::remove_file(dest.join(TRASH_MARKER)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-        fs::rename(&trash, root)
-            .with_context(|| format!("moving {} back after a late change", trash.display()))?;
-        cleared.with_context(|| format!("clearing the trash marker in {}", dest.display()))?;
-        back_to_baled(registry, &mut record, root)?;
-        return Ok(Outcome::Busy(Vec::new()));
+    // moved tree again, and who holds it, and move it back unless both pass.
+    // Until the marker is written, a crash leaves an unmarked trash, which
+    // `recover` checks again before deleting it.
+    let checked = (|| -> Result<Option<Outcome>> {
+        let wip = wip_commit(&trash, &id)?;
+        if verify_in(&trash, &wip, &dest, &deny, Place::Moved)?.is_some() {
+            return Ok(Some(Outcome::Busy(Vec::new())));
+        }
+        let holders = busy_holders(&trash)?;
+        if !holders.is_empty() {
+            return Ok(Some(Outcome::Busy(holders)));
+        }
+        write_trash_marker(&dest, &wip, &trash)?;
+        Ok(None)
+    })();
+    match checked {
+        Ok(None) => {}
+        Ok(Some(busy)) => {
+            move_back(registry, &mut record, &trash, root)?;
+            return Ok(busy);
+        }
+        Err(e) => {
+            move_back(registry, &mut record, &trash, root)?;
+            return Err(e).with_context(|| format!("checking {} after moving it", trash.display()));
+        }
     }
     // A failed removal leaves the record `Cooling`; the next run finishes it.
     remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
+}
+
+/// Renames the moved-aside checkout back to `root` and sets `Baled`. A failed
+/// rename leaves the record `Cooling` and the trash unmarked.
+fn move_back(registry: &Registry, record: &mut Record, trash: &Path, root: &Path) -> Result<()> {
+    fs::rename(trash, root)
+        .with_context(|| format!("moving {} back to {}", trash.display(), root.display()))?;
+    back_to_baled(registry, record, root)
 }
 
 /// Puts a record whose checkout is still at `root` back to `Baled`. The
@@ -388,8 +401,12 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             // Still a working checkout: prove the saved state covers it (and
             // is not stale) before deleting it.
             let deny = deny_list(home, &trash)?;
-            verify_in(&trash, &record.id, &dest, &deny, Place::Moved)
-                .with_context(|| format!("keeping {}", trash.display()))?;
+            let change = verify_in(&trash, wip_sha.trim(), &dest, &deny, Place::Moved)
+                .with_context(|| format!("keeping {}: could not check it", trash.display()))?;
+            if change.is_some() {
+                // It holds work the save does not: keep it, stay `Cooling`.
+                return Ok(Outcome::Busy(Vec::new()));
+            }
         }
         remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
     }
@@ -399,20 +416,15 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
 }
 
 /// Writes `dest/trash` (tmp + rename, 0600 on unix) naming `trash` and the
-/// current `refs/bale/<id>/wip` commit.
-fn write_trash_marker(dest: &Path, root: &Path, id: &str, trash: &Path) -> Result<()> {
-    let wip = Git::at(root).run(&[
-        "rev-parse",
-        "--verify",
-        &format!("refs/bale/{id}/wip^{{commit}}"),
-    ])?;
+/// wip commit it was verified against.
+fn write_trash_marker(dest: &Path, wip: &str, trash: &Path) -> Result<()> {
     let name = trash
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("{} is not valid UTF-8", trash.display()))?;
     let marker = TrashMarker {
         name: name.to_string(),
-        wip: wip.trim().to_string(),
+        wip: wip.to_string(),
     };
     let path = dest.join(TRASH_MARKER);
     let tmp = dest.join(format!("{TRASH_MARKER}.tmp"));
@@ -520,7 +532,8 @@ enum Place {
     /// checkout by a path relative to the old location, so any git run inside
     /// the submodule fails; `git add -A` runs one to probe a submodule for
     /// changes. Gitlinks are left out of `add -A` and re-read with
-    /// `update-index`, which takes the submodule's HEAD without entering it.
+    /// `update-index --remove`, which takes the submodule's HEAD without
+    /// entering it (and drops the entry when the dir is gone).
     Moved,
 }
 
@@ -558,7 +571,9 @@ fn snapshot_tree_in(dir: &Path, place: Place) -> Result<String> {
     args.extend(excludes.iter().map(String::as_str));
     g.run(&args)?;
     for chunk in gitlinks.chunks(200) {
-        let mut args = vec!["update-index", "--"];
+        // `--remove` drops the gitlink of a deleted submodule dir, as
+        // `add -A` does in place.
+        let mut args = vec!["update-index", "--remove", "--"];
         args.extend(chunk.iter().map(String::as_str));
         g.run(&args)?;
     }
@@ -883,10 +898,32 @@ pub(crate) fn sha_file(path: &Path) -> Result<String> {
 /// matches both the source and the copy, and the working tree still builds
 /// exactly the wip commit's tree.
 fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
-    verify_in(root, id, dest, deny, Place::InPlace)
+    let wip = wip_commit(root, id)?;
+    match verify_in(root, &wip, dest, deny, Place::InPlace)? {
+        None => Ok(()),
+        Some(change) => bail!("{change}"),
+    }
 }
 
-fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) -> Result<()> {
+/// The commit `refs/bale/<id>/wip` names.
+fn wip_commit(dir: &Path, id: &str) -> Result<String> {
+    let wip = Git::at(dir).run(&[
+        "rev-parse",
+        "--verify",
+        &format!("refs/bale/{id}/wip^{{commit}}"),
+    ])?;
+    Ok(wip.trim().to_string())
+}
+
+/// `verify` against the wip commit `wip`. `Ok(Some(change))` says what no
+/// longer matches the saved state; `Err` means the check itself failed.
+fn verify_in(
+    root: &Path,
+    wip: &str,
+    dest: &Path,
+    deny: &[String],
+    place: Place,
+) -> Result<Option<String>> {
     let manifest = dest.join(MANIFEST);
     let text =
         fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
@@ -903,11 +940,11 @@ fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) 
     if want != have {
         let missing: Vec<PathBuf> = want.iter().filter(|w| !have.contains(w)).cloned().collect();
         let extra: Vec<PathBuf> = have.iter().filter(|h| !want.contains(h)).cloned().collect();
-        bail!(
+        return Ok(Some(format!(
             "ignored files changed while saving: unsaved [{}], gone [{}]",
             join_paths(&missing),
             join_paths(&extra)
-        );
+        )));
     }
     for f in &saved {
         let src = root.join(&f.rel);
@@ -917,11 +954,11 @@ fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) 
                 for p in [&src, &copy] {
                     let is_link = fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
                     if !is_link || fs::read_link(p).ok().as_ref() != Some(target) {
-                        bail!(
+                        return Ok(Some(format!(
                             "saved symlink {} does not match {}",
                             f.rel.display(),
                             p.display()
-                        );
+                        )));
                     }
                 }
             }
@@ -929,11 +966,11 @@ fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) 
                 for p in [&src, &copy] {
                     let is_file = fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
                     if !is_file || sha_file(p)? != f.sha256 {
-                        bail!(
+                        return Ok(Some(format!(
                             "saved file {} does not match {}",
                             f.rel.display(),
                             p.display()
-                        );
+                        )));
                     }
                 }
             }
@@ -941,26 +978,55 @@ fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) 
     }
 
     let rebuilt = snapshot_tree_in(root, place)?;
-    let wip = Git::at(root).run(&["rev-parse", &format!("refs/bale/{id}/wip^{{tree}}")])?;
-    if rebuilt != wip.trim() {
-        bail!(
-            "working tree changed while saving: tree {rebuilt} is not refs/bale/{id}/wip's {}",
-            wip.trim()
-        );
+    let tree = Git::at(root).run(&["rev-parse", &format!("{wip}^{{tree}}")])?;
+    if rebuilt != tree.trim() {
+        return Ok(Some(format!(
+            "working tree changed while saving: tree {rebuilt} is not wip {wip}'s {}",
+            tree.trim()
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::process::Command;
+    use std::rc::Rc;
+    use std::thread::LocalKey;
+
+    type Seam = RefCell<Option<Box<dyn Fn(&Path)>>>;
 
     thread_local! {
-        /// Test-only seam: runs in `finish` after the tree is verified and
-        /// before it is moved aside.
-        pub(super) static BEFORE_RENAME: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+        /// Test-only seam: runs in `finish` with the checkout's path after
+        /// the tree is verified and before it is moved aside.
+        pub(super) static BEFORE_RENAME: Seam = const { RefCell::new(None) };
+        /// Test-only seam: runs in `finish` with the trash path right after
+        /// the move, before the moved tree is checked.
+        pub(super) static AFTER_RENAME: Seam = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run_seam(seam: &'static LocalKey<Seam>, path: &Path) {
+        seam.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(path)
+            }
+        });
+    }
+
+    /// Sets a seam until the guard drops.
+    struct SeamGuard(&'static LocalKey<Seam>);
+
+    impl Drop for SeamGuard {
+        fn drop(&mut self) {
+            self.0.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    fn set_seam(seam: &'static LocalKey<Seam>, f: impl Fn(&Path) + 'static) -> SeamGuard {
+        seam.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        SeamGuard(seam)
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -1002,13 +1068,11 @@ mod tests {
         let home = BaleHome(tmp.path().join("home"));
         let id = crate::ops::up::register(&home, &wt).unwrap().id;
 
-        BEFORE_RENAME.with(|h| {
-            h.set(Some(|root: &Path| {
-                fs::write(root.join("late.txt"), "late\n").unwrap()
-            }))
+        let seam = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
         });
         let out = cold(&home, &id);
-        BEFORE_RENAME.with(|h| h.set(None));
+        drop(seam);
 
         assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
         assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late\n");
@@ -1075,13 +1139,11 @@ mod tests {
         let home = BaleHome(tmp.path().join("home"));
         let id = crate::ops::up::register(&home, &wt).unwrap().id;
 
-        BEFORE_RENAME.with(|h| {
-            h.set(Some(|root: &Path| {
-                fs::write(root.join("late.txt"), "late\n").unwrap()
-            }))
+        let seam = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
         });
         let out = cold(&home, &id);
-        BEFORE_RENAME.with(|h| h.set(None));
+        drop(seam);
 
         assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
         assert!(wt.join("late.txt").is_file());
@@ -1099,27 +1161,158 @@ mod tests {
         let home = BaleHome(tmp.path().join("home"));
         let id = crate::ops::up::register(&home, &wt).unwrap().id;
 
-        BEFORE_RENAME.with(|h| {
-            h.set(Some(|root: &Path| {
-                git(
-                    &root.join("lib"),
-                    &[
-                        "-c",
-                        "commit.gpgsign=false",
-                        "commit",
-                        "-q",
-                        "--allow-empty",
-                        "-m",
-                        "late",
-                    ],
-                )
-            }))
+        let seam = set_seam(&BEFORE_RENAME, |root: &Path| {
+            git(
+                &root.join("lib"),
+                &[
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "late",
+                ],
+            )
         });
         let out = cold(&home, &id);
-        BEFORE_RENAME.with(|h| h.set(None));
+        drop(seam);
 
         assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
         assert!(wt.join("lib/.git").exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+    }
+
+    /// The trash marker lets `recover` delete the trash without checking
+    /// it, so it must not exist until the moved tree has been checked.
+    #[test]
+    fn no_trash_marker_before_the_moved_tree_is_checked() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        let marker = home.saved_dir(&id).join(TRASH_MARKER);
+
+        let seen = Rc::new(Cell::new(None));
+        let seen_in = seen.clone();
+        let seam = set_seam(&AFTER_RENAME, move |_: &Path| {
+            seen_in.set(Some(marker.exists()))
+        });
+        let out = cold(&home, &id);
+        drop(seam);
+
+        assert_eq!(out.unwrap(), Outcome::Done(Level::Cold));
+        assert_eq!(seen.get(), Some(false), "marker written before the check");
+    }
+
+    /// A crash right after the move, with a write that landed before it:
+    /// the next run must check the trash, find the write and keep it.
+    #[test]
+    fn crash_after_rename_keeps_a_late_write() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let before = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
+        });
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop((before, after));
+        assert!(crashed.is_err());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Cooling);
+        let trash = trash_siblings(&wt).unwrap();
+        assert_eq!(trash.len(), 1);
+
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(
+            fs::read_to_string(trash[0].join("late.txt")).unwrap(),
+            "late\n"
+        );
+    }
+
+    /// A git failure while checking the moved tree is an error, not a busy
+    /// tree: the tree goes back and the cause is reported.
+    #[test]
+    fn git_failure_after_rename_moves_the_tree_back_with_an_error() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let wip = format!("refs/bale/{id}/wip");
+        let seam = set_seam(&AFTER_RENAME, move |_: &Path| {
+            git(&repo, &["update-ref", "-d", &wip])
+        });
+        let out = cold(&home, &id);
+        drop(seam);
+
+        let err = out.unwrap_err();
+        assert!(format!("{err:#}").contains("after moving it"), "{err:#}");
+        assert!(wt.join(".gitignore").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+    }
+
+    /// A process that opens the tree after the first busy check and before
+    /// the move still holds the moved tree; the second check finds it.
+    #[cfg(unix)]
+    #[test]
+    fn holder_that_arrives_before_rename_moves_the_tree_back() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let child: Rc<RefCell<Option<KillOnDrop>>> = Rc::new(RefCell::new(None));
+        let child_in = child.clone();
+        let seam = set_seam(&BEFORE_RENAME, move |root: &Path| {
+            let c = Command::new("sleep")
+                .arg("30")
+                .current_dir(root)
+                .spawn()
+                .unwrap();
+            *child_in.borrow_mut() = Some(KillOnDrop(c));
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let out = cold(&home, &id);
+        drop(seam);
+        drop(child.borrow_mut().take());
+
+        assert!(
+            matches!(&out, Ok(Outcome::Busy(h)) if !h.is_empty()),
+            "{out:?}"
+        );
+        assert!(wt.join(".gitignore").is_file());
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
