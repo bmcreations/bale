@@ -245,23 +245,41 @@ Everything in `bale up`, then:
    similar entries from a configurable list. An ignored file inside a regenerable-named directory that `up`
    keeps is saved. Inside a submodule, ignored files under a regenerable name count as regenerable and are not
    saved. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
-   shared store.
-4. Verify the saved state by hashing it against the tree.
-5. Rename the checkout directory to a trash name and verify the moved tree again, with the same checks as
-   step 4. That includes each submodule's contents, nested submodules too: a tracked edit, an untracked
-   file, or an ignored file that is not regenerable inside a submodule counts as a change, since the wip
-   commit holds only the submodule's commit. Then check again for processes holding the moved tree. A
+   shared store. The manifest also records the permission bits of every regular file `open` writes (on
+   unix) and every directory with nothing in it, since git keeps neither a file's full mode nor empty
+   directories.
+4. Verify the saved state by hashing it against the tree. This in-place check is an early refusal; the
+   safety of the delete rests on step 5.
+5. Rename the checkout directory to a trash name and check the moved tree against what `open` would give
+   back. bale runs `open`'s own restore (the wip commit read into a private index and checked out, then the
+   saved files, modes and empty directories) into a directory beside the trash, and compares the two with
+   plain file reads, not through git: the path set both ways by exact name, file types, bytes, modes on
+   unix, and symlink targets. The walk skips only the root's `.git`, the regenerable directories `up`
+   removed, what step 3 skips (`node_modules` and the denylist), and the inside of submodule directories.
+   Submodules are checked through git instead, nested submodules too: a tracked edit, an untracked file, a
+   new commit, or an ignored file that is not regenerable inside a submodule counts as a change, since the
+   wip commit holds only the submodule's commit. Then check again for processes holding the moved tree. A
    process that opened the tree after the busy check could have written to it. On any change, move the tree
-   back, return the record to `baled` and report it busy (with the holders, when the re-check found some).
-   If a check itself fails, move the tree back the same way and report the error. Only when both checks pass,
+   back and return the record to `baled`. A disk difference is reported as skipped, naming the first
+   differing path; a submodule change or a new holder is reported busy (with the holders, when there are
+   some). If a check itself fails, move the tree back the same way and report the error. Only when both checks pass,
    record the trash name and the wip commit it was checked against, then remove the trash directory. The
    worktree stays locked in git.
+
+   Because the compare reads the disk, a tree whose files git would not give back byte for byte stays:
+   a clean filter that changes content, `core.autocrlf=input` on a CRLF file, a new `ident` file holding an
+   unexpanded `$Id$` (checkout would expand it), a case variant of `.git` such as `d/.GIT` (which `add -A`
+   drops), and a fifo, socket or device. A repo with `core.autocrlf=true` and `text=auto` still goes cold, because checkout writes the
+   CRLF bytes back.
 6. Write the registry record as `cold`.
 
 ### `bale open`
 
 1. Check out the branch at the same path. If the directory was moved, use `git worktree repair`.
-2. Apply `refs/bale/<id>/wip` and restore the saved files, checking hashes.
+2. Apply `refs/bale/<id>/wip` and restore the saved files, checking hashes, then the recorded modes and
+   empty directories. Check the result against the wip commit's own path list and the manifest, never the
+   ignore rules in force at open time: an exclude line removed while the tree was cold turns a saved ignored
+   file into an untracked one, and that must not fail the open.
 3. Rewrite machine-specific absolute paths that are known to break, such as `sdk.dir` in
    `local.properties`. This only matters if the path or machine changed.
 4. Release bale's git lock (a lock with any other reason stays) and mark it hot.
@@ -306,11 +324,12 @@ the source it saves is about 1 GB per Android worktree.)*
   directory; a submodule directory that is not checked out holds files; the tree uses sparse checkout; or
   an index entry at the root or in a submodule is flagged assume-unchanged or skip-worktree, since `git
   status` skips edits to those. LFS pointer files need no special handling, because the checkout restores
-  them.
+  them. Anything step 5's disk compare would refuse is caught there, after the move, and the tree moves
+  back.
 - Every git command bale runs passes `-c status.showUntrackedFiles=all -c core.fsmonitor=false -c
   core.untrackedCache=false -c diff.ignoreSubmodules=none`, so the user's or repo's config cannot make a
   tree look unchanged when files exist. `-c` does not override `submodule.<name>.ignore` in `.gitmodules`,
-  so each `git status` also passes `--untracked-files=all` and `--ignore-submodules`.
+  so each `git status` also passes `--ignore-submodules`.
 
 ### Recovering an interrupted `cold`
 
@@ -324,7 +343,7 @@ A record left `cooling` by a crash resumes on the next `cold` or sweep.
     deleted.
   - If it was not recorded and has no `.git`, it is kept and reported as an error, since git can't check it
     against the save.
-  - If it was not recorded, it is checked against the save as in step 5. If it matches, it is deleted. If it
+  - If it was not recorded, it is checked against the save with step 5's disk compare. If it matches, it is deleted. If it
     changed, or the check fails, it is moved back to the recorded path and the record returns to `baled`;
     a change is reported busy, and a failed check as an error. If the move back fails, the trash stays where it
     is, the record stays `cooling`, and the error names both paths.
