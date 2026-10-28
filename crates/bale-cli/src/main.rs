@@ -1,12 +1,11 @@
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bale_core::ops::cold::cold;
 use bale_core::ops::open::open;
-use bale_core::ops::up::{register, up, Outcome};
-use bale_core::registry::{workspace_id, Level, Registry};
+use bale_core::ops::up::{resolve, up, Outcome};
+use bale_core::registry::{Level, Registry};
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
 
@@ -59,6 +58,9 @@ fn main() -> ExitCode {
             if let Some(reason) = opened.detached_reason {
                 println!("  HEAD left detached: {reason}");
             }
+            for note in opened.notes {
+                println!("  {note}");
+            }
             Ok(code)
         }),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
@@ -67,26 +69,6 @@ fn main() -> ExitCode {
         eprintln!("bale: {e:#}");
         ExitCode::from(1)
     })
-}
-
-/// An existing path is registered and its id returned; anything else must be
-/// a registered workspace id or the path of a registered (cold) workspace.
-fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
-    let path = Path::new(arg);
-    if path.exists() {
-        return Ok(register(home, path)?.id);
-    }
-    let registry = Registry::open(home.clone());
-    if let Some(r) = registry.get(arg)? {
-        return Ok(r.id);
-    }
-    let absolute = std::env::current_dir()
-        .context("reading the current directory")?
-        .join(path);
-    registry
-        .get(&workspace_id(&absolute))?
-        .map(|r| r.id)
-        .with_context(|| format!("{arg} is neither an existing path nor a registered workspace"))
 }
 
 /// Prints the outcome; exit 0 done, 3 busy, 4 skipped.

@@ -3,7 +3,7 @@ mod support;
 use bale_core::git::worktrees;
 use bale_core::ops::cold::cold;
 use bale_core::ops::open::open;
-use bale_core::ops::up::{register, up, Outcome};
+use bale_core::ops::up::{register, resolve, up, Outcome};
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,11 @@ fn cold_then_open_roundtrip() {
     let report = open(&fx.home(), &id).unwrap();
     assert_eq!(report.outcome, Outcome::Done(Level::Hot));
     assert_eq!(report.detached_reason, None);
+    assert!(
+        report.notes.iter().any(|n| n.contains("unstaged")),
+        "{:?}",
+        report.notes
+    );
     assert_restored(&fx, &wt, &id, &before);
     assert_eq!(on_branch(&wt).as_deref(), Some("refs/heads/feature"));
     assert_eq!(rev(&wt, "HEAD"), head);
@@ -355,7 +360,8 @@ fn foreign_admin_dir_is_refused() {
 }
 
 /// Colds `wt`, then leaves the state an interrupted `open` would: the dir,
-/// its `.git`, the tracked tree and `.env` written; `b.txt` not yet.
+/// its `.git`, HEAD detached, the tracked tree and `.env` written; `b.txt`
+/// not yet.
 fn partial_open(fx: &Fixture, wt: &Path) -> String {
     let id = go_cold(fx, wt);
     let admin = Registry::open(fx.home())
@@ -365,6 +371,9 @@ fn partial_open(fx: &Fixture, wt: &Path) -> String {
         .admin_dir;
     fs::create_dir_all(wt).unwrap();
     fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    // Open detaches HEAD before anything else.
+    let head = rev(wt, &format!("refs/bale/{id}/head"));
+    git(wt, &["update-ref", "--no-deref", "HEAD", &head]);
     fs::write(wt.join("f"), "modified\n").unwrap();
     fs::copy(fx.home().saved_dir(&id).join("files/.env"), wt.join(".env")).unwrap();
     set_level(fx, &id, Level::Opening);
@@ -445,4 +454,153 @@ fn up_and_cold_skip_an_opening_record() {
         );
     }
     assert!(wt.join("f").exists());
+}
+
+fn admin_of(fx: &Fixture, id: &str) -> PathBuf {
+    Registry::open(fx.home())
+        .get(id)
+        .unwrap()
+        .unwrap()
+        .admin_dir
+}
+
+#[test]
+fn resolve_by_path_keeps_a_nested_cold_record() {
+    let fx = Fixture::new();
+    commit_ignore(&fx);
+    let wt = fx.repo.join(".worktrees/x");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+    );
+    fs::write(wt.join("f"), "modified\n").unwrap();
+    let before = status(&wt);
+    let id = go_cold(&fx, &wt);
+    let admin = admin_of(&fx, &id);
+    // An empty dir at the path: git run there would climb to the main checkout.
+    fs::create_dir_all(&wt).unwrap();
+
+    assert_eq!(resolve(&fx.home(), wt.to_str().unwrap()).unwrap(), id);
+    assert_eq!(admin_of(&fx, &id), admin);
+    assert_eq!(level(&fx, &id), Level::Cold);
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert_eq!(status(&wt), before);
+    assert_eq!(on_branch(&wt).as_deref(), Some("refs/heads/feature"));
+}
+
+#[test]
+fn resolve_by_path_on_partial_opening_keeps_branch() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let before = status(&wt);
+    let id = partial_open(&fx, &wt);
+
+    assert_eq!(resolve(&fx.home(), wt.to_str().unwrap()).unwrap(), id);
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.branch.as_deref(), Some("feature"));
+    assert_eq!(rec.level, Level::Opening);
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.detached_reason, None);
+    assert_eq!(on_branch(&wt).as_deref(), Some("refs/heads/feature"));
+    assert_restored(&fx, &wt, &id, &before);
+}
+
+#[test]
+fn resolve_by_path_registers_a_new_worktree() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = resolve(&fx.home(), wt.to_str().unwrap()).unwrap();
+    assert_eq!(level(&fx, &id), Level::Hot);
+}
+
+#[test]
+fn staged_force_added_ignored_file_survives_two_round_trips() {
+    // `node_modules` is ignored and never saved as an ignored file, so only
+    // the index keeps this file across a cold.
+    let fx = Fixture::new();
+    fs::write(fx.repo.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&fx.repo, &["add", ".gitignore"]);
+    git(&fx.repo, &["commit", "-m", "ignore"]);
+    let wt = fx.add_worktree("wt", "feature");
+    fs::create_dir_all(wt.join("node_modules")).unwrap();
+    fs::write(wt.join("node_modules/keep.txt"), "keep\n").unwrap();
+    git(&wt, &["add", "-f", "node_modules/keep.txt"]);
+    let before = status(&wt);
+
+    let id = go_cold(&fx, &wt);
+    open(&fx.home(), &id).unwrap();
+    assert_ne!(git(&wt, &["ls-files", "node_modules/keep.txt"]), "");
+    assert_eq!(status(&wt), before);
+
+    go_cold(&fx, &wt);
+    open(&fx.home(), &id).unwrap();
+    assert_eq!(
+        fs::read_to_string(wt.join("node_modules/keep.txt")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[test]
+fn broken_admin_dir_never_reaches_the_main_checkout() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = go_cold(&fx, &wt);
+    let main_head = rev(&fx.repo, "HEAD");
+    fs::remove_file(admin_of(&fx, &id).join("HEAD")).unwrap();
+
+    open(&fx.home(), &id).unwrap_err();
+    assert_eq!(on_branch(&fx.repo).as_deref(), Some("refs/heads/main"));
+    assert_eq!(rev(&fx.repo, "HEAD"), main_head);
+    assert_eq!(level(&fx, &id), Level::Opening);
+    assert!(bale_refs(&fx, &id).contains("/wip"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_path_is_refused() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = go_cold(&fx, &wt);
+    let elsewhere = fx.repo.parent().unwrap().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &wt).unwrap();
+
+    let err = open(&fx.home(), &id).unwrap_err();
+    assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert_eq!(level(&fx, &id), Level::Cold);
+}
+
+#[test]
+fn uninitialized_submodule_is_noted() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(
+        &wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.repo.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&wt, &["commit", "-m", "sub"]);
+    fs::write(wt.join("f"), "modified\n").unwrap();
+    let id = go_cold(&fx, &wt);
+
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("git submodule update --init")),
+        "{:?}",
+        report.notes
+    );
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
 }

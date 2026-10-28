@@ -455,7 +455,7 @@ pub fn save_wip(dir: &Path, id: &str) -> Result<()> {
 /// The tree `add -A` would build, computed in a temporary copy of the index
 /// (so force-added files stay), with assume-unchanged bits cleared (so their
 /// edits are seen). Without a real index it starts from `read-tree HEAD`.
-pub(crate) fn snapshot_tree(dir: &Path) -> Result<String> {
+fn snapshot_tree(dir: &Path) -> Result<String> {
     let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
     let index = tmp.path().join("index");
     let real = Git::at(dir).run(&["rev-parse", "--path-format=absolute", "--git-path", "index"])?;

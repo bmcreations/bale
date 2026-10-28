@@ -12,9 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
-use crate::ops::cold::{
-    copy_file, copy_symlink, create_private, hex, sha_file, SavedFile, FILES, MANIFEST,
-};
+use crate::ops::cold::{copy_file, copy_symlink, hex, sha_file, SavedFile, FILES, MANIFEST};
 use crate::ops::up::{remove_entry, Outcome};
 use crate::registry::{canonical_or_ancestor, Level, Record, Registry};
 use crate::BaleHome;
@@ -24,6 +22,8 @@ pub struct OpenReport {
     pub outcome: Outcome,
     /// Why HEAD was left detached instead of on the recorded branch.
     pub detached_reason: Option<String>,
+    /// Things the user should know or do next, one line each.
+    pub notes: Vec<String>,
 }
 
 impl OpenReport {
@@ -31,6 +31,7 @@ impl OpenReport {
         OpenReport {
             outcome,
             detached_reason: None,
+            notes: Vec::new(),
         }
     }
 }
@@ -99,16 +100,33 @@ pub fn open(home: &BaleHome, id: &str) -> Result<OpenReport> {
 
     // The restore is verified and the record is Hot; nothing below can lose work.
     let cleanup = (|| -> Result<()> {
-        if let Some(sdk) = sdk_candidate(|k| std::env::var_os(k), dirs::home_dir()) {
-            rewrite_sdk_dir(&path.join("local.properties"), &sdk)?;
-        }
         git::unlock_worktree_if_ours(&path, &path)?;
         delete_saved_state(home, &record)
     })();
     cleanup.with_context(|| format!("{} is open, but finishing up failed", path.display()))?;
+
+    let mut notes = Vec::new();
+    if saved.has_changes {
+        notes.push("uncommitted changes are restored unstaged".to_string());
+    }
+    if let Some(note) = submodule_note(&path) {
+        notes.push(note);
+    }
+    // Best effort and last: a failure here leaves a note, not an error.
+    if let Some(sdk) = sdk_candidate(|k| std::env::var_os(k), dirs::home_dir()) {
+        match rewrite_sdk_dir(&path.join("local.properties"), &sdk) {
+            Ok(true) => notes.push(format!(
+                "local.properties: sdk.dir now points at {}",
+                sdk.display()
+            )),
+            Ok(false) => {}
+            Err(e) => notes.push(format!("local.properties: sdk.dir not updated: {e:#}")),
+        }
+    }
     Ok(OpenReport {
         outcome: Outcome::Done(Level::Hot),
         detached_reason,
+        notes,
     })
 }
 
@@ -116,6 +134,8 @@ pub fn open(home: &BaleHome, id: &str) -> Result<OpenReport> {
 struct Saved {
     head: String,
     wip: String,
+    /// The wip tree differs from the head tree.
+    has_changes: bool,
     files: Vec<SavedFile>,
 }
 
@@ -175,7 +195,19 @@ fn check_preconditions(home: &BaleHome, record: &Record) -> Result<Saved> {
             want.display()
         );
     }
-    Ok(Saved { head, wip, files })
+    let tree = |rev: &str| -> Result<String> {
+        Ok(Git::at(&record.repo_common_dir)
+            .run(&["rev-parse", &format!("{rev}^{{tree}}")])?
+            .trim()
+            .to_string())
+    };
+    let has_changes = tree(&head)? != tree(&wip)?;
+    Ok(Saved {
+        head,
+        wip,
+        has_changes,
+        files,
+    })
 }
 
 fn is_plain_relative(rel: &Path) -> bool {
@@ -283,21 +315,38 @@ fn restore(home: &BaleHome, record: &Record, saved: &Saved) -> Result<()> {
     let path = &record.path;
     fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     let dot_git = path.join(".git");
-    if fs::symlink_metadata(&dot_git).is_err() {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&dot_git)
-            .with_context(|| format!("creating {}", dot_git.display()))?;
-        f.write_all(git_file_line(record).as_bytes())?;
-        f.sync_all()?;
+    match fs::symlink_metadata(&dot_git) {
+        // Present only on a resume, after `check_resumable` accepted it.
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dot_git)
+                .with_context(|| format!("creating {}", dot_git.display()))?;
+            f.write_all(git_file_line(record).as_bytes())?;
+            f.sync_all()?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("checking {}", dot_git.display())),
     }
 
     let g = Git::at(path);
+    // Nothing below may run in any other repository.
+    let found = g.run(&["rev-parse", "--absolute-git-dir"])?;
+    let found = PathBuf::from(found.trim_end_matches(['\n', '\r']));
+    if canonical_or_ancestor(&found) != canonical_or_ancestor(&record.admin_dir) {
+        bail!(
+            "git in {} uses {}, not {}",
+            path.display(),
+            found.display(),
+            record.admin_dir.display()
+        );
+    }
     // Detach first: with HEAD still symbolic, `reset` would move the branch.
     g.run(&["update-ref", "--no-deref", "HEAD", &saved.head])?;
     g.run(&["read-tree", "-u", "--reset", &saved.wip])?;
     g.run(&["reset", "-q", &saved.head])?;
+    restage_ignored_additions(&g, saved)?;
 
     let files = home.saved_dir(&record.id).join(FILES);
     for f in &saved.files {
@@ -317,6 +366,50 @@ fn restore(home: &BaleHome, record: &Record, saved: &Saved) -> Result<()> {
         }
     }
     verify_restore(record, saved)
+}
+
+/// `reset` unstages everything, which turns a staged, force-added ignored
+/// file into a plain ignored one that the next cold would not keep. Adds
+/// those back to the index.
+fn restage_ignored_additions(g: &Git, saved: &Saved) -> Result<()> {
+    let added = g.run(&[
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-filter=A",
+        &saved.head,
+        &saved.wip,
+    ])?;
+    let added: Vec<String> = added
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| format!(":(literal){p}"))
+        .collect();
+    let mut ignored = Vec::new();
+    for chunk in added.chunks(200) {
+        let mut args = vec![
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let out = g.run(&args)?;
+        ignored.extend(
+            out.split('\0')
+                .filter(|p| !p.is_empty())
+                .map(|p| format!(":(literal){p}")),
+        );
+    }
+    for chunk in ignored.chunks(200) {
+        let mut args = vec!["add", "-f", "--"];
+        args.extend(chunk.iter().map(String::as_str));
+        g.run(&args)?;
+    }
+    Ok(())
 }
 
 /// Creates `rel` under `root` one component at a time, refusing to pass
@@ -359,6 +452,23 @@ fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A note naming submodules `read-tree` left unchecked-out, if any.
+fn submodule_note(path: &Path) -> Option<String> {
+    let out = Git::at(path).run(&["submodule", "status"]).ok()?;
+    let missing: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix('-'))
+        .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest.trim()))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "submodules not checked out ({}): run `git submodule update --init`",
+        missing.join(", ")
+    ))
 }
 
 /// Puts HEAD back on the recorded branch when that is safe; otherwise
@@ -477,18 +587,13 @@ fn rewrite_sdk_dir(file: &Path, sdk: &Path) -> Result<bool> {
         return Ok(false);
     }
     let dir = file.parent().context("local.properties has no parent")?;
-    let tmp = dir.join("local.properties.bale-tmp");
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("clearing {}", tmp.display())),
-    }
-    let mut f = create_private(&tmp)?;
-    f.write_all(out.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    fs::set_permissions(&tmp, fs::metadata(file)?.permissions())?;
-    fs::rename(&tmp, file).with_context(|| format!("writing {}", file.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+    tmp.write_all(out.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    fs::set_permissions(tmp.path(), fs::metadata(file)?.permissions())?;
+    tmp.persist(file)
+        .with_context(|| format!("writing {}", file.display()))?;
     Ok(true)
 }
 

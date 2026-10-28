@@ -91,6 +91,31 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
     Ok(record)
 }
 
+/// Turns a CLI argument into a workspace id. An existing path whose record is
+/// mid-transition or cold resolves to that record untouched (git run in such a
+/// dir could climb to a parent repo or see a detached HEAD); any other
+/// existing path is registered. Otherwise `arg` must be a registered id or
+/// the path of a registered workspace that no longer exists.
+pub fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
+    let path = Path::new(arg);
+    let registry = Registry::open(home.clone());
+    let absolute =
+        std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
+    let by_path = registry.get(&workspace_id(&absolute))?;
+    if fs::symlink_metadata(path).is_ok() {
+        match by_path {
+            Some(r) if !matches!(r.level, Level::Hot | Level::Baled) => return Ok(r.id),
+            _ => return Ok(register(home, path)?.id),
+        }
+    }
+    if let Some(r) = registry.get(arg)? {
+        return Ok(r.id);
+    }
+    by_path
+        .map(|r| r.id)
+        .with_context(|| format!("{arg} is neither an existing path nor a registered workspace"))
+}
+
 /// Removes the worktree's regenerable output in place and marks it `Baled`.
 /// A record left `Baling` by a crash resumes at trash removal.
 pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
