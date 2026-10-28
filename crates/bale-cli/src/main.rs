@@ -1,3 +1,6 @@
+mod hook;
+mod install;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -71,11 +74,42 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Entry points for Claude Code and git hooks.
+    Hook {
+        #[command(subcommand)]
+        kind: HookKind,
+    },
+    /// Install the 30-minute sweep schedule, or with flags only the given hooks.
+    Install {
+        /// Add WorktreeCreate and WorktreeRemove hooks to ~/.claude/settings.json.
+        #[arg(long)]
+        claude_hooks: bool,
+        /// Install a post-checkout hook in this repo that registers new worktrees.
+        #[arg(long, value_name = "REPO")]
+        git_hook: Option<PathBuf>,
+        /// Print the files and commands without changing anything.
+        #[arg(long)]
+        print_only: bool,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookKind {
+    /// Claude Code WorktreeCreate: JSON on stdin, prints the worktree path.
+    ClaudeWorktreeCreate,
+    /// Claude Code WorktreeRemove: JSON on stdin, colds the worktree.
+    ClaudeWorktreeRemove,
+    /// git post-checkout: registers a newly added linked worktree.
+    GitPostCheckout {
+        prev: String,
+        new: String,
+        flag: String,
     },
 }
 
@@ -120,6 +154,25 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             } else {
                 ExitCode::SUCCESS
+            }
+        }),
+        Command::Hook { kind } => match kind {
+            HookKind::ClaudeWorktreeCreate => hook::claude_worktree_create(&home),
+            HookKind::ClaudeWorktreeRemove => hook::claude_worktree_remove(&home),
+            HookKind::GitPostCheckout { prev, flag, .. } => {
+                Ok(hook::git_post_checkout(&home, &prev, &flag))
+            }
+        },
+        Command::Install {
+            claude_hooks,
+            git_hook,
+            print_only,
+        } => install::plan(claude_hooks, git_hook.as_deref()).and_then(|plan| {
+            if print_only {
+                plan.print();
+                Ok(ExitCode::SUCCESS)
+            } else {
+                plan.apply().map(|()| ExitCode::SUCCESS)
             }
         }),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
