@@ -58,8 +58,8 @@ The Conductor and Cursor files usually live in the repo and are committed, so an
 your team shares.
 
 "Unverified" means the adapter is written from the tool's documentation and its own tests, and nobody has
-yet created a workspace in the tool and watched the hook run. The process names the Conductor, Cursor and
-Codex remove paths use to ignore the tool itself are a guess until then.
+yet created a workspace in the tool and watched the hook run. The process names the Conductor archive path
+uses to ignore Conductor itself are a guess until then.
 
 ## Day-to-day commands
 
@@ -87,13 +87,17 @@ Codex trees record the tool as their origin with no session or title; other tree
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
 
-Two things to know before relying on removal:
+Known limitations:
 
 - Removing Xcode DerivedData that lives inside a worktree also removes its `SourcePackages/checkouts`.
   Local edits to a package checkout are lost; Xcode fetches it again on the next resolve.
 - bale treats a directory in a Xcode or SwiftPM tree as DerivedData only when it holds an `info.plist`
   with a `WorkspacePath` and a `Build` directory, and git ignores all of it. On a case-insensitive
   filesystem the names `info.plist` and `Build` also match other letter cases.
+- After a tree goes cold, `git worktree add` at the same path fails with "missing but locked worktree",
+  so a tool's own unarchive or re-create at that path may fail. Use `bale open <path>` to bring the tree
+  back instead.
+- Nothing has run on Windows yet; the Windows code is only checked by clippy.
 
 ## For agents
 
