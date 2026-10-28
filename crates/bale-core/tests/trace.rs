@@ -75,7 +75,8 @@ fn sweep_writes_one_sweep_line_and_one_tree_line_per_tree() {
         assert!(key.starts_with("dev:"), "{s}");
     }
     let sample = PathBuf::from(vols[0]["sample_path"].as_str().unwrap());
-    let canon = |p: &PathBuf| fs::canonicalize(p).unwrap();
+    // As bale reports it: long names, no `\\?\` prefix on Windows.
+    let canon = |p: &PathBuf| bale_core::paths::canonicalize(p).unwrap();
     assert!(sample == canon(&a) || sample == canon(&b), "{s}");
 
     let trees = of_kind(&all, "tree");
@@ -318,9 +319,11 @@ fn a_skip_records_a_reason_code_and_no_path() {
     let id = register(&home, &wt).unwrap().id;
     // A `.git` that points elsewhere: skipped with a reason naming the path.
     fs::write(wt.join(".git"), "gitdir: /nonexistent/bale-test\n").unwrap();
+    // bale names it canonically: long names on Windows, where TEMP may be 8.3.
+    let shown = bale_core::paths::canonicalize(&wt).unwrap();
     let out = cold(&home, &id).unwrap();
     assert!(
-        matches!(&out, Outcome::Skipped(r) if r.contains(&*wt.to_string_lossy())),
+        matches!(&out, Outcome::Skipped(r) if r.contains(&*shown.to_string_lossy())),
         "{out:?}"
     );
     let all = lines(&home);

@@ -2137,10 +2137,15 @@ fn install_cursor_finds_bale_in_any_setup_key_by_its_words() {
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     let cmds = v["setup-worktree"].as_array().unwrap();
     assert_eq!(cmds.len(), 2, "{v}");
-    assert!(
-        cmds[1].as_str().unwrap().contains("' hook cursor setup"),
-        "{v}"
-    );
+    assert_eq!(cmds[0], "echo ' hook cursor setup'", "{v}");
+    // bale's own entry, quoted for the shell Cursor runs it in.
+    let exe = env!("CARGO_BIN_EXE_bale");
+    let guarded = if cfg!(windows) {
+        format!("if exist \"{exe}\" \"{exe}\" hook cursor setup")
+    } else {
+        format!("if [ -x '{exe}' ]; then '{exe}' hook cursor setup; fi")
+    };
+    assert_eq!(cmds[1], guarded.as_str(), "{v}");
 }
 
 /// bale's entry under the key Cursor runs, in the bare form earlier installs
