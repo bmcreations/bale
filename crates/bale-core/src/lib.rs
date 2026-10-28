@@ -1,6 +1,8 @@
+pub mod busy;
 pub mod config;
 pub mod detect;
 pub mod git;
+pub mod idle;
 pub mod lock;
 pub mod registry;
 
