@@ -274,30 +274,106 @@ impl Kind {
     }
 }
 
-/// Why `open` would not give back the tree at `tree` byte for byte, if it
-/// would not. Runs open's own restore (checkout of `wip` through git's
+/// What [`restore_check`] found.
+pub(crate) enum Verdict {
+    /// Open would give the tree back as it is. Holds what the walk saw, so
+    /// the caller can tell whether anything changed since.
+    Same(Snapshot),
+    /// Why open would not give it back.
+    Differs(String),
+}
+
+/// The tree as the compare walked it: every kept entry's stat signature.
+pub(crate) struct Snapshot {
+    tree: PathBuf,
+    skip: Skip,
+    seen: BTreeMap<PathBuf, (Kind, Stamp)>,
+    root: Stamp,
+}
+
+impl Snapshot {
+    /// The first path that was added, removed or changed (by its stat
+    /// signature) since the compare, if any.
+    pub(crate) fn changed(&self) -> Result<Option<PathBuf>> {
+        if stamp(&fs::symlink_metadata(&self.tree)?) != self.root {
+            return Ok(Some(PathBuf::new()));
+        }
+        let now = entries(&self.tree, &self.skip)?;
+        if let Some(rel) = now.keys().find(|r| !self.seen.contains_key(*r)) {
+            return Ok(Some(rel.clone()));
+        }
+        Ok(self
+            .seen
+            .iter()
+            .find(|(rel, was)| now.get(*rel) != Some(*was))
+            .map(|(rel, _)| rel.clone()))
+    }
+}
+
+/// What a stat says about an entry that a write would change: on unix the
+/// device, inode, size, mode, mtime and ctime; elsewhere size, mtime and
+/// creation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix: [i64; 7],
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+fn stamp(meta: &fs::Metadata) -> Stamp {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            unix: [
+                meta.dev() as i64,
+                meta.ino() as i64,
+                i64::from(meta.mode()),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            ],
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            created: meta.created().ok(),
+        }
+    }
+}
+
+/// Whether `open` would give back the tree at `tree` byte for byte. Runs open's own restore (checkout of `wip` through git's
 /// filters and eol rules, then the manifest in `dest`) into a temporary dir
 /// beside `tree`, and compares the two with plain file reads: the paths both
 /// ways, file types, file bytes, modes (unix) and symlink targets. A fifo,
 /// socket or device in the tree is a mismatch. `Err` means the check itself
-/// failed.
-pub(crate) fn restore_mismatch(
+/// failed. On a match the verdict carries the stat of every entry walked.
+pub(crate) fn restore_check(
     tree: &Path,
     wip: &str,
     dest: &Path,
     regen: &[PathBuf],
     deny: &[String],
-) -> Result<Option<String>> {
+) -> Result<Verdict> {
     let manifest = read_manifest(dest)?;
     let g = Git::at(tree);
     let git_dir = g.run(&["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(git_dir.trim_end_matches(['\n', '\r']));
     let listing = g.run(&["ls-tree", "-r", "-z", wip])?;
-    let entries: Vec<(&str, &str)> = listing
+    let listed: Vec<(&str, &str)> = listing
         .split('\0')
         .filter_map(|e| e.split_once('\t'))
         .collect();
-    let gitlinks = entries
+    let gitlinks = listed
         .iter()
         .filter(|(meta, _)| meta.starts_with("160000 "))
         .map(|(_, path)| PathBuf::from(path))
@@ -306,7 +382,7 @@ pub(crate) fn restore_mismatch(
         regen: regen.to_vec(),
         deny: deny.to_vec(),
         gitlinks,
-        tracked: with_ancestors(entries.iter().map(|(_, path)| *path)),
+        tracked: with_ancestors(listed.iter().map(|(_, path)| *path)),
     };
 
     // Beside the tree, so it is on the same filesystem (case folding, exec
@@ -327,11 +403,21 @@ pub(crate) fn restore_mismatch(
         .env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str())
         .run(&["read-tree", "-u", "--reset", wip])?;
     apply_manifest(&work, &manifest, &dest.join(FILES))?;
-    compare(tree, &work, &skip)
+    let root = stamp(&fs::symlink_metadata(tree)?);
+    let seen = entries(tree, &skip)?;
+    if let Some(reason) = compare(tree, &work, &skip, &seen)? {
+        return Ok(Verdict::Differs(reason));
+    }
+    Ok(Verdict::Same(Snapshot {
+        tree: tree.to_path_buf(),
+        skip,
+        seen,
+        root,
+    }))
 }
 
-/// Every entry under `root` the walk keeps, by exact name.
-fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, Kind>> {
+/// Every entry under `root` the walk keeps, by exact name, with its stat.
+fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, (Kind, Stamp)>> {
     let mut found = BTreeMap::new();
     let mut it = WalkDir::new(root)
         .min_depth(1)
@@ -356,24 +442,35 @@ fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, Kind>> {
         if kind == Kind::Dir && skip.gitlinks.contains(&rel) {
             it.skip_current_dir();
         }
-        found.insert(rel, kind);
+        let meta = item
+            .metadata()
+            .with_context(|| format!("reading {}", item.path().display()))?;
+        found.insert(rel, (kind, stamp(&meta)));
     }
     Ok(found)
 }
 
-fn compare(tree: &Path, restored: &Path, skip: &Skip) -> Result<Option<String>> {
-    let have = entries(tree, skip)?;
-    let want = entries(restored, skip)?;
+fn compare(
+    tree: &Path,
+    restored: &Path,
+    skip: &Skip,
+    seen: &BTreeMap<PathBuf, (Kind, Stamp)>,
+) -> Result<Option<String>> {
+    let have: BTreeMap<&PathBuf, Kind> = seen.iter().map(|(r, (k, _))| (r, *k)).collect();
+    let want: BTreeMap<PathBuf, Kind> = entries(restored, skip)?
+        .into_iter()
+        .map(|(r, (k, _))| (r, k))
+        .collect();
     if let Some((rel, _)) = have.iter().find(|(_, k)| **k == Kind::Other) {
         return Ok(Some(format!(
             "{}: a fifo, socket or device can't be saved",
             rel.display()
         )));
     }
-    if let Some(rel) = have.keys().find(|r| !want.contains_key(*r)) {
+    if let Some(rel) = have.keys().find(|r| !want.contains_key(**r)) {
         return Ok(Some(format!("{} would not be restored", rel.display())));
     }
-    if let Some(rel) = want.keys().find(|r| !have.contains_key(*r)) {
+    if let Some(rel) = want.keys().find(|r| !have.contains_key(r)) {
         return Ok(Some(format!(
             "{} would be restored but is not in the tree",
             rel.display()
@@ -381,7 +478,7 @@ fn compare(tree: &Path, restored: &Path, skip: &Skip) -> Result<Option<String>> 
     }
     for (rel, kind) in &have {
         let (a, b) = (tree.join(rel), restored.join(rel));
-        let other = want[rel];
+        let other = want[*rel];
         if *kind != other {
             return Ok(Some(format!(
                 "{} would be restored as a {}, not a {}",

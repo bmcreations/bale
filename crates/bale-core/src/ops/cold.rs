@@ -18,7 +18,7 @@ use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
 use crate::ops::disk::{
-    self, read_manifest, record_tree, restore_mismatch, write_manifest, Manifest, Skip,
+    self, read_manifest, record_tree, restore_check, write_manifest, Manifest, Skip, Verdict,
 };
 use crate::ops::up::{
     bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
@@ -355,12 +355,21 @@ fn finish(
         if verify_in(&trash, &wip, &dest, &ex, Place::Moved)?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
-        if let Some(reason) = restore_mismatch(&trash, &wip, &dest, &ex.regen, &ex.deny)? {
-            return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
-        }
+        let snapshot = match restore_check(&trash, &wip, &dest, &ex.regen, &ex.deny)? {
+            Verdict::Same(snapshot) => snapshot,
+            Verdict::Differs(reason) => {
+                return Ok(Some(Outcome::Skipped(not_restorable(&reason))))
+            }
+        };
+        #[cfg(test)]
+        tests::run_seam(&tests::AFTER_COMPARE, &trash);
         let holders = busy_holders(&trash)?;
         if !holders.is_empty() {
             return Ok(Some(Outcome::Busy(holders)));
+        }
+        // A write after the compare read a file would not show in it.
+        if snapshot.changed()?.is_some() {
+            return Ok(Some(Outcome::Busy(Vec::new())));
         }
         write_trash_marker(&dest, &wip, &trash)?;
         Ok(None)
@@ -477,8 +486,11 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
-                Ok(restore_mismatch(&trash, wip, &dest, &ex.regen, &ex.deny)?
-                    .map(|reason| Outcome::Skipped(not_restorable(&reason))))
+                Ok(match restore_check(&trash, wip, &dest, &ex.regen, &ex.deny)? {
+                    Verdict::Same(snapshot) if snapshot.changed()?.is_none() => None,
+                    Verdict::Same(_) => Some(Outcome::Busy(Vec::new())),
+                    Verdict::Differs(reason) => Some(Outcome::Skipped(not_restorable(&reason))),
+                })
             });
             match checked {
                 Ok(None) => {}
@@ -1222,6 +1234,9 @@ mod tests {
         /// Test-only seam: runs in `move_back` with the trash path before
         /// it is renamed back.
         pub(super) static BEFORE_MOVE_BACK: Seam = const { RefCell::new(None) };
+        /// Test-only seam: runs in `finish` with the trash path after the
+        /// disk compare passed, before the holder check and the marker.
+        pub(super) static AFTER_COMPARE: Seam = const { RefCell::new(None) };
     }
 
     pub(super) fn run_seam(seam: &'static LocalKey<Seam>, path: &Path) {
@@ -1310,6 +1325,40 @@ mod tests {
         // Nothing changes on the next try, so it goes cold.
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
         assert!(!wt.exists());
+    }
+
+    /// A write to the moved tree after the disk compare passed, before the
+    /// marker, is seen by the stat re-check and moves the tree back.
+    #[test]
+    fn write_after_compare_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        fs::write(wt.join("work.txt"), "one\n").unwrap();
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let seam = set_seam(&AFTER_COMPARE, |trash: &Path| {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(trash.join("work.txt"))
+                .unwrap();
+            f.write_all(b"two\n").unwrap();
+        });
+        let out = cold(&home, &id);
+        drop(seam);
+
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(
+            fs::read_to_string(wt.join("work.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
     }
 
     /// A worktree of `repo` at `wt` with `repo2` added as submodule `lib`.
