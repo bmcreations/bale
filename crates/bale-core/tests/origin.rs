@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use bale_core::git::scope;
+use bale_core::git::{latest_subject, scope};
 use bale_core::ops::cold::cold;
 use bale_core::ops::meta::{set_origin, set_pinned};
 use bale_core::ops::sweep::{sweep, Action};
@@ -220,6 +220,70 @@ fn sweep_keeps_a_pinned_idle_tree() {
     set_pinned(&fx.home(), &id, false).unwrap();
     let rows = sweep(&fx.home(), false).unwrap();
     assert_eq!(rows.iter().find(|r| r.0 == id).unwrap().1, Action::Cold);
+}
+
+/// A pinned tree stranded mid-up or mid-cold is still left alone, but its
+/// row says so and names the command that finishes it.
+#[test]
+fn sweep_reports_a_pinned_tree_stranded_mid_transition() {
+    let fx = Fixture::new();
+    let wt = idle_gradle_tree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_pinned(&fx.home(), &id, true).unwrap();
+    for (level, doing, cmd) in [
+        (Level::Baling, "baling", "up"),
+        (Level::Cooling, "going cold", "cold"),
+    ] {
+        let reg = Registry::open(fx.home());
+        let mut r = record(&fx, &id);
+        r.level = level;
+        reg.put(&r).unwrap();
+
+        for dry_run in [true, false] {
+            let rows = sweep(&fx.home(), dry_run).unwrap();
+            let row = rows.iter().find(|r| r.0 == id).unwrap();
+            let want = format!(
+                "interrupted while {doing}; pinned, so sweep leaves it: run `bale {cmd} {id}`"
+            );
+            assert_eq!(row.1, Action::Report(want.clone()), "{rows:?}");
+            assert_eq!(row.2, want);
+            assert_eq!(record(&fx, &id).level, level);
+        }
+    }
+    assert!(wt.join("app/build/out.bin").exists());
+}
+
+#[test]
+fn latest_subject_matches_the_newest_scope_subject() {
+    let fx = Fixture::new();
+    let wt = two_unpushed(&fx);
+    assert_eq!(
+        latest_subject(&wt).unwrap().as_deref(),
+        Some("second change")
+    );
+
+    // With an upstream, the range is @{upstream}..HEAD.
+    git(
+        &fx.repo,
+        &["remote", "add", "origin", "/nonexistent/bale-test"],
+    );
+    git(&wt, &["config", "branch.feature.remote", "origin"]);
+    git(&wt, &["config", "branch.feature.merge", "refs/heads/main"]);
+    assert_eq!(
+        latest_subject(&wt).unwrap().as_deref(),
+        Some("second change")
+    );
+    assert_eq!(
+        latest_subject(&wt).unwrap(),
+        scope(&wt).unwrap().subjects.into_iter().next()
+    );
+
+    // Nothing unpushed: no subject.
+    git(
+        &fx.repo,
+        &["update-ref", "refs/remotes/origin/main", "feature"],
+    );
+    assert_eq!(latest_subject(&wt).unwrap(), None);
 }
 
 #[test]

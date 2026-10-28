@@ -498,13 +498,15 @@ fn human(bytes: u64) -> String {
 fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
     let records = Registry::open(home.clone()).all()?;
     if json {
+        let scopes = par_map(&records, |r| scope_of(r).map(|(s, _)| s));
         let rows = records
             .iter()
-            .map(|r| {
+            .zip(scopes)
+            .map(|(r, scope)| {
                 let mut v = serde_json::to_value(r)?;
                 v["origin"] = serde_json::to_value(&r.origin)?;
                 v["pinned"] = r.pinned.into();
-                v["scope"] = serde_json::to_value(scope_of(r).map(|(s, _)| s))?;
+                v["scope"] = serde_json::to_value(scope)?;
                 Ok(v)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -516,7 +518,8 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
         "ID", "LEVEL", "ACTIVE", "BRANCH", "SESSION"
     );
     let home_dir = install::home_dir().ok();
-    for r in records {
+    let labels = par_map(&records, |r| session_label(r, home_dir.as_deref()));
+    for (r, label) in records.iter().zip(labels) {
         let level = format!("{}{}", if r.pinned { "*" } else { "" }, r.level.name());
         println!(
             "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  {}",
@@ -524,7 +527,7 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
             level,
             ago(r.last_activity),
             r.branch.as_deref().unwrap_or("(detached)"),
-            truncate(&session_label(&r, home_dir.as_deref()), SESSION_WIDTH),
+            truncate(&label, SESSION_WIDTH),
             r.path.display()
         );
     }
@@ -534,11 +537,46 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
 /// Widest `SESSION` cell in `bale ls`, in chars.
 const SESSION_WIDTH: usize = 50;
 
+/// Threads `bale ls` spreads per-tree work over: each tree costs file reads
+/// and git processes, which wait on I/O rather than CPU.
+const LS_THREADS: usize = 8;
+
+/// `f` over `items` on up to [`LS_THREADS`] threads, results in input order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..LS_THREADS.min(items.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        done.push((i, f(item)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("ls worker panicked"))
+            .collect()
+    });
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
 /// What `bale ls` names a tree's session: its title when known, else the
-/// newest commit subject, else `-`.
+/// newest commit subject, else `-`. A live tree costs one or two git
+/// processes for the subject, and none when it has a title.
 fn session_label(r: &Record, home_dir: Option<&Path>) -> String {
     title(r, home_dir)
-        .or_else(|| scope_of(r).and_then(|(s, _)| s.subjects.into_iter().next()))
+        .or_else(|| match r.level {
+            Level::Hot | Level::Baled => bale_core::git::latest_subject(&r.path).ok().flatten(),
+            _ => r.scope.as_ref().and_then(|s| s.subjects.first().cloned()),
+        })
         .unwrap_or_else(|| "-".into())
 }
 

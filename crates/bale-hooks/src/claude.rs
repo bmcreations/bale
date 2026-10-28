@@ -192,26 +192,33 @@ pub fn encode_project_path(tree: &Path) -> String {
 /// Bytes read per step from the end of a transcript.
 const CHUNK: usize = 256 * 1024;
 
+/// Bytes read at most from the end of a transcript. Claude Code re-appends
+/// the title line as a session runs, so it sits near the end; an untitled
+/// transcript costs this much rather than its whole size.
+const TAIL_BUDGET: u64 = 1024 * 1024;
+
 /// `(session id, title)` of the Claude Code session that ran in `tree`:
-/// `session`'s transcript under `<claude_home>/projects/<encoded tree>/`
-/// when present, else the newest transcript there. The title is the last
-/// `custom-title` line's `customTitle`. `None` when there is no transcript
-/// or it has no title.
+/// `session`'s transcript under `<claude_home>/projects/<encoded tree>/`,
+/// or, with no `session`, the newest transcript there. A named session
+/// whose transcript is missing gets `None`, not the newest file, which may
+/// belong to a later session in the same tree. The title is the last
+/// `custom-title` line's `customTitle` within the last [`TAIL_BUDGET`]
+/// bytes. `None` when there is no transcript or it has no title.
 pub fn session_title(
     claude_home: &Path,
     tree: &Path,
     session: Option<&str>,
 ) -> Option<(String, String)> {
     let dir = claude_home.join("projects").join(encode_project_path(tree));
-    let named = session
-        .filter(|s| {
-            !s.is_empty()
+    let path = match session {
+        Some(s) => {
+            let safe = !s.is_empty()
                 && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        })
-        .map(|s| dir.join(format!("{s}.jsonl")))
-        .filter(|p| p.is_file());
-    let path = named.or_else(|| newest_transcript(&dir))?;
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            Some(dir.join(format!("{s}.jsonl"))).filter(|p| safe && p.is_file())?
+        }
+        None => newest_transcript(&dir)?,
+    };
     let id = path.file_stem()?.to_string_lossy().into_owned();
     Some((id, last_title(&path)?))
 }
@@ -230,16 +237,18 @@ fn newest_transcript(dir: &Path) -> Option<PathBuf> {
 
 /// The `customTitle` of the last `custom-title` line in the transcript at
 /// `path`, read backwards in [`CHUNK`]-sized steps so a long transcript
-/// costs only its tail when the title was set late.
+/// costs only its tail when the title was set late. Stops after
+/// [`TAIL_BUDGET`] bytes.
 fn last_title(path: &Path) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let mut end = file.metadata().ok()?.len();
+    let floor = end.saturating_sub(TAIL_BUDGET);
     // Bytes after the last newline seen so far: the start of a line whose
     // beginning lies in an earlier chunk.
     let mut carry: Vec<u8> = Vec::new();
-    while end > 0 {
-        let start = end.saturating_sub(CHUNK as u64);
+    while end > floor {
+        let start = end.saturating_sub(CHUNK as u64).max(floor);
         let mut buf = vec![0; (end - start) as usize];
         file.seek(SeekFrom::Start(start)).ok()?;
         file.read_exact(&mut buf).ok()?;
@@ -595,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn named_session_wins_and_newest_transcript_is_the_fallback() {
+    fn named_session_is_read_and_newest_transcript_serves_unnamed() {
         let home = tempfile::tempdir().unwrap();
         let (tree, dir) = project(home.path());
         for (sid, title, mtime) in [("old", "Old work", 1_000), ("new", "New work", 2_000)] {
@@ -611,11 +620,9 @@ mod tests {
             session_title(home.path(), &tree, Some("old")),
             Some(("old".into(), "Old work".into()))
         );
-        // A session with no transcript here falls back to the newest.
-        assert_eq!(
-            session_title(home.path(), &tree, Some("gone")),
-            Some(("new".into(), "New work".into()))
-        );
+        // A named session with no transcript here has no title: the newest
+        // file may be another session's.
+        assert_eq!(session_title(home.path(), &tree, Some("gone")), None);
     }
 
     #[test]
@@ -623,13 +630,30 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (tree, dir) = project(home.path());
         let filler = format!("{}\n", json!({"type": "user", "message": "x".repeat(1000)}));
-        let text = [title_line("Early title"), filler.repeat(1200)].concat();
-        assert!(text.len() > 3 * CHUNK);
+        let text = [title_line("Early title"), filler.repeat(900)].concat();
+        assert!(text.len() > 3 * CHUNK && text.len() < TAIL_BUDGET as usize);
         fs::write(dir.join("s.jsonl"), text).unwrap();
         assert_eq!(
             session_title(home.path(), &tree, Some("s")).map(|t| t.1),
             Some("Early title".into())
         );
+    }
+
+    /// Only the last [`TAIL_BUDGET`] bytes are read, so an untitled
+    /// transcript of any size costs at most that much.
+    #[test]
+    fn title_beyond_the_tail_budget_is_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let (tree, dir) = project(home.path());
+        let filler = format!("{}\n", json!({"type": "user", "message": "x".repeat(1000)}));
+        let tail = filler.repeat(TAIL_BUDGET as usize / filler.len() + 1);
+        assert!(tail.len() > TAIL_BUDGET as usize);
+        fs::write(
+            dir.join("s.jsonl"),
+            [title_line("Too early"), tail].concat(),
+        )
+        .unwrap();
+        assert_eq!(session_title(home.path(), &tree, Some("s")), None);
     }
 
     /// A title line split across two 256 KiB chunks is still read whole.
