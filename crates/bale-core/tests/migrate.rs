@@ -40,9 +40,11 @@ fn three_worktrees(fx: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 fn row<'a>(rows: &'a [PlanRow], path: &Path) -> &'a PlanRow {
-    let want = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let want = bale_core::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     rows.iter()
-        .find(|r| r.path == path || fs::canonicalize(&r.path).is_ok_and(|p| p == want))
+        .find(|r| {
+            r.path == path || bale_core::paths::canonicalize(&r.path).is_ok_and(|p| p == want)
+        })
         .unwrap_or_else(|| panic!("no row for {}: {rows:#?}", path.display()))
 }
 
@@ -389,8 +391,12 @@ fn repo_names_main_checkout_for_linked_path_arg() {
     let (normal, _, _) = three_worktrees(&fx);
     let rows = plan(&fx.home(), std::slice::from_ref(&normal)).unwrap();
     assert_eq!(rows.len(), 3, "{rows:#?}");
-    let main = fs::canonicalize(&fx.repo).unwrap();
+    let main = bale_core::paths::canonicalize(&fx.repo).unwrap();
     for r in &rows {
-        assert_eq!(fs::canonicalize(&r.repo).unwrap(), main, "{r:#?}");
+        assert_eq!(
+            bale_core::paths::canonicalize(&r.repo).unwrap(),
+            main,
+            "{r:#?}"
+        );
     }
 }

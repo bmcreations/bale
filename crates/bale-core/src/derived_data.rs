@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// folder with a missing or unparseable plist, or no `WorkspacePath`, is
 /// never matched.
 pub fn derived_data_for(workspace: &Path, dd_root: &Path) -> Vec<PathBuf> {
-    let ws = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let ws = crate::paths::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let Ok(entries) = fs::read_dir(dd_root) else {
         return Vec::new();
     };
@@ -18,7 +18,8 @@ pub fn derived_data_for(workspace: &Path, dd_root: &Path) -> Vec<PathBuf> {
         let Some(wp) = workspace_path(&entry.path().join("info.plist")) else {
             continue;
         };
-        let inside = wp.starts_with(&ws) || fs::canonicalize(&wp).is_ok_and(|c| c.starts_with(&ws));
+        let inside = wp.starts_with(&ws)
+            || crate::paths::canonicalize(&wp).is_ok_and(|c| c.starts_with(&ws));
         if inside {
             out.push(entry.path());
         }

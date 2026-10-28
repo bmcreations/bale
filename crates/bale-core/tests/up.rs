@@ -403,7 +403,7 @@ fn build_dir_with_real_content_is_kept() {
 
         let report = up_report(&fx.home(), &id).unwrap();
         assert_eq!(report.outcome, Outcome::Done(Level::Baled), "{case}");
-        let build = fs::canonicalize(wt.join("build")).unwrap();
+        let build = bale_core::paths::canonicalize(wt.join("build")).unwrap();
         assert_eq!(report.kept, vec![build], "{case}");
         assert!(wt.join("build").is_dir(), "{case}");
         assert!(!wt.join("app/build").exists(), "{case}");
@@ -439,7 +439,7 @@ fn build_dir_inside_a_nested_repo_is_kept() {
 
     let report = up_report(&fx.home(), &id).unwrap();
     assert_eq!(report.outcome, Outcome::Done(Level::Baled));
-    let kept = fs::canonicalize(nested.join("build")).unwrap();
+    let kept = bale_core::paths::canonicalize(nested.join("build")).unwrap();
     assert_eq!(report.kept, vec![kept]);
     assert_eq!(
         fs::read_to_string(nested.join("build/notes.txt")).unwrap(),
@@ -476,7 +476,7 @@ fn build_dir_inside_a_submodule_is_kept() {
 
     let report = up_report(&fx.home(), &id).unwrap();
     assert_eq!(report.outcome, Outcome::Done(Level::Baled));
-    let kept = fs::canonicalize(wt.join("lib/build")).unwrap();
+    let kept = bale_core::paths::canonicalize(wt.join("lib/build")).unwrap();
     assert_eq!(report.kept, vec![kept]);
     assert_eq!(
         fs::read_to_string(wt.join("lib/build/k.txt")).unwrap(),

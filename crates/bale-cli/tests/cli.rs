@@ -139,11 +139,7 @@ fn stdout(out: &Output) -> String {
 
 /// Canonical path without Windows' `\\?\` prefix.
 fn canon(p: &Path) -> PathBuf {
-    let c = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    match c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        Some(rest) => PathBuf::from(rest),
-        None => c,
-    }
+    bale_core::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// A documented payload with `field` replaced by `value`.

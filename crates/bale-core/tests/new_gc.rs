@@ -47,11 +47,11 @@ fn plant_saved_state(fx: &Fixture, id: &str) {
 }
 
 fn lock_reason(fx: &Fixture, path: &Path) -> Option<String> {
-    let want = fs::canonicalize(path).unwrap();
+    let want = bale_core::paths::canonicalize(path).unwrap();
     worktrees(&fx.repo)
         .unwrap()
         .into_iter()
-        .find(|w| fs::canonicalize(&w.path).ok().as_ref() == Some(&want))
+        .find(|w| bale_core::paths::canonicalize(&w.path).ok().as_ref() == Some(&want))
         .unwrap()
         .locked
 }
@@ -77,7 +77,7 @@ fn orphan(fx: &Fixture, name: &str) -> String {
 fn new_creates_and_registers() {
     let fx = Fixture::new();
     let rec = new_workspace(&fx.home(), &fx.repo, "x", None).unwrap();
-    let want = fs::canonicalize(default_root(&fx).join("x")).unwrap();
+    let want = bale_core::paths::canonicalize(default_root(&fx).join("x")).unwrap();
     assert_eq!(rec.path, want);
     assert_eq!(head_ref(&want), "refs/heads/x");
     assert_eq!(rec.level, Level::Hot);
@@ -111,7 +111,7 @@ fn new_uses_configured_worktree_root() {
     )
     .unwrap();
     let rec = new_workspace(&fx.home(), &fx.repo, "x", None).unwrap();
-    let want = fs::canonicalize(root.join("my repo é").join("x")).unwrap();
+    let want = bale_core::paths::canonicalize(root.join("my repo é").join("x")).unwrap();
     assert_eq!(rec.path, want);
 }
 
@@ -134,13 +134,13 @@ fn new_resolves_a_relative_worktree_root_against_the_main_checkout() {
     fs::write(fx.repo.join(".bale.toml"), "worktree_root = \"../wt\"\n").unwrap();
     let cwd = std::env::current_dir().unwrap();
     assert_ne!(
-        fs::canonicalize(&cwd).unwrap(),
-        fs::canonicalize(&fx.repo).unwrap()
+        bale_core::paths::canonicalize(&cwd).unwrap(),
+        bale_core::paths::canonicalize(&fx.repo).unwrap()
     );
     let stray = cwd.join("../wt");
     let stray_before = stray.exists();
     let rec = new_workspace(&fx.home(), &fx.repo, "x", None).unwrap();
-    let want = fs::canonicalize(fx.repo.join("../wt/my repo é/x")).unwrap();
+    let want = bale_core::paths::canonicalize(fx.repo.join("../wt/my repo é/x")).unwrap();
     assert_eq!(rec.path, want);
     assert_eq!(head_ref(&want), "refs/heads/x");
     assert_eq!(stray.exists(), stray_before, "stray dir beside the cwd");
@@ -552,7 +552,7 @@ fn gc_removes_stale_check_dirs_of_the_workspace() {
     let lookalike = plant_check_dir(&wt, &format!(".bale-check-{id}-notes.d"));
 
     // Reported beside the recorded (canonical) path.
-    let want = vec![(id.clone(), fs::canonicalize(&ours).unwrap())];
+    let want = vec![(id.clone(), bale_core::paths::canonicalize(&ours).unwrap())];
     let dry = gc(&fx.home(), true).unwrap();
     assert!(ours.exists(), "a dry run removed it");
     assert_eq!(dry.checks, want);

@@ -158,7 +158,7 @@ fn user_locked_tree_is_skipped_untouched() {
 #[test]
 fn cold_refuses_main_checkout() {
     let fx = Fixture::new();
-    let root = fs::canonicalize(&fx.repo).unwrap();
+    let root = bale_core::paths::canonicalize(&fx.repo).unwrap();
     let id = workspace_id(&root);
     let rec = Record {
         id: id.clone(),
@@ -1328,7 +1328,7 @@ fn resolve_refuses_a_gitfile_pointing_at_the_main_repo() {
     );
     let before = register(&fx.home(), &wt).unwrap();
     replace_with_stray(&wt);
-    let main_git = fs::canonicalize(fx.repo.join(".git")).unwrap();
+    let main_git = bale_core::paths::canonicalize(fx.repo.join(".git")).unwrap();
     fs::write(wt.join(".git"), format!("gitdir: {}\n", main_git.display())).unwrap();
 
     assert!(resolve(&fx.home(), wt.to_str().unwrap()).is_err());

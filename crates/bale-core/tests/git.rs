@@ -4,7 +4,7 @@ use bale_core::git::{self, Git};
 use support::{git as sh, Fixture};
 
 fn canon(p: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(p).unwrap()
+    bale_core::paths::canonicalize(p).unwrap()
 }
 
 #[test]

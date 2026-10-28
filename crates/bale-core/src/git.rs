@@ -199,10 +199,10 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
 
 /// The entry `git worktree list` in `repo` gives for `path`.
 pub fn find_worktree(repo: &Path, path: &Path) -> Result<WorktreeInfo> {
-    let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let want = crate::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     worktrees(repo)?
         .into_iter()
-        .find(|w| std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == want)
+        .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == want)
         .with_context(|| format!("{} is not a worktree of {}", path.display(), repo.display()))
 }
 

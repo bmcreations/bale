@@ -121,12 +121,13 @@ fn missing_ancestors(dir: &Path) -> Vec<PathBuf> {
 
 /// The repo's main checkout: the first entry of `git worktree list`.
 fn main_checkout(repo: &Path) -> Result<PathBuf> {
-    let repo = fs::canonicalize(repo).with_context(|| format!("resolving {}", repo.display()))?;
+    let repo = crate::paths::canonicalize(repo)
+        .with_context(|| format!("resolving {}", repo.display()))?;
     let main = git::worktrees(&repo)?
         .into_iter()
         .find(|w| w.is_main)
         .with_context(|| format!("{} lists no worktrees", repo.display()))?;
-    Ok(fs::canonicalize(&main.path).unwrap_or(main.path))
+    Ok(crate::paths::canonicalize(&main.path).unwrap_or(main.path))
 }
 
 /// Whether `refs/heads/<branch>` exists. Matches the exact ref, since

@@ -158,7 +158,7 @@ fn missing_root_is_an_error() {
 fn many_roots_from_one_scan_match_each_root() {
     let tmp = tempfile::tempdir().unwrap();
     // busy_holders_many takes canonical roots.
-    let base = fs::canonicalize(tmp.path()).unwrap();
+    let base = bale_core::paths::canonicalize(tmp.path()).unwrap();
     let held = base.join("held");
     let free = base.join("free");
     fs::create_dir_all(held.join("app")).unwrap();
@@ -182,7 +182,7 @@ fn many_roots_from_one_scan_match_each_root() {
 #[test]
 fn many_roots_prefix_cwd_outside_and_symlinked_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let base = fs::canonicalize(tmp.path()).unwrap();
+    let base = bale_core::paths::canonicalize(tmp.path()).unwrap();
     let wt = base.join("wt");
     let wt2 = base.join("wt2");
     let files = base.join("files");
@@ -211,7 +211,7 @@ fn many_roots_prefix_cwd_outside_and_symlinked_root() {
         wt.clone(),
         wt2.clone(),
         files.clone(),
-        fs::canonicalize(&link).unwrap(),
+        bale_core::paths::canonicalize(&link).unwrap(),
     ];
     let lists = busy_holders_many(&roots).unwrap();
     let pids = |i: usize| lists[i].iter().map(|h| h.pid).collect::<Vec<_>>();

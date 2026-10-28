@@ -105,10 +105,10 @@ fn existing_worktree<'a>(
         .ok()?
         .into_iter()
         .filter(|w| !w.is_main)
-        .map(|w| fs::canonicalize(&w.path).unwrap_or(w.path))
+        .map(|w| bale_core::paths::canonicalize(&w.path).unwrap_or(w.path))
         .collect();
     candidates
-        .filter_map(|c| fs::canonicalize(c).ok())
+        .filter_map(|c| bale_core::paths::canonicalize(c).ok())
         .find(|c| listed.contains(c))
 }
 
@@ -138,7 +138,7 @@ fn fallback_path(cwd: &Path, name: &str) -> Result<PathBuf> {
             .with_context(|| format!("{} lists no worktrees", cwd.display()))?
             .path
     };
-    let main = fs::canonicalize(&main).context("resolving the main checkout")?;
+    let main = bale_core::paths::canonicalize(&main).context("resolving the main checkout")?;
     Ok(main.join(".claude").join("worktrees").join(name))
 }
 
@@ -163,7 +163,7 @@ fn git_fallback(cwd: &Path, name: &str, branch: &str) -> Result<PathBuf> {
     } else {
         g.run(&["worktree", "add", "-b", branch, "--", &p])?;
     }
-    Ok(fs::canonicalize(&path).unwrap_or(path))
+    Ok(bale_core::paths::canonicalize(&path).unwrap_or(path))
 }
 
 /// The pids whose hold on the tree comes from running this hook: this

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -57,7 +56,7 @@ pub fn plan(home: &BaleHome, repos: &[PathBuf]) -> Result<Vec<PlanRow>> {
     let mut rows = Vec::new();
     for repo in repos {
         let listed = git::common_dir(repo).and_then(|common| {
-            let common = fs::canonicalize(&common).unwrap_or(common);
+            let common = crate::paths::canonicalize(&common).unwrap_or(common);
             if !seen_repos.insert(common) {
                 return Ok(None);
             }
@@ -169,7 +168,7 @@ fn probe_busy(rows: &mut [PlanRow]) {
         if row.action != BALE {
             continue;
         }
-        match fs::canonicalize(&row.path) {
+        match crate::paths::canonicalize(&row.path) {
             Ok(p) => {
                 candidates.push(i);
                 paths.push(p);
@@ -244,12 +243,12 @@ pub fn apply(home: &BaleHome, rows: &[PlanRow]) -> Result<MigrateReport> {
 /// True when git now shows the row's worktree locked with a reason other
 /// than bale's, for example a lock the user added after `plan`.
 fn foreign_lock(row: &PlanRow) -> Result<bool> {
-    let want = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+    let want = crate::paths::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
     let list = git::worktrees(&row.repo)
         .with_context(|| format!("re-reading locks in {}", row.repo.display()))?;
     Ok(list
         .iter()
-        .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == want)
+        .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == want)
         .and_then(|w| w.locked.as_deref())
         .is_some_and(|reason| reason != LOCK_REASON))
 }
@@ -288,7 +287,7 @@ fn temp_roots() -> Vec<PathBuf> {
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
     ] {
-        if let Ok(c) = fs::canonicalize(&p) {
+        if let Ok(c) = crate::paths::canonicalize(&p) {
             roots.push(c);
         }
         roots.push(p);
@@ -315,7 +314,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let kept = tmp.path().join("kept");
         let gone = tmp.path().join("gone");
-        fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
         let mut rows = vec![empty_row(tmp.path(), &kept), empty_row(tmp.path(), &gone)];
         for r in &mut rows {
             r.action = BALE.into();

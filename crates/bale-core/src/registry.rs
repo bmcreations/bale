@@ -70,7 +70,7 @@ pub fn is_workspace_id(id: &str) -> bool {
 /// existing ancestor and re-joins the remaining components, so the result
 /// matches what canonicalize gave while the path existed.
 pub(crate) fn canonical_or_ancestor(path: &Path) -> PathBuf {
-    if let Ok(c) = fs::canonicalize(path) {
+    if let Ok(c) = crate::paths::canonicalize(path) {
         return c;
     }
     let mut rest = Vec::new();
@@ -79,7 +79,7 @@ pub(crate) fn canonical_or_ancestor(path: &Path) -> PathBuf {
         if let Some(name) = cur.file_name() {
             rest.push(name.to_os_string());
         }
-        if let Ok(mut c) = fs::canonicalize(parent) {
+        if let Ok(mut c) = crate::paths::canonicalize(parent) {
             c.extend(rest.iter().rev());
             return c;
         }

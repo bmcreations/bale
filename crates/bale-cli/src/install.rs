@@ -705,7 +705,7 @@ fn canon_lenient(p: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut cur = p;
     loop {
-        if let Ok(c) = fs::canonicalize(cur) {
+        if let Ok(c) = bale_core::paths::canonicalize(cur) {
             let mut out = c;
             out.extend(rest.iter().rev());
             return out;

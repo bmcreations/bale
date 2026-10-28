@@ -6,6 +6,7 @@ pub mod git;
 pub mod idle;
 pub mod lock;
 pub mod ops;
+pub mod paths;
 pub mod registry;
 
 use std::path::PathBuf;

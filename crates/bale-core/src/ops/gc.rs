@@ -144,9 +144,10 @@ fn collect(
 /// from which git would climb into an enclosing repo, fails the probe.
 fn repo_git(record: &Record) -> Result<Git> {
     let dir = &record.repo_common_dir;
-    let expected = fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let expected =
+        crate::paths::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
     let actual = git::common_dir(dir)?;
-    if fs::canonicalize(&actual).unwrap_or(actual.clone()) != expected {
+    if crate::paths::canonicalize(&actual).unwrap_or(actual.clone()) != expected {
         bail!(
             "{} is no longer a git repository (git resolved {})",
             dir.display(),

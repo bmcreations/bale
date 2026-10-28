@@ -130,7 +130,7 @@ fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
     if let Some(action) = level_action(record.level) {
         return Ok(action);
     }
-    let root = fs::canonicalize(&record.path)
+    let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
     let cfg = load_config(home, Some(&root))?;
     let regen = regenerable_dirs(&root, &detect(&root), &cfg);

@@ -31,7 +31,8 @@ pub enum Outcome {
 /// record's path, branch, head and admin dir (keeping its level). Errors for
 /// the main checkout and for paths that are not a worktree of their repo.
 pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
-    let root = fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let root = crate::paths::canonicalize(path)
+        .with_context(|| format!("resolving {}", path.display()))?;
     // Without its own gitfile, git here climbs to an enclosing repo and the
     // record would be repointed at it, defeating every checkout check.
     if fs::symlink_metadata(root.join(".git")).is_err() {
@@ -43,7 +44,7 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
     let common = git::common_dir(&root)?;
     let info = git::worktrees(&root)?
         .into_iter()
-        .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
+        .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
         .with_context(|| {
             format!(
                 "{} is not a worktree of {}",
@@ -62,8 +63,8 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
     // gitfile pointing anywhere else (the main git dir, say) is not this
     // worktree, whatever `git worktree list` still says about the path.
     let worktrees_dir =
-        fs::canonicalize(common.join("worktrees")).unwrap_or(common.join("worktrees"));
-    let admin_canon = fs::canonicalize(&admin).unwrap_or_else(|_| admin.clone());
+        crate::paths::canonicalize(common.join("worktrees")).unwrap_or(common.join("worktrees"));
+    let admin_canon = crate::paths::canonicalize(&admin).unwrap_or_else(|_| admin.clone());
     if admin_canon.parent() != Some(worktrees_dir.as_path()) {
         bail!(
             "{} uses git dir {}, which is not a linked worktree's; move it away",
@@ -178,7 +179,7 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
     };
-    let root = fs::canonicalize(&record.path)
+    let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
 
     let skip = |reason: &str| Ok(UpReport::plain(Outcome::Skipped(reason.into())));

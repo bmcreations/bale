@@ -77,7 +77,7 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
         Level::Hot | Level::Baling | Level::Baled => {}
     }
 
-    let root = fs::canonicalize(&record.path)
+    let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
     if let Some(reason) = not_checkout(&root, &record) {
         return Ok(Outcome::Skipped(reason));
@@ -143,7 +143,7 @@ pub fn exclusions(home: &BaleHome, dir: &Path) -> Result<Exclusions> {
 fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     let info = git::worktrees(root)?
         .into_iter()
-        .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
+        .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
         .with_context(|| format!("{} is not a git worktree", root.display()))?;
     if info.is_main {
         bail!(
@@ -477,8 +477,8 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 path.display()
             )));
         }
-        let root =
-            fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
+        let root = crate::paths::canonicalize(&path)
+            .with_context(|| format!("resolving {}", path.display()))?;
         if let Some(reason) = not_checkout(&root, &record) {
             return Ok(Outcome::Skipped(reason));
         }
@@ -686,8 +686,8 @@ fn trash_siblings(path: &Path) -> Result<Vec<PathBuf>> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(Vec::new());
     };
-    let parent =
-        fs::canonicalize(parent).with_context(|| format!("resolving {}", parent.display()))?;
+    let parent = crate::paths::canonicalize(parent)
+        .with_context(|| format!("resolving {}", parent.display()))?;
     let prefix = format!("{TRASH_PREFIX}{}-", name.to_string_lossy());
     let mut found = Vec::new();
     for entry in fs::read_dir(&parent).with_context(|| format!("reading {}", parent.display()))? {
@@ -891,8 +891,8 @@ pub(crate) fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
     // Resolved here: on Windows `dir` is a verbatim path, where `..` is not
     // collapsed for git.
     let git_dir = dir.join(target);
-    let git_dir =
-        fs::canonicalize(&git_dir).with_context(|| format!("resolving {}", git_dir.display()))?;
+    let git_dir = crate::paths::canonicalize(&git_dir)
+        .with_context(|| format!("resolving {}", git_dir.display()))?;
     Ok(Some(git_dir))
 }
 
@@ -1473,7 +1473,7 @@ mod tests {
 
     fn repo() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = fs::canonicalize(tmp.path()).unwrap().join("r");
+        let root = crate::paths::canonicalize(tmp.path()).unwrap().join("r");
         fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "t"]);
@@ -2805,7 +2805,7 @@ mod tests {
         }
         // Found under the canonical parent (macOS temp dirs sit behind /var -> /private/var).
         let found = trash_siblings(&tmp.path().join("a")).unwrap();
-        let parent = fs::canonicalize(tmp.path()).unwrap();
+        let parent = crate::paths::canonicalize(tmp.path()).unwrap();
         assert_eq!(found, vec![parent.join(".bale-trash-a-1")]);
     }
 }
