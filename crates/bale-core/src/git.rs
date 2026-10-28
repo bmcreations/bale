@@ -236,7 +236,6 @@ pub fn unlock_worktree_if_ours(repo: &Path, path: &Path) -> Result<bool> {
 /// Most commit subjects a [`Scope`] keeps.
 const SCOPE_SUBJECTS: &str = "8";
 
-/// The tree's branch, upstream, unpushed commits and uncommitted changes.
 /// The newest subject [`scope`] would list first, at the cost of one or two
 /// git processes instead of scope's seven: the newest commit in
 /// `@{upstream}..HEAD`, or with no upstream, in `HEAD --not --remotes`.
@@ -252,6 +251,7 @@ pub fn latest_subject(root: &Path) -> Result<Option<String>> {
     Ok(out.lines().next().map(str::to_string))
 }
 
+/// The tree's branch, upstream, unpushed commits and uncommitted changes.
 pub fn scope(root: &Path) -> Result<Scope> {
     let g = Git::at(root);
     let count = |args: &[&str]| -> Result<u32> {
