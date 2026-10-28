@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use bale_core::ops::cold::cold;
 use bale_core::ops::up::{register, up, Outcome};
 use bale_core::registry::{Level, Registry};
 use bale_core::BaleHome;
@@ -23,6 +24,11 @@ enum Command {
         /// Worktree path or workspace id.
         target: String,
     },
+    /// Save a worktree's uncommitted work and ignored files, then delete its checkout.
+    Cold {
+        /// Worktree path or workspace id.
+        target: String,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
@@ -35,7 +41,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = BaleHome::from_env();
     let result = match cli.command {
-        Command::Up { target } => cmd_up(&home, &target),
+        Command::Up { target } => {
+            resolve(&home, &target).and_then(|id| Ok(report(&id, up(&home, &id)?)))
+        }
+        Command::Cold { target } => {
+            resolve(&home, &target).and_then(|id| Ok(report(&id, cold(&home, &id)?)))
+        }
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -57,23 +68,23 @@ fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
         .with_context(|| format!("{arg} is neither an existing path nor a registered workspace id"))
 }
 
-fn cmd_up(home: &BaleHome, target: &str) -> Result<ExitCode> {
-    let id = resolve(home, target)?;
-    match up(home, &id)? {
+/// Prints the outcome; exit 0 done, 3 busy, 4 skipped.
+fn report(id: &str, outcome: Outcome) -> ExitCode {
+    match outcome {
         Outcome::Done(level) => {
             println!("{id}: {}", level_name(level));
-            Ok(ExitCode::SUCCESS)
+            ExitCode::SUCCESS
         }
         Outcome::Busy(holders) => {
             println!("{id}: busy, left untouched");
             for h in holders {
                 println!("  pid {} {} {}", h.pid, h.command, h.path.display());
             }
-            Ok(ExitCode::from(3))
+            ExitCode::from(3)
         }
         Outcome::Skipped(reason) => {
             println!("{id}: skipped ({reason})");
-            Ok(ExitCode::from(4))
+            ExitCode::from(4)
         }
     }
 }

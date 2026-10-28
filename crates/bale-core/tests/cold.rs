@@ -1,0 +1,421 @@
+mod support;
+
+use bale_core::git::worktrees;
+use bale_core::ops::cold::{cold, save_ignored, save_wip};
+use bale_core::ops::up::{register, Outcome};
+use bale_core::registry::{workspace_id, Level, Record, Registry};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use support::{git, Fixture};
+
+/// Commits a `.gitignore` on main, then adds a Gradle worktree `wt` with a
+/// modified tracked `f`, untracked `b.txt`, ignored `.env`, ignored `build/`
+/// and ignored `node_modules/`.
+fn dirty_worktree(fx: &Fixture) -> PathBuf {
+    fs::write(
+        fx.repo.join(".gitignore"),
+        ".env\n.env.local\nbuild/\nnode_modules/\n",
+    )
+    .unwrap();
+    fs::write(fx.repo.join("settings.gradle.kts"), "").unwrap();
+    git(&fx.repo, &["add", ".gitignore", "settings.gradle.kts"]);
+    git(&fx.repo, &["commit", "-m", "ignore"]);
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("f"), "modified\n").unwrap();
+    fs::write(wt.join("b.txt"), "untracked\n").unwrap();
+    fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/out.bin"), "regen").unwrap();
+    fs::create_dir_all(wt.join("node_modules/x")).unwrap();
+    fs::write(wt.join("node_modules/x/i.js"), "js").unwrap();
+    wt
+}
+
+fn level(fx: &Fixture, id: &str) -> Level {
+    Registry::open(fx.home()).get(id).unwrap().unwrap().level
+}
+
+fn set_level(fx: &Fixture, id: &str, level: Level) {
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(id).unwrap().unwrap();
+    rec.level = level;
+    reg.put(&rec).unwrap();
+}
+
+fn linked(fx: &Fixture) -> bale_core::git::WorktreeInfo {
+    worktrees(&fx.repo)
+        .unwrap()
+        .into_iter()
+        .find(|w| !w.is_main)
+        .unwrap()
+}
+
+fn show(fx: &Fixture, rev: &str) -> String {
+    git(&fx.repo, &["show", rev])
+}
+
+fn trash_beside(wt: &Path) -> Vec<PathBuf> {
+    let prefix = format!(".bale-trash-{}-", wt.file_name().unwrap().to_string_lossy());
+    fs::read_dir(wt.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect()
+}
+
+#[cfg(unix)]
+fn symlink(target: &str, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[test]
+fn cold_saves_everything_and_removes_dir() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    #[cfg(unix)]
+    symlink("../main/.env.local", &wt.join(".env.local"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
+    assert!(trash_beside(&wt).is_empty());
+    assert_eq!(level(&fx, &id), Level::Cold);
+
+    let wip = format!("refs/bale/{id}/wip");
+    assert_eq!(show(&fx, &format!("{wip}:f")), "modified\n");
+    assert_eq!(show(&fx, &format!("{wip}:b.txt")), "untracked\n");
+    let head = git(&fx.repo, &["rev-parse", "feature"]);
+    assert_eq!(
+        git(&fx.repo, &["rev-parse", &format!("refs/bale/{id}/head")]),
+        head
+    );
+    assert_eq!(git(&fx.repo, &["rev-parse", &format!("{wip}^")]), head);
+
+    let files = fx.home().saved_dir(&id).join("files");
+    assert_eq!(
+        fs::read_to_string(files.join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+    assert!(!files.join("build").exists());
+    assert!(!files.join("node_modules").exists());
+    let manifest = fs::read_to_string(fx.home().saved_dir(&id).join("manifest.json")).unwrap();
+    assert!(manifest.contains(".env"), "{manifest}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(files.join(".env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = fs::metadata(&files).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+        let link = files.join(".env.local");
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            PathBuf::from("../main/.env.local")
+        );
+    }
+
+    let entry = linked(&fx);
+    assert_eq!(entry.locked.as_deref(), Some("baled by bale"));
+}
+
+#[test]
+fn cold_refuses_main_checkout() {
+    let fx = Fixture::new();
+    let root = fs::canonicalize(&fx.repo).unwrap();
+    let id = workspace_id(&root);
+    let rec = Record {
+        id: id.clone(),
+        repo_common_dir: root.join(".git"),
+        path: root.clone(),
+        admin_dir: root.join(".git"),
+        branch: Some("main".into()),
+        head: String::new(),
+        level: Level::Hot,
+        last_activity: SystemTime::now(),
+        note: None,
+    };
+    Registry::open(fx.home()).put(&rec).unwrap();
+    let err = cold(&fx.home(), &id).unwrap_err();
+    assert!(format!("{err:#}").contains("main checkout"), "{err:#}");
+    assert!(fx.repo.join("f").exists());
+}
+
+#[test]
+fn cold_refuses_sparse() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(&wt, &["sparse-checkout", "set", "src"]);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("sparse")),
+        "{out:?}"
+    );
+    assert!(wt.exists());
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert_eq!(linked(&fx).locked, None);
+}
+
+#[test]
+fn cold_refuses_dirty_submodule() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(
+        &wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.repo.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&wt, &["commit", "-m", "sub"]);
+    fs::write(wt.join("lib/f"), "dirty\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("lib/f")).unwrap(), "dirty\n");
+    assert_eq!(level(&fx, &id), Level::Hot);
+}
+
+#[test]
+fn cold_refuses_untracked_nested_repo() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let nested = wt.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-b", "main"]);
+    fs::write(nested.join("x"), "x").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("nested")),
+        "{out:?}"
+    );
+    assert!(nested.join("x").exists());
+}
+
+#[test]
+fn real_index_untouched() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("staged.txt"), "s\n").unwrap();
+    git(&wt, &["add", "staged.txt"]);
+    fs::write(wt.join("loose.txt"), "l\n").unwrap();
+    let index = PathBuf::from(
+        git(
+            &wt,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .trim(),
+    );
+    let before = fs::read(&index).unwrap();
+
+    save_wip(&wt, "abc").unwrap();
+
+    assert_eq!(fs::read(&index).unwrap(), before);
+    assert_eq!(
+        git(&wt, &["diff", "--cached", "--name-only"]),
+        "staged.txt\n"
+    );
+    assert!(git(&wt, &["status", "--porcelain"]).contains("?? loose.txt"));
+    assert_eq!(show(&fx, "refs/bale/abc/wip:staged.txt"), "s\n");
+    assert_eq!(show(&fx, "refs/bale/abc/wip:loose.txt"), "l\n");
+}
+
+#[test]
+fn force_added_ignored_file_is_kept() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "*.key\n").unwrap();
+    fs::write(wt.join("a.key"), "k\n").unwrap();
+    git(&wt, &["add", "-f", "a.key"]);
+    save_wip(&wt, "abc").unwrap();
+    assert_eq!(show(&fx, "refs/bale/abc/wip:a.key"), "k\n");
+}
+
+#[test]
+fn assume_unchanged_edit_is_kept() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(&wt, &["update-index", "--assume-unchanged", "f"]);
+    fs::write(wt.join("f"), "hidden edit\n").unwrap();
+    save_wip(&wt, "abc").unwrap();
+    assert_eq!(show(&fx, "refs/bale/abc/wip:f"), "hidden edit\n");
+}
+
+#[test]
+fn save_ignored_honours_extra_deny() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "*.log\ncache/\n").unwrap();
+    fs::write(wt.join("a.log"), "a").unwrap();
+    fs::create_dir_all(wt.join("cache/deep")).unwrap();
+    fs::write(wt.join("cache/deep/c"), "c").unwrap();
+    let dest = fx.home().saved_dir("x");
+    let saved = save_ignored(&wt, &dest, &["cache".to_string()]).unwrap();
+    let rels: Vec<_> = saved.iter().map(|s| s.rel.clone()).collect();
+    assert_eq!(rels, vec![PathBuf::from("a.log")]);
+    assert!(dest.join("manifest.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_ignored_dir_is_not_followed() {
+    let fx = Fixture::new();
+    let outside = fx.repo.parent().unwrap().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("big"), "outside").unwrap();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "link\ndir/\n").unwrap();
+    symlink(outside.to_str().unwrap(), &wt.join("link"));
+    fs::create_dir_all(wt.join("dir")).unwrap();
+    symlink(outside.to_str().unwrap(), &wt.join("dir/inner"));
+    let dest = fx.home().saved_dir("x");
+    let saved = save_ignored(&wt, &dest, &[]).unwrap();
+    assert_eq!(saved.len(), 2, "{saved:?}");
+    assert!(saved.iter().all(|s| s.symlink_target.is_some()));
+    assert!(fs::symlink_metadata(dest.join("files/link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(outside.join("big")).unwrap(), "outside");
+    assert!(fs::symlink_metadata(dest.join("files/dir/inner"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn recovers_cooling_with_dir_present() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    // A stale file from an earlier interrupted attempt must not survive.
+    let dest = fx.home().saved_dir(&id);
+    fs::create_dir_all(dest.join("files")).unwrap();
+    fs::write(dest.join("files/stale"), "old").unwrap();
+    set_level(&fx, &id, Level::Cooling);
+
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!wt.exists());
+    assert!(!dest.join("files/stale").exists());
+    assert!(dest.join("files/.env").exists());
+    assert_eq!(show(&fx, &format!("refs/bale/{id}/wip:f")), "modified\n");
+    assert_eq!(level(&fx, &id), Level::Cold);
+}
+
+#[test]
+fn recovers_cooling_after_rename() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    save_wip(&wt, &id).unwrap();
+    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    let trash = wt.with_file_name(".bale-trash-wt-123");
+    fs::rename(&wt, &trash).unwrap();
+    set_level(&fx, &id, Level::Cooling);
+
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    assert!(!trash.exists());
+    assert_eq!(level(&fx, &id), Level::Cold);
+}
+
+#[test]
+fn cooling_without_wip_ref_keeps_trash() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    let trash = wt.with_file_name(".bale-trash-wt-123");
+    fs::rename(&wt, &trash).unwrap();
+    set_level(&fx, &id, Level::Cooling);
+
+    let err = cold(&fx.home(), &id).unwrap_err();
+    assert!(format!("{err:#}").contains("wip"), "{err:#}");
+    assert_eq!(fs::read_to_string(trash.join("f")).unwrap(), "modified\n");
+    assert_eq!(level(&fx, &id), Level::Cooling);
+}
+
+#[test]
+fn cold_on_cold_skips() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_level(&fx, &id, Level::Cold);
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r == "cold"),
+        "{out:?}"
+    );
+    assert!(wt.exists());
+}
+
+#[cfg(unix)]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn busy_tree_is_not_removed() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let _child = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(matches!(&out, Outcome::Busy(h) if !h.is_empty()), "{out:?}");
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
+    assert_ne!(level(&fx, &id), Level::Cold);
+}

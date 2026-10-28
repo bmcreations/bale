@@ -13,11 +13,23 @@ const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
 #[derive(Debug, Clone)]
 pub struct Git {
     dir: PathBuf,
+    envs: Vec<(String, std::ffi::OsString)>,
 }
 
 impl Git {
     pub fn at(dir: impl Into<PathBuf>) -> Git {
-        Git { dir: dir.into() }
+        Git {
+            dir: dir.into(),
+            envs: Vec::new(),
+        }
+    }
+
+    /// Sets `key` for every command this runner starts. Applied after the
+    /// repo-redirecting variables are scrubbed, so it can point git at a
+    /// private `GIT_INDEX_FILE`.
+    pub fn env(mut self, key: &str, value: impl Into<std::ffi::OsString>) -> Git {
+        self.envs.push((key.to_string(), value.into()));
+        self
     }
 
     /// Runs `git <args>` in the directory and returns stdout. Retries up to five
@@ -36,6 +48,7 @@ impl Git {
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
                 .env_remove("GIT_COMMON_DIR")
+                .envs(self.envs.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| format!("failed to run git {}", args.join(" ")))?;
             if out.status.success() {

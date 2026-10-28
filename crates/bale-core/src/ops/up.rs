@@ -15,7 +15,7 @@ use crate::lock::WorkspaceLock;
 use crate::registry::{workspace_id, Level, Record, Registry};
 use crate::BaleHome;
 
-const TRASH_PREFIX: &str = ".bale-trash-";
+pub(crate) const TRASH_PREFIX: &str = ".bale-trash-";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DD_NOTE: &str = "DerivedData not removed: ";
 
@@ -95,6 +95,11 @@ pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(Outcome::Skipped("locked".into()));
     };
+    up_locked(home, id)
+}
+
+/// `up` for a caller that already holds the `WorkspaceLock` for `id`.
+pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
     let registry = Registry::open(home.clone());
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
@@ -172,12 +177,12 @@ fn rename_failure(failure: MoveFailure, unlocked: Result<bool>) -> Result<Outcom
     Err(err)
 }
 
-fn regenerable(home: &BaleHome, root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn regenerable(home: &BaleHome, root: &Path) -> Result<Vec<PathBuf>> {
     let cfg = load_config(home, Some(root))?;
     Ok(regenerable_dirs(root, &detect(root), &cfg))
 }
 
-fn is_busy_error(e: &io::Error) -> bool {
+pub(crate) fn is_busy_error(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && e.raw_os_error() == Some(32))
 }
 
@@ -273,7 +278,7 @@ fn remove_trash(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_entry(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
     let ft = fs::symlink_metadata(path)?.file_type();
     if ft.is_symlink() {
         // A Windows directory symlink or junction needs remove_dir; neither
