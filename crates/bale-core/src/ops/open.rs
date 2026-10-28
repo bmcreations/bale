@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
-use crate::ops::cold::{copy_file, copy_symlink, hex, sha_file, SavedFile, FILES, MANIFEST};
+use crate::ops::cold::{hex, sha_file, SavedFile, FILES};
+use crate::ops::disk::{apply_manifest, file_mode, read_manifest, Manifest};
 use crate::ops::up::{remove_entry, Outcome};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
@@ -136,7 +137,7 @@ struct Saved {
     wip: String,
     /// The wip tree differs from the head tree.
     has_changes: bool,
-    files: Vec<SavedFile>,
+    manifest: Manifest,
 }
 
 /// Everything open relies on must exist before the path is touched: both
@@ -165,12 +166,18 @@ fn check_preconditions(home: &BaleHome, record: &Record) -> Result<Saved> {
     let wip = resolve("wip")?;
 
     let dest = home.saved_dir(id);
-    let manifest = dest.join(MANIFEST);
-    let text = fs::read_to_string(&manifest)
-        .with_context(|| format!("reading the manifest {}", manifest.display()))?;
-    let files: Vec<SavedFile> = serde_json::from_str(&text)
-        .with_context(|| format!("parsing the manifest {}", manifest.display()))?;
-    for f in &files {
+    let manifest = read_manifest(&dest).context("reading the manifest")?;
+    for rel in manifest
+        .modes
+        .iter()
+        .map(|m| &m.rel)
+        .chain(&manifest.dirs)
+    {
+        if !is_plain_relative(rel) {
+            bail!("manifest entry {} is not a relative path", rel.display());
+        }
+    }
+    for f in &manifest.files {
         if !is_plain_relative(&f.rel) {
             bail!("manifest entry {} is not a relative path", f.rel.display());
         }
@@ -206,7 +213,7 @@ fn check_preconditions(home: &BaleHome, record: &Record) -> Result<Saved> {
         head,
         wip,
         has_changes,
-        files,
+        manifest,
     })
 }
 
@@ -291,6 +298,7 @@ fn check_resumable(record: &Record, saved: &Saved) -> Result<()> {
     for name in others.split('\0').filter(|s| !s.is_empty()) {
         let rel = Path::new(name);
         let known = saved
+            .manifest
             .files
             .iter()
             .find(|f| f.rel == rel)
@@ -349,22 +357,7 @@ fn restore(home: &BaleHome, record: &Record, saved: &Saved) -> Result<()> {
     restage_ignored_additions(&g, saved)?;
 
     let files = home.saved_dir(&record.id).join(FILES);
-    for f in &saved.files {
-        let to = path.join(&f.rel);
-        if fs::symlink_metadata(&to).is_ok() {
-            // Written by an earlier, interrupted open; checked below.
-            continue;
-        }
-        if let Some(parent) = f.rel.parent() {
-            make_parents(path, parent)?;
-        }
-        let from = files.join(&f.rel);
-        if f.symlink_target.is_some() {
-            copy_symlink(&from, &to, f.rel.clone())?;
-        } else {
-            copy_file(&from, &to)?;
-        }
-    }
+    apply_manifest(path, &saved.manifest, &files)?;
     verify_restore(record, saved)
 }
 
@@ -412,30 +405,29 @@ fn restage_ignored_additions(g: &Git, saved: &Saved) -> Result<()> {
     Ok(())
 }
 
-/// Creates `rel` under `root` one component at a time, refusing to pass
-/// through anything that is not a real directory.
-fn make_parents(root: &Path, rel: &Path) -> Result<()> {
-    let mut cur = root.to_path_buf();
-    for c in rel.components() {
-        cur.push(c);
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => bail!("{} is in the way of a saved file", cur.display()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&cur).with_context(|| format!("creating {}", cur.display()))?
-            }
-            Err(e) => return Err(e).with_context(|| format!("checking {}", cur.display())),
-        }
-    }
-    Ok(())
-}
-
 /// Every saved file matches its manifest entry and the working tree builds
 /// exactly the wip tree.
 fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
-    for f in &saved.files {
+    for f in &saved.manifest.files {
         check_entry(&record.path.join(&f.rel), f)
             .with_context(|| format!("restored {} does not match", f.rel.display()))?;
+    }
+    for d in &saved.manifest.dirs {
+        if !fs::symlink_metadata(record.path.join(d)).is_ok_and(|m| m.is_dir()) {
+            bail!("restored dir {} is missing", d.display());
+        }
+    }
+    for m in &saved.manifest.modes {
+        let meta = fs::symlink_metadata(record.path.join(&m.rel))
+            .with_context(|| format!("restored {} is missing", m.rel.display()))?;
+        if file_mode(&meta).is_some_and(|mode| mode != m.mode) {
+            bail!(
+                "restored {} has mode {:o}, not {:o}",
+                m.rel.display(),
+                file_mode(&meta).unwrap_or(0),
+                m.mode
+            );
+        }
     }
     let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
     let g = Git::at(&record.path).env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str());

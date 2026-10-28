@@ -4,7 +4,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +16,7 @@ use crate::busy::{busy_holders, Holder};
 use crate::config::{load_config, Config};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
+use crate::ops::disk::{self, read_manifest, record_tree, write_manifest, Manifest, Skip};
 use crate::lock::WorkspaceLock;
 use crate::ops::up::{
     bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
@@ -791,7 +792,8 @@ fn ls_files_v(g: &Git) -> Result<Vec<(char, String)>> {
 }
 
 /// Copies the worktree's ignored files to `dest/files/` (dirs 0700, files
-/// 0600 on unix) and writes `dest/manifest.json`. `ex.regen`, `node_modules`
+/// 0600 on unix) and writes `dest/manifest.json`, which also records every
+/// file's mode and the empty dirs. `ex.regen`, `node_modules`
 /// and `ex.deny` are skipped. Symlinks are saved as symlinks and never
 /// followed. `dest` is cleared first.
 pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<SavedFile>> {
@@ -830,13 +832,23 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
         });
     }
 
-    let manifest = dest.join(MANIFEST);
-    let tmp = dest.join(format!("{MANIFEST}.tmp"));
-    let mut f = create_private(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(&saved)?)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, &manifest).with_context(|| format!("writing {}", manifest.display()))?;
+    let skip = Skip {
+        regen: ex.regen.clone(),
+        deny: ex.deny.clone(),
+        gitlinks: gitlinks(&Git::at(dir))?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    };
+    let (modes, dirs) = record_tree(dir, &skip)?;
+    write_manifest(
+        dest,
+        &Manifest {
+            files: saved.clone(),
+            modes,
+            dirs,
+        },
+    )?;
     Ok(saved)
 }
 
@@ -892,22 +904,7 @@ fn scan_ignored_with(
         .iter()
         .filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf))
         .collect();
-    let denied = |rel: &Path| -> bool {
-        regen.iter().any(|r| rel.starts_with(r))
-            || rel.components().any(|c| {
-                let Component::Normal(name) = c else {
-                    return false;
-                };
-                let name = name.to_string_lossy();
-                name == "node_modules"
-                    || name.starts_with(TRASH_PREFIX)
-                    || deny.iter().any(|d| !d.contains('/') && *d == name)
-            })
-            || deny
-                .iter()
-                .filter(|d| d.contains('/'))
-                .any(|d| rel.starts_with(d.trim_end_matches('/')))
-    };
+    let denied = |rel: &Path| disk::denied(rel, &regen, deny);
 
     let listed = g.run(&[
         "ls-files",
@@ -1116,11 +1113,7 @@ fn verify_in(
     ex: &Exclusions,
     place: Place,
 ) -> Result<Option<String>> {
-    let manifest = dest.join(MANIFEST);
-    let text =
-        fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
-    let saved: Vec<SavedFile> =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
+    let saved = read_manifest(dest)?.files;
     let mut want: Vec<PathBuf> = scan_ignored(root, ex)?
         .entries
         .into_iter()

@@ -40,7 +40,12 @@ fn dirty(wt: &Path) {
     fs::create_dir_all(wt.join("node_modules/x")).unwrap();
     fs::write(wt.join("node_modules/x/i.js"), "js").unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink("../main/.env.local", wt.join(".env.local")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Restored with its own mode, not the 0600 of the saved copy.
+        fs::set_permissions(wt.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink("../main/.env.local", wt.join(".env.local")).unwrap();
+    }
 }
 
 fn status(wt: &Path) -> String {
@@ -109,7 +114,7 @@ fn assert_restored(fx: &Fixture, wt: &Path, id: &str, before: &str) {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(wt.join(".env")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o777, 0o640);
         let link = wt.join(".env.local");
         assert!(fs::symlink_metadata(&link)
             .unwrap()
