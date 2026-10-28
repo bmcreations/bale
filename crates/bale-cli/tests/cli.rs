@@ -1467,17 +1467,17 @@ fn install_conductor_keeps_existing_scripts_and_comments() {
     assert_eq!(lines[1], "[scripts]");
     assert_eq!(lines[2], "# Install deps first.");
     // toml_edit writes a value with a newline as a multi-line string.
-    assert_eq!(lines[3..5], ["setup = \"\"\"", "{ npm install"], "{after}");
+    assert_eq!(lines[3..5], ["setup = \"\"\"", "( npm install"], "{after}");
     assert!(
-        lines[5].starts_with("} && '")
+        lines[5].starts_with(") && '")
             && lines[5].ends_with(" hook conductor setup\"\"\" # keep this comment"),
         "{after}"
     );
     assert_eq!(lines[6], "run = \"npm start\"");
     // The user's archive runs first, while the tree still exists.
-    assert_eq!(lines[7..9], ["archive = \"\"\"", "{ echo bye"], "{after}");
+    assert_eq!(lines[7..9], ["archive = \"\"\"", "( echo bye"], "{after}");
     assert!(
-        lines[9].starts_with("}; '") && lines[9].ends_with(" hook conductor archive\"\"\""),
+        lines[9].starts_with("); '") && lines[9].ends_with(" hook conductor archive\"\"\""),
         "{after}"
     );
     assert_eq!(
