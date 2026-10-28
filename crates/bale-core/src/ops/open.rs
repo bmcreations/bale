@@ -123,7 +123,7 @@ fn open_untraced(home: &BaleHome, id: &str) -> Result<OpenReport> {
         notes.push(note);
     }
     // Best effort and last: a failure here leaves a note, not an error.
-    if let Some(sdk) = sdk_candidate(|k| std::env::var_os(k), dirs::home_dir()) {
+    if let Some(sdk) = sdk_candidate(|k| std::env::var_os(k), crate::paths::home_dir()) {
         match rewrite_sdk_dir(&path.join("local.properties"), &sdk) {
             Ok(true) => notes.push(format!(
                 "local.properties: sdk.dir now points at {}",

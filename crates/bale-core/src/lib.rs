@@ -39,7 +39,7 @@ impl BaleHome {
         match std::env::var_os("BALE_HOME") {
             Some(p) if !p.is_empty() => BaleHome(PathBuf::from(p)),
             _ => BaleHome(
-                dirs::home_dir()
+                crate::paths::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".bale"),
             ),

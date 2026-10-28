@@ -334,7 +334,7 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
     record.trash.clear();
     #[cfg(target_os = "macos")]
     {
-        let failures = dirs::home_dir()
+        let failures = crate::paths::home_dir()
             .map(|h| {
                 remove_derived_data(
                     &root,

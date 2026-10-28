@@ -172,20 +172,9 @@ fn is_unstable_location(exe: &Path) -> bool {
             .is_some_and(|i| parts.len() > i + 2)
 }
 
-/// The home dir, from `HOME` or `USERPROFILE` (the latter first on Windows),
-/// so tests can redirect it.
+/// The home dir, as [`bale_core::paths::home_dir`] finds it.
 pub(crate) fn home_dir() -> Result<PathBuf> {
-    let order = if cfg!(windows) {
-        ["USERPROFILE", "HOME"]
-    } else {
-        ["HOME", "USERPROFILE"]
-    };
-    order
-        .iter()
-        .filter_map(std::env::var_os)
-        .find(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .context("neither HOME nor USERPROFILE is set")
+    bale_core::paths::home_dir().context("no home dir: HOME and USERPROFILE are unset")
 }
 
 /// `PATH`, and `BALE_HOME` when set, captured at install time so the

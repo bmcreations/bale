@@ -91,7 +91,7 @@ pub(crate) fn is_derived_data_root(dir: &Path) -> bool {
 
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
 pub(crate) fn global_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
+    crate::paths::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
 }
 
 /// The folders in Xcode's shared DerivedData built from the tree at `root`.
