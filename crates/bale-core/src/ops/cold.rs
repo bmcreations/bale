@@ -515,6 +515,10 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
                 record_check(&dest, *snapshot)?;
+                // As `finish`: once proven, mark it, so a removal that
+                // stops partway is finished on the next run, never moved
+                // back half-removed.
+                write_trash_marker(&dest, wip, &trash)?;
                 Ok(None)
             });
             match checked {
@@ -2157,6 +2161,59 @@ mod tests {
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
+    }
+
+    /// Recovery that has checked an unmarked trash and then fails partway
+    /// through removing it must finish the removal on the next run. Moving
+    /// the half-removed tree back would let a later cold save its losses
+    /// over the good save.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_removal_that_stops_partway_finishes_on_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"0\n"))
+        {
+            return; // root ignores the permission that blocks removal
+        }
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        for i in 0..30 {
+            fs::write(wt.join(format!("u{i}.txt")), "u").unwrap();
+        }
+        fs::create_dir(wt.join("mm")).unwrap();
+        fs::write(wt.join("mm/f"), "x").unwrap();
+        fs::set_permissions(wt.join("mm"), fs::Permissions::from_mode(0o500)).unwrap();
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(after);
+        assert!(crashed.is_err());
+        let trash = trash_siblings(&wt).unwrap();
+        assert_eq!(trash.len(), 1);
+
+        let first = cold(&home, &id);
+        assert!(first.is_err(), "{first:?}");
+        fs::set_permissions(trash[0].join("mm"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let second = cold(&home, &id);
+        assert!(
+            matches!(second, Ok(Outcome::Done(Level::Cold))),
+            "{second:?}"
+        );
+        assert!(!wt.exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        crate::ops::open::open(&home, &id).unwrap();
+        assert_eq!(fs::read_to_string(wt.join("u7.txt")).unwrap(), "u");
+        assert_eq!(fs::read_to_string(wt.join("mm/f")).unwrap(), "x");
     }
 
     /// A removal that fails partway names the entry it failed on, so the
