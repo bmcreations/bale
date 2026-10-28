@@ -1,5 +1,7 @@
 pub mod config;
 pub mod detect;
+pub mod lock;
+pub mod registry;
 
 use std::path::PathBuf;
 
