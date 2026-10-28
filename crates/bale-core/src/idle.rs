@@ -17,10 +17,13 @@ pub fn last_source_change(root: &Path, regenerable: &[PathBuf]) -> Result<System
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                if err.io_error().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound) {
+                let path = err.path().unwrap_or(root).to_path_buf();
+                // A file deleted mid-walk is fine; a missing root is not.
+                if path != root
+                    && err.io_error().map(|e| e.kind()) == Some(std::io::ErrorKind::NotFound)
+                {
                     continue;
                 }
-                let path = err.path().unwrap_or(root).to_path_buf();
                 return Err(err).with_context(|| format!("walking {}", path.display()));
             }
         };

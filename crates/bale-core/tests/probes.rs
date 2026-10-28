@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use bale_core::busy::busy_holders;
 use bale_core::idle::last_source_change;
 use std::fs;
@@ -57,6 +58,31 @@ fn open_file_is_a_holder() {
 
 #[cfg(unix)]
 #[test]
+fn open_file_under_root_with_cwd_outside_is_a_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("wt");
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let file = root.join("build/out.bin");
+    fs::write(&file, "x").unwrap();
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(&elsewhere)
+        .stdin(fs::File::open(&file).unwrap())
+        .spawn()
+        .unwrap();
+    let child = Child(child);
+    std::thread::sleep(Duration::from_millis(300));
+    let holders = busy_holders(&root).unwrap();
+    assert!(
+        holders.iter().any(|h| h.pid == child.0.id()),
+        "holders: {holders:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unrelated_process_is_not_a_holder() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("wt");
@@ -112,4 +138,10 @@ fn symlinks_are_not_followed() {
         .unwrap();
     assert_eq!(got, t.max(link_mtime));
     assert_ne!(got, later);
+}
+
+#[test]
+fn missing_root_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(last_source_change(&tmp.path().join("nope"), &[]).is_err());
 }

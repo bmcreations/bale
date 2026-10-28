@@ -9,6 +9,9 @@ pub struct Holder {
     pub path: PathBuf,
 }
 
+/// On Linux only cwd, open fds and the executable are checked; files held
+/// solely by mmap are not detected. Windows returns empty.
+///
 /// Processes (other than this one) with cwd or an open file under `root`.
 /// Windows returns empty: busy is detected by the rename in the cold path.
 pub fn busy_holders(root: &Path) -> Result<Vec<Holder>> {
@@ -103,6 +106,14 @@ mod lsof {
             assert_eq!(h[0].command, "sleep");
             assert_eq!(h[0].path, PathBuf::from("/r/app"));
         }
+
+        #[test]
+        fn open_file_with_cwd_outside_root_is_a_holder() {
+            let out = "p20\ncjava\nfcwd\nn/elsewhere\nf5\nn/r/build/out.bin\n";
+            let h = parse(out, Path::new("/r"), 1);
+            assert_eq!(h.len(), 1);
+            assert_eq!(h[0].path, PathBuf::from("/r/build/out.bin"));
+        }
     }
 }
 
@@ -114,7 +125,9 @@ mod linux {
     use std::io::ErrorKind;
 
     fn skippable(e: &std::io::Error) -> bool {
+        // ESRCH (process gone) surfaces as NotFound; some kernels report it raw.
         matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound)
+            || e.raw_os_error() == Some(3)
     }
 
     pub fn holders(root: &Path) -> Result<Vec<Holder>> {
@@ -124,7 +137,11 @@ mod linux {
         let own = std::process::id();
         let mut result = Vec::new();
         for entry in fs::read_dir("/proc").context("reading /proc")? {
-            let Ok(entry) = entry else { continue };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) if skippable(&e) => continue,
+                Err(e) => return Err(e).context("reading /proc entry"),
+            };
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -145,11 +162,19 @@ mod linux {
         Ok(result)
     }
 
+    /// First of cwd, exe, or an open fd that resolves under `root`.
     fn first_match(proc_dir: &Path, root: &Path) -> Result<Option<PathBuf>> {
-        let mut links = Vec::new();
-        links.push(proc_dir.join("cwd"));
+        let mut links = vec![proc_dir.join("cwd"), proc_dir.join("exe")];
         match fs::read_dir(proc_dir.join("fd")) {
-            Ok(rd) => links.extend(rd.filter_map(|e| e.ok()).map(|e| e.path())),
+            Ok(rd) => {
+                for e in rd {
+                    match e {
+                        Ok(e) => links.push(e.path()),
+                        Err(e) if skippable(&e) => {}
+                        Err(e) => return Err(e).context("reading /proc fd entry"),
+                    }
+                }
+            }
             Err(e) if skippable(&e) => {}
             Err(e) => return Err(e).context("reading /proc fd dir"),
         }
@@ -157,7 +182,7 @@ mod linux {
             let target = match fs::read_link(&link) {
                 Ok(t) => t,
                 Err(e) if skippable(&e) => continue,
-                Err(_) => continue,
+                Err(e) => return Err(e).with_context(|| format!("reading {}", link.display())),
             };
             // Deleted files read as "<path> (deleted)"; canonicalize fails, use raw target.
             let target = target.canonicalize().unwrap_or(target);
