@@ -55,6 +55,10 @@ fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str> {
 /// branch name `worktree-<name>`, or with plain git where Claude Code would
 /// have put it when bale fails, and prints only its absolute path on stdout.
 pub fn create(home: &BaleHome) -> Result<ExitCode> {
+    crate::as_hook(Tool::Claude, || create_untraced(home))
+}
+
+fn create_untraced(home: &BaleHome) -> Result<ExitCode> {
     let payload = read_payload()?;
     let name = field(&payload, "name")?;
     let cwd = PathBuf::from(field(&payload, "cwd")?);

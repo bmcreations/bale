@@ -31,6 +31,12 @@ pub enum Outcome {
 /// record's path, branch, head and admin dir (keeping its level). Errors for
 /// the main checkout and for paths that are not a worktree of their repo.
 pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
+    crate::trace::op(home, "adopt", None, || register_untraced(home, path))
+}
+
+/// `register` without an `op` line, for operations that register on the
+/// way (`resolve`, `new`) and are traced as themselves.
+pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> {
     let root = crate::paths::canonicalize(path)
         .with_context(|| format!("resolving {}", path.display()))?;
     // Without its own gitfile, git here climbs to an enclosing repo and the
@@ -130,7 +136,7 @@ pub fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
     if fs::symlink_metadata(path).is_ok() {
         match by_path {
             Some(r) if !matches!(r.level, Level::Hot | Level::Baled) => return Ok(r.id),
-            _ => return Ok(register(home, path)?.id),
+            _ => return Ok(register_untraced(home, path)?.id),
         }
     }
     if let Some(r) = registry.get(arg)? {
@@ -166,10 +172,12 @@ pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
 
 /// `up`, also naming the regenerable-named dirs it kept.
 pub fn up_report(home: &BaleHome, id: &str) -> Result<UpReport> {
-    let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
-    };
-    up_locked_report(home, id, &[])
+    crate::trace::op(home, "up", Some(id), || {
+        let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
+            return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
+        };
+        up_locked_report(home, id, &[])
+    })
 }
 
 /// `up` for a caller that already holds the `WorkspaceLock` for `id`.

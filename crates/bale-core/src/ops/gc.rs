@@ -36,6 +36,13 @@ pub struct GcReport {
 /// another bale process holds, and records whose repo cannot be probed are
 /// left alone. With `dry_run`, reports the same lists and changes nothing.
 pub fn gc(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
+    if dry_run {
+        return gc_untraced(home, true);
+    }
+    crate::trace::op(home, "gc", None, || gc_untraced(home, false))
+}
+
+fn gc_untraced(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
     let registry = Registry::open(home.clone());
     let mut report = GcReport::default();
     for (stem, read) in registry.all_lenient()? {

@@ -44,6 +44,10 @@ impl OpenReport {
 /// `Opening` by a crash resumes when the path holds nothing but what open
 /// itself writes.
 pub fn open(home: &BaleHome, id: &str) -> Result<OpenReport> {
+    crate::trace::op(home, "open", Some(id), || open_untraced(home, id))
+}
+
+fn open_untraced(home: &BaleHome, id: &str) -> Result<OpenReport> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(OpenReport::plain(Outcome::Skipped("locked".into())));
     };

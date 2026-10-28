@@ -33,10 +33,12 @@ fn workspace_path() -> Result<PathBuf> {
 
 /// setup: registers the workspace with bale. Never fails Conductor's setup.
 pub fn setup(home: &BaleHome) -> ExitCode {
-    match workspace_path().and_then(|path| register(home, &path)) {
-        Ok(r) => println!("bale: {}: {}", r.id, r.level.name()),
-        Err(e) => eprintln!("bale: conductor setup: {e:#}"),
-    }
+    crate::as_hook(Tool::Conductor, || {
+        match workspace_path().and_then(|path| register(home, &path)) {
+            Ok(r) => println!("bale: {}: {}", r.id, r.level.name()),
+            Err(e) => eprintln!("bale: conductor setup: {e:#}"),
+        }
+    });
     ExitCode::SUCCESS
 }
 

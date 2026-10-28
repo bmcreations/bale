@@ -70,6 +70,17 @@ pub fn cold_if_clean(home: &BaleHome, id: &str) -> Result<Outcome> {
 }
 
 fn cold_with(home: &BaleHome, id: &str, require_clean: bool, ignore: &[u32]) -> Result<Outcome> {
+    crate::trace::op(home, "cold", Some(id), || {
+        cold_untraced(home, id, require_clean, ignore)
+    })
+}
+
+fn cold_untraced(
+    home: &BaleHome,
+    id: &str,
+    require_clean: bool,
+    ignore: &[u32],
+) -> Result<Outcome> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(Outcome::Skipped("locked".into()));
     };

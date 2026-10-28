@@ -194,6 +194,11 @@ pub(crate) fn free_space(path: &Path) -> Result<u64> {
     fs4::available_space(path).with_context(|| format!("reading free space on {}", path.display()))
 }
 
+/// The size of the volume holding `path`.
+pub(crate) fn total_space(path: &Path) -> Result<u64> {
+    fs4::total_space(path).with_context(|| format!("reading total space on {}", path.display()))
+}
+
 pub(crate) fn denied(rel: &Path, regen: &[PathBuf], deny: &[String]) -> bool {
     regen.iter().any(|r| rel.starts_with(r))
         || rel.components().any(|c| {

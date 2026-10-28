@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::config::load_config;
 use crate::git::{self, Git};
-use crate::ops::up::register;
+use crate::ops::up::register_untraced;
 use crate::registry::{workspace_id, Record, Registry};
 use crate::BaleHome;
 
@@ -25,6 +25,10 @@ pub fn new_workspace(
     name: &str,
     branch: Option<&str>,
 ) -> Result<Record> {
+    crate::trace::op(home, "new", None, || new_untraced(home, repo, name, branch))
+}
+
+fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) -> Result<Record> {
     check_name(name)?;
     let branch = branch.unwrap_or(name);
     if branch.starts_with('-') {
@@ -63,7 +67,7 @@ pub fn new_workspace(
         }
         return Err(e);
     }
-    register(home, &path)
+    register_untraced(home, &path)
         .with_context(|| format!("{} was created but could not be registered", path.display()))
 }
 

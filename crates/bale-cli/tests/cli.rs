@@ -1775,3 +1775,54 @@ fn ls_finds_a_title_for_a_tree_without_origin_and_honors_claude_config_dir() {
     let out = env.bale_env(&env.repo, &["ls"], &[("CLAUDE_CONFIG_DIR", &config)]);
     assert!(stdout(&out).contains("Named elsewhere"), "{}", stdout(&out));
 }
+
+#[test]
+fn trace_path_prints_the_trace_dir() {
+    let env = Env::new();
+    let out = env.bale(&env.repo, &["trace", "path"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).trim_end(),
+        env.bale_home().join("trace").to_string_lossy()
+    );
+}
+
+#[test]
+fn sweep_succeeds_with_one_warning_when_the_trace_cannot_be_written() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Adopting already traced; a regular file in place of the dir makes
+    // every later write fail.
+    fs::remove_dir_all(env.bale_home().join("trace")).unwrap();
+    fs::write(env.bale_home().join("trace"), "not a dir").unwrap();
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("nothing to do"), "{}", stdout(&out));
+    let warnings = stderr(&out).matches("usage trace").count();
+    assert_eq!(warnings, 1, "{}", stderr(&out));
+}
+
+#[test]
+fn cli_ops_are_traced_with_the_cli_trigger() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let out = env.bale(&env.repo, &["up", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let dir = env.bale_home().join("trace");
+    let text: String = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect();
+    let ops: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["kind"] == "op" && v["op"] == "up")
+        .collect();
+    assert_eq!(ops.len(), 1, "{text}");
+    assert_eq!(ops[0]["trigger"], "cli");
+    assert_eq!(ops[0]["outcome"], "ok");
+}

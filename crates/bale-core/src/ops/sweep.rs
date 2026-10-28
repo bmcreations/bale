@@ -2,17 +2,22 @@
 //! record is handled on its own; a failure in one becomes that record's row.
 
 use std::fs;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde_json::Map;
 
 use crate::config::{load_config, Config};
+use crate::derived_data::{derived_data_for, is_derived_data_root};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
 use crate::ops::up::{bale_able_from, up_report, Outcome};
+use crate::par::par_map;
 use crate::registry::{Level, Record, Registry};
+use crate::trace::BuildLog;
 use crate::BaleHome;
 
 /// Report text for a record `bale open` left half done; `sweep` puts the
@@ -58,25 +63,187 @@ pub fn decide(
 /// returning one `(id, action, result)` row each; a record file that does
 /// not parse becomes a `Report` row keyed by its file stem. Errs only when
 /// the registry directory cannot be read.
+///
+/// Also appends the run's usage trace (see [`crate::trace`]): a `tree` line
+/// per record, a `build` line per Xcode build log not seen before, and one
+/// `sweep` line; then prunes old trace files. Sizes and build logs are read
+/// before any tree is changed.
 pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
+    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run))
+}
+
+fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
+    let start = Instant::now();
     let records = Registry::open(home.clone()).all_lenient()?;
-    Ok(records
-        .into_iter()
-        .map(|(stem, record)| match record {
+    let measured = par_map(&records, |(_, record)| match record {
+        Ok(r) => measure(home, r),
+        Err(_) => Measured::default(),
+    });
+    let mut rows = Vec::with_capacity(records.len());
+    let mut builds = Vec::new();
+    let mut paths = Vec::new();
+    for ((stem, record), m) in records.into_iter().zip(measured) {
+        match record {
             Ok(record) => {
-                let (action, result) = sweep_one(home, &record, dry_run);
-                (record.id, action, result)
+                let (action, result, edited) = sweep_one(home, &record, dry_run);
+                trace_tree(home, &record, &action, edited, &m);
+                builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
+                paths.push(record.path.clone());
+                rows.push((record.id, action, result));
             }
             Err(e) => {
                 // The row is keyed by the file stem, so the cause alone suffices.
                 let text = format!("corrupt record: {}", e.root_cause());
-                (stem, Action::Report(text.clone()), text)
+                rows.push((stem, Action::Report(text.clone()), text));
             }
-        })
-        .collect())
+        }
+    }
+    let now = SystemTime::now();
+    crate::trace::record_builds(home, &builds, now);
+    let mut fields = Map::new();
+    if dry_run {
+        fields.insert("dry_run".into(), true.into());
+    }
+    fields.insert("volumes".into(), crate::trace::volumes(&paths).into());
+    fields.insert("duration_ms".into(), millis(start.elapsed()).into());
+    crate::trace::emit(home, "sweep", fields);
+    crate::trace::prune(home, now);
+    Ok(rows)
 }
 
-fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String) {
+/// Sizing longer than this for one tree is cut short and recorded as null.
+const SIZING_LIMIT: Duration = Duration::from_secs(30);
+
+/// What sweep reads from a tree before changing anything, for its trace.
+#[derive(Default)]
+struct Measured {
+    /// `(regen_bytes, tree_bytes)`; `None` for trees not on disk, after an
+    /// error, or when cut short.
+    sizes: Option<(u64, u64)>,
+    truncated: bool,
+    sizing_ms: Option<u64>,
+    builds: Vec<BuildLog>,
+}
+
+/// Sizes a `Hot` or `Baled` tree and reads its Xcode build logs. Errors
+/// warn once (via the trace) and leave the fields empty.
+fn measure(home: &BaleHome, record: &Record) -> Measured {
+    let mut m = Measured::default();
+    if !matches!(record.level, Level::Hot | Level::Baled) {
+        return m;
+    }
+    let start = Instant::now();
+    let root = match crate::paths::canonicalize(&record.path) {
+        Ok(root) => root,
+        Err(_) => return m,
+    };
+    let regen =
+        load_config(home, Some(&root)).map(|cfg| regenerable_dirs(&root, &detect(&root), &cfg));
+    match regen {
+        Ok(regen) => {
+            match bale_able_from(&root, regen.clone()) {
+                Ok((removable, _)) => {
+                    match crate::trace::size_tree(&root, &removable, start + SIZING_LIMIT) {
+                        Some((tree, in_regen)) => m.sizes = Some((in_regen, tree)),
+                        None => m.truncated = true,
+                    }
+                    m.sizing_ms = Some(millis(start.elapsed()));
+                }
+                Err(e) => crate::trace::warn(&e),
+            }
+            m.builds = build_logs_for(&root, &regen);
+        }
+        Err(e) => crate::trace::warn(&e),
+    }
+    m
+}
+
+/// The build logs of every Xcode DerivedData root that belongs to the tree:
+/// the in-tree ones among `regen` and the global ones whose `WorkspacePath`
+/// lies in it.
+fn build_logs_for(root: &Path, regen: &[PathBuf]) -> Vec<BuildLog> {
+    let mut roots: Vec<PathBuf> = regen
+        .iter()
+        .filter(|d| is_derived_data_root(d))
+        .cloned()
+        .collect();
+    if let Some(home_dir) = dirs::home_dir() {
+        let global = home_dir.join("Library/Developer/Xcode/DerivedData");
+        roots.extend(derived_data_for(root, &global));
+    }
+    let mut out = Vec::new();
+    for dd in roots {
+        match crate::trace::build_logs(&dd) {
+            Ok(logs) => out.extend(logs),
+            Err(e) => crate::trace::warn(&e),
+        }
+    }
+    out
+}
+
+/// Appends the record's `tree` line.
+fn trace_tree(
+    home: &BaleHome,
+    record: &Record,
+    action: &Action,
+    edited: Option<SystemTime>,
+    m: &Measured,
+) {
+    let (name, reason) = match action {
+        Action::Keep if record.pinned => ("skip", Some("pinned".to_string())),
+        Action::Keep => ("keep", None),
+        Action::Up => ("up", None),
+        Action::Cold => ("cold", None),
+        // Probe errors name paths inside the tree; the trace keeps none.
+        Action::Report(text) if text == "missing" || text.starts_with("interrupted") => {
+            ("report", Some(text.replace("<id>", &record.id)))
+        }
+        Action::Report(_) => ("report", Some("probe failed".to_string())),
+    };
+    let mut f = Map::new();
+    f.insert("id".into(), record.id.clone().into());
+    f.insert("path".into(), record.path.to_string_lossy().into());
+    f.insert(
+        "repo".into(),
+        record.repo_common_dir.to_string_lossy().into(),
+    );
+    f.insert("level".into(), record.level.name().into());
+    f.insert("pinned".into(), record.pinned.into());
+    let origin = record.origin.as_ref();
+    f.insert("origin_tool".into(), origin.map(|o| o.tool.clone()).into());
+    f.insert(
+        "session_id".into(),
+        origin.map(|o| o.session.clone()).into(),
+    );
+    f.insert(
+        "last_source_edit".into(),
+        edited.map(crate::trace::rfc3339).into(),
+    );
+    f.insert("regen_bytes".into(), m.sizes.map(|s| s.0).into());
+    f.insert("tree_bytes".into(), m.sizes.map(|s| s.1).into());
+    if m.truncated {
+        f.insert("sizing_truncated".into(), true.into());
+    }
+    f.insert("sizing_ms".into(), m.sizing_ms.into());
+    f.insert("action".into(), name.into());
+    if let Some(reason) = reason {
+        f.insert("reason".into(), crate::trace::clip(&reason).into());
+    }
+    crate::trace::emit(home, "tree", f);
+}
+
+fn millis(d: Duration) -> u64 {
+    d.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Decides and applies the policy for one record: `(action, result, last
+/// source edit)`, the last as sweep's idle logic saw it (`None` when it was
+/// not probed or no file remains).
+fn sweep_one(
+    home: &BaleHome,
+    record: &Record,
+    dry_run: bool,
+) -> (Action, String, Option<SystemTime>) {
     // A pinned tree is left to its owner, even mid-transition. An
     // interrupted transition still gets a hint, since that changes nothing:
     // open's own, or for up and cold the command that finishes it.
@@ -85,21 +252,21 @@ fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String
             Level::Opening => None,
             Level::Baling => Some(("baling", "up")),
             Level::Cooling => Some(("going cold", "cold")),
-            _ => return (Action::Keep, "pinned".into()),
+            _ => return (Action::Keep, "pinned".into(), None),
         };
         if let Some((doing, cmd)) = stranded {
             let text = format!(
                 "interrupted while {doing}; pinned, so sweep leaves it: run `bale {cmd} {}`",
                 record.id
             );
-            return (Action::Report(text.clone()), text);
+            return (Action::Report(text.clone()), text, None);
         }
     }
-    let action = match plan(home, record) {
-        Ok(action) => action,
+    let (action, edited) = match plan(home, record) {
+        Ok(planned) => planned,
         Err(e) => {
             let text = format!("{e:#}");
-            return (Action::Report(text.clone()), text);
+            return (Action::Report(text.clone()), text, None);
         }
     };
     let result = match &action {
@@ -119,7 +286,7 @@ fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String
         },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
     };
-    (action, result)
+    (action, result, edited)
 }
 
 /// The action fixed by the level alone, without probes or config.
@@ -137,16 +304,16 @@ fn level_action(level: Level) -> Option<Action> {
 /// become `Report` rows and can never lead to `Cold`. Level-only actions
 /// load no config, so a broken config cannot block a resume or the
 /// interrupted-open hint.
-fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
+fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)> {
     // Cooling may legitimately have no checkout; cold's recovery handles it.
     if matches!(record.level, Level::Cold | Level::Opening | Level::Cooling) {
-        return Ok(level_action(record.level).expect("level-only action"));
+        return Ok((level_action(record.level).expect("level-only action"), None));
     }
     if fs::symlink_metadata(&record.path).is_err() {
-        return Ok(Action::Report("missing".into()));
+        return Ok((Action::Report("missing".into()), None));
     }
     if let Some(action) = level_action(record.level) {
-        return Ok(action);
+        return Ok((action, None));
     }
     let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
@@ -163,7 +330,11 @@ fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
         && !bale_able_from(&root, regen)?.0.is_empty();
-    Ok(decide(record.level, idle_for, dirty, has_regen, &cfg))
+    let edited = (changed > UNIX_EPOCH).then_some(changed);
+    Ok((
+        decide(record.level, idle_for, dirty, has_regen, &cfg),
+        edited,
+    ))
 }
 
 /// `now` minus the later of the two times; zero when that lies in the future.

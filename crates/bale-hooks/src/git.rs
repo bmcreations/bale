@@ -21,6 +21,12 @@ pub const GIT_HOOK_MARKER: &str = "# Installed by `bale install --git-hook`.";
 /// post-checkout: registers the cwd when git just created it as a linked
 /// worktree (`prev` all zeros, branch checkout). Never fails the checkout.
 pub fn post_checkout(home: &BaleHome, prev: &str, _new: &str, flag: &str) -> ExitCode {
+    crate::as_hook(crate::Tool::Git, || {
+        post_checkout_untraced(home, prev, flag)
+    })
+}
+
+fn post_checkout_untraced(home: &BaleHome, prev: &str, flag: &str) -> ExitCode {
     if flag == "1" && !prev.is_empty() && prev.chars().all(|c| c == '0') {
         let result = std::env::current_dir()
             .context("reading the current directory")

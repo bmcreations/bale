@@ -13,6 +13,7 @@ use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
+use bale_core::par::par_map;
 use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
@@ -127,6 +128,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The local usage trace bale records for benchmarking.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Print the directory the trace is kept in.
+    Path,
 }
 
 #[derive(Subcommand)]
@@ -177,7 +189,15 @@ enum GitHook {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = BaleHome::from_env();
-    let result = match cli.command {
+    let result = bale_core::trace::with_trigger("cli", || run(cli.command, home));
+    result.unwrap_or_else(|e| {
+        eprintln!("bale: {e:#}");
+        ExitCode::from(1)
+    })
+}
+
+fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
+    match command {
         Command::Up { target } => resolve(&home, &target).and_then(|id| {
             let baled = up_report(&home, &id)?;
             let code = report(&id, baled.outcome);
@@ -265,11 +285,13 @@ fn main() -> ExitCode {
         Command::Unpin { target } => cmd_pin(&home, &target, false),
         Command::Show { target } => cmd_show(&home, &target).map(|()| ExitCode::SUCCESS),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
-    };
-    result.unwrap_or_else(|e| {
-        eprintln!("bale: {e:#}");
-        ExitCode::from(1)
-    })
+        Command::Trace {
+            command: TraceCommand::Path,
+        } => {
+            println!("{}", home.trace_dir().display());
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 /// Why `up` left a regenerable-named dir in place.
@@ -536,37 +558,6 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
 
 /// Widest `SESSION` cell in `bale ls`, in chars.
 const SESSION_WIDTH: usize = 50;
-
-/// Threads `bale ls` spreads per-tree work over: each tree costs file reads
-/// and git processes, which wait on I/O rather than CPU.
-const LS_THREADS: usize = 8;
-
-/// `f` over `items` on up to [`LS_THREADS`] threads, results in input order.
-fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..LS_THREADS.min(items.len()))
-            .map(|_| {
-                s.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(item) = items.get(i) else { break };
-                        done.push((i, f(item)));
-                    }
-                    done
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().expect("ls worker panicked"))
-            .collect()
-    });
-    out.sort_by_key(|(i, _)| *i);
-    out.into_iter().map(|(_, r)| r).collect()
-}
 
 /// What `bale ls` names a tree's session: its title when known, else the
 /// newest commit subject, else `-`. A live tree costs one or two git
