@@ -145,6 +145,10 @@ impl Plan {
                     if let (Some(_), Some(backup)) = (before, backup) {
                         println!("{}", reformat_note(path, backup));
                         if fs::symlink_metadata(backup).is_err() {
+                            if let Some(dir) = backup.parent() {
+                                fs::create_dir_all(dir)
+                                    .with_context(|| format!("creating {}", dir.display()))?;
+                            }
                             fs::copy(path, backup)
                                 .with_context(|| format!("backing up {}", path.display()))?;
                         }
@@ -194,8 +198,27 @@ impl Plan {
     }
 }
 
-/// Where a JSON config's original is kept: `<name>.bak-bale` beside `path`.
-pub(crate) fn backup_path(path: &Path) -> PathBuf {
+/// Where a JSON config's original is kept: in `backups` (bale's
+/// `$BALE_HOME/backups`), named for `path`'s whole absolute path so two
+/// repos' files of the same name keep separate backups.
+pub(crate) fn backup_path(backups: &Path, path: &Path) -> PathBuf {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let name: String = path
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    backups.join(format!("{name}.bak-bale"))
+}
+
+/// Where installs before backups moved to `$BALE_HOME` kept them: beside `path`.
+fn old_backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".bak-bale");
     path.with_file_name(name)
@@ -232,6 +255,7 @@ pub(crate) fn read_config(path: &Path) -> Result<Option<(String, fs::Permissions
 /// delete the file when nothing is left, else rewrite it, restoring the
 /// install's backup byte for byte when it holds the same JSON.
 pub(crate) fn json_uninstall_steps(
+    backups: &Path,
     path: &Path,
     before: String,
     mode: fs::Permissions,
@@ -240,12 +264,15 @@ pub(crate) fn json_uninstall_steps(
     if root.as_object().is_some_and(|o| o.is_empty()) {
         return Ok(vec![Step::Remove(path.to_path_buf())]);
     }
-    let original = fs::read_to_string(backup_path(path)).ok().filter(|text| {
-        serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .as_ref()
-            == Some(root)
-    });
+    let original = [backup_path(backups, path), old_backup_path(path)]
+        .iter()
+        .find_map(|b| fs::read_to_string(b).ok())
+        .filter(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .as_ref()
+                == Some(root)
+        });
     let after = match original {
         Some(text) => text,
         None => serde_json::to_string_pretty(root)? + "\n",
@@ -415,10 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn backup_sits_beside_the_file() {
+    fn backup_is_named_for_the_whole_path() {
+        let b = Path::new("/b/backups");
         assert_eq!(
-            backup_path(Path::new("/h/.claude/settings.json")),
-            Path::new("/h/.claude/settings.json.bak-bale")
+            backup_path(b, Path::new("/r1/.cursor/worktrees.json")),
+            b.join("-r1-.cursor-worktrees.json.bak-bale")
+        );
+        assert_ne!(
+            backup_path(b, Path::new("/r1/.cursor/worktrees.json")),
+            backup_path(b, Path::new("/r2/.cursor/worktrees.json"))
+        );
+        // A relative `--repo` is named for where it is, not how it was typed.
+        let rel = Path::new(".cursor/worktrees.json");
+        assert_eq!(
+            backup_path(b, rel),
+            backup_path(b, &std::env::current_dir().unwrap().join(rel))
         );
     }
 }

@@ -547,8 +547,10 @@ fn claude_hooks_install_is_idempotent_and_keeps_existing() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&path).unwrap(), first);
 
-    let backup = path.with_file_name("settings.json.bak-bale");
-    assert_eq!(fs::read_to_string(backup).unwrap(), SETTINGS);
+    assert!(!path.with_file_name("settings.json.bak-bale").exists());
+    let backups = backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), SETTINGS);
 
     let v: Value = serde_json::from_str(&first).unwrap();
     let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
@@ -760,6 +762,7 @@ fn claude_hooks_install_creates_missing_settings_without_backup() {
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(v["hooks"]["WorktreeCreate"].is_array(), "{v}");
     assert!(!path.with_file_name("settings.json.bak-bale").exists());
+    assert!(backups(&env).is_empty());
 }
 
 #[test]
@@ -773,6 +776,7 @@ fn claude_hooks_install_refuses_other_worktree_hook() {
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(&path).unwrap(), other);
     assert!(!path.with_file_name("settings.json.bak-bale").exists());
+    assert!(backups(&env).is_empty());
 }
 
 #[test]
@@ -1040,8 +1044,8 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
     let path = settings_path(&env);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let wrapped = r#"{"hooks":{
-      "WorktreeCreate":[{"hooks":[{"type":"command","command":"env BALE_HOME=/x '/old/bale' hook claude-worktree-create"}]}],
-      "WorktreeRemove":[{"hooks":[{"type":"command","command":"nice '/old/bale' hook claude-worktree-remove"}]}]}}"#;
+      "WorktreeCreate":[{"hooks":[{"type":"command","command":"env BALE_HOME=/x '/old/bale' hook claude create"}]}],
+      "WorktreeRemove":[{"hooks":[{"type":"command","command":"nice '/old/bale' hook claude remove"}]}]}}"#;
     fs::write(&path, wrapped).unwrap();
     let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -1049,6 +1053,31 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
     let text = stdout(&out);
     assert!(text.contains("left unchanged"), "{text}");
     assert!(text.contains("nice '/old/bale'"), "{text}");
+}
+
+#[test]
+fn claude_hooks_install_rewrites_wrapped_old_form_entries() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let wrapped = r#"{"hooks":{
+      "WorktreeCreate":[{"hooks":[{"type":"command","command":"env BALE_HOME=/x '/old/bale' hook claude-worktree-create"}]}],
+      "WorktreeRemove":[{"hooks":[{"type":"command","command":"nice '/old/bale' hook claude-worktree-remove"}]}]}}"#;
+    fs::write(&path, wrapped).unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("stale"), "{text}");
+    assert!(!text.contains("already installed"), "{text}");
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"],
+        "env BALE_HOME=/x '/old/bale' hook claude create"
+    );
+    assert_eq!(
+        v["hooks"]["WorktreeRemove"][0]["hooks"][0]["command"],
+        "nice '/old/bale' hook claude remove"
+    );
 }
 
 #[test]
@@ -2035,7 +2064,50 @@ fn install_cursor_appends_to_existing_array() {
     );
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     assert_eq!(keys, ["zeta", "setup-worktree", "alpha"]);
-    assert!(path.with_file_name("worktrees.json.bak-bale").exists());
+    // The backup sits with bale's state, not untracked in the repo.
+    assert!(!path.with_file_name("worktrees.json.bak-bale").exists());
+    let backups = backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        fs::read_to_string(&backups[0]).unwrap(),
+        r#"{"zeta":1,"setup-worktree":["npm install"],"alpha":2}"#
+    );
+    assert!(
+        stdout(&out).contains(&backups[0].display().to_string()),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn install_cursor_finds_bale_in_any_setup_key_by_its_words() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // The OS key is the target; bale already runs from the generic key.
+    let os = if cfg!(windows) {
+        "setup-worktree-windows"
+    } else {
+        "setup-worktree-unix"
+    };
+    let text =
+        format!(r#"{{"{os}":["npm i"],"setup-worktree":["'/old/bale' hook cursor setup"]}}"#);
+    fs::write(&path, &text).unwrap();
+    let out = install(&env, "cursor", true);
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+
+    // Words that only look like bale's in a string are not bale's entry.
+    let text = r#"{"setup-worktree":["echo ' hook cursor setup'"]}"#;
+    fs::write(&path, text).unwrap();
+    install(&env, "cursor", true);
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let cmds = v["setup-worktree"].as_array().unwrap();
+    assert_eq!(cmds.len(), 2, "{v}");
+    assert!(
+        cmds[1].as_str().unwrap().ends_with("' hook cursor setup"),
+        "{v}"
+    );
 }
 
 #[test]
@@ -2143,6 +2215,89 @@ fn codex_setup_resolves_relative_path_arg() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(env.is_registered(&wt), "{}", stdout(&out));
     assert_eq!(json_record(&env, &wt)["origin"]["tool"], "codex");
+}
+
+/// The backups bale keeps under `$BALE_HOME/backups`.
+fn backups(env: &Env) -> Vec<PathBuf> {
+    let dir = env.bale_home().join("backups");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    listing(&dir)
+}
+
+#[test]
+fn install_conductor_repoints_bales_own_chained_command() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // As an install from /old/bale wrote them.
+    fs::write(
+        &path,
+        "[scripts]\n\
+         setup = \"( npm i # c\\n) && '/old/bale' hook conductor setup\" # keep\n\
+         archive = \"'/old/bale' hook conductor archive\"\n",
+    )
+    .unwrap();
+    let out = install(&env, "conductor", true);
+    assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!(
+            "[scripts]\n\
+             setup = \"\"\"\n( npm i # c\n) && '{exe}' hook conductor setup\"\"\" # keep\n\
+             archive = \"'{exe}' hook conductor archive\"\n"
+        )
+    );
+}
+
+#[test]
+fn install_claude_notes_that_repo_is_ignored() {
+    let env = Env::new();
+    let repo = env.repo.to_str().unwrap();
+    for cmd in ["install", "uninstall"] {
+        let out = env.bale(
+            &env.repo,
+            &[cmd, "--hooks", "claude", "--repo", repo, "--print-only"],
+            None,
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            stdout(&out).contains("--repo is ignored"),
+            "{cmd}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
+fn hooks_list_is_deduplicated() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "claude,claude", "--print-only"],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let update = format!("update {}:", path.display());
+    assert_eq!(stdout(&out).matches(&update).count(), 1, "{}", stdout(&out));
+    install(&env, "claude", false);
+    let out = env.bale(
+        &env.repo,
+        &["uninstall", "--hooks", "claude,claude", "--print-only"],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out)
+            .matches(&format!("rm {}", path.display()))
+            .count(),
+        1,
+        "{}",
+        stdout(&out)
+    );
 }
 
 /// `bale uninstall --hooks <tool> [--repo <repo>]`.

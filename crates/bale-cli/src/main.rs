@@ -317,7 +317,8 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             hooks,
             repo,
             print_only,
-        } => install::plan(&hooks, repo.as_deref()).and_then(|plan| run_plan(&plan, print_only)),
+        } => install::plan(&hooks, repo.as_deref(), &home)
+            .and_then(|plan| run_plan(&plan, print_only)),
         Command::Uninstall {
             hooks,
             repo,
@@ -686,6 +687,7 @@ fn show_text(r: &Record, title: Option<String>) -> String {
     line("level:", r.level.name());
     line("pinned:", if r.pinned { "yes" } else { "no" });
     match &r.origin {
+        Some(o) if o.session.is_empty() => line("origin:", &o.tool),
         Some(o) => line("origin:", &format!("{} session {}", o.tool, o.session)),
         None => line("origin:", "unknown"),
     }
@@ -767,6 +769,33 @@ fn ago(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_omits_an_empty_session() {
+        let origin = |session: &str| bale_core::registry::Origin {
+            tool: "cursor".into(),
+            session: session.into(),
+            title: None,
+        };
+        let mut r = Record {
+            id: "0123456789ab".into(),
+            repo_common_dir: "/nowhere/.git".into(),
+            path: "/nowhere/wt".into(),
+            admin_dir: "/nowhere/.git/worktrees/wt".into(),
+            branch: None,
+            head: String::new(),
+            level: bale_core::registry::Level::Cold,
+            last_activity: std::time::SystemTime::UNIX_EPOCH,
+            note: None,
+            trash: Vec::new(),
+            origin: Some(origin("")),
+            pinned: false,
+            scope: None,
+        };
+        assert!(show_text(&r, None).contains("origin:   cursor\n"));
+        r.origin = Some(origin("s1"));
+        assert!(show_text(&r, None).contains("origin:   cursor session s1\n"));
+    }
 
     #[test]
     fn busy_report_without_holders_says_the_tree_changed() {

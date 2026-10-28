@@ -88,12 +88,12 @@ fn target_key(obj: &Map<String, Value>, windows: bool) -> &'static str {
 }
 
 /// Appends bale's setup command to `<repo>/.cursor/worktrees.json`, keeping
-/// the other keys and their order.
-pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
-    install_plan_for(repo, exe, cfg!(windows))
+/// the other keys and their order; the original is backed up in `backups`.
+pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
+    install_plan_for(repo, exe, backups, cfg!(windows))
 }
 
-fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
+fn install_plan_for(repo: &Path, exe: &Path, backups: &Path, windows: bool) -> Result<Plan> {
     let path = repo.join(".cursor").join("worktrees.json");
     let want = hook_command(exe, windows);
     let meta = match fs::symlink_metadata(&path) {
@@ -124,6 +124,34 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
         .as_object_mut()
         .with_context(|| format!("{} is not a JSON object", path.display()))?;
     let key = target_key(obj, windows);
+    // bale's entry, plain or wrapped, in whichever setup key holds it.
+    let existing = SETUP_KEYS.iter().find_map(|&k| {
+        obj.get(k)?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|c| bale_call(c, &HOOK_ARGS).is_some())
+            .map(|c| (k, c.to_string()))
+    });
+    match existing {
+        Some((k, c)) if k == key && c == want => {
+            return Ok(Plan::new(vec![Step::Note(format!(
+                "{}: Cursor hook already installed",
+                display_path(&path)
+            ))]));
+        }
+        Some((k, c)) => {
+            // bale from another path, wrapped by the user, or under a key
+            // Cursor does not run here: never add a second bale call.
+            return Ok(Plan::new(vec![Step::Note(format!(
+                "note: left unchanged in {}: {k} entry `{c}` already runs bale; edit \
+                 it by hand to use {} under {key}",
+                display_path(&path),
+                display_path(exe)
+            ))]));
+        }
+        None => {}
+    }
     let commands = obj
         .entry(key)
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -135,30 +163,7 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
                 path.display()
             )
         })?;
-
-    let existing = commands
-        .iter()
-        .filter_map(Value::as_str)
-        .find(|c| c.contains(" hook cursor setup"));
-    match existing {
-        Some(c) if c == want => {
-            return Ok(Plan::new(vec![Step::Note(format!(
-                "{}: Cursor hook already installed",
-                display_path(&path)
-            ))]));
-        }
-        Some(c) => {
-            // bale from another path, or wrapped by the user: never add a
-            // second bale call.
-            return Ok(Plan::new(vec![Step::Note(format!(
-                "note: left unchanged in {}: {key} entry `{c}` already runs bale; edit \
-                 it by hand to use {}",
-                display_path(&path),
-                display_path(exe)
-            ))]));
-        }
-        None => commands.push(Value::String(want)),
-    }
+    commands.push(Value::String(want));
 
     let after = format!("{}\n", serde_json::to_string_pretty(&root)?);
     let dir: PathBuf = path
@@ -172,7 +177,7 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
             before,
             after,
             mode,
-            backup: Some(backup_path(&path)),
+            backup: Some(backup_path(backups, &path)),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Cursor worktree of this \
@@ -197,7 +202,7 @@ const HOOK_ARGS: [&str; 3] = ["hook", "cursor", "setup"];
 /// `<repo>/.cursor/worktrees.json`; an entry the user wrapped around bale
 /// stays. A key emptied by the removal goes, and the file when nothing is
 /// left.
-pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
+pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
     let path = repo.join(".cursor").join("worktrees.json");
     let Some((before, mode)) = read_config(&path)? else {
         return Ok(Plan::new(vec![Step::Note(format!(
@@ -248,7 +253,7 @@ pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
         )));
         return Ok(Plan::new(steps));
     }
-    steps.extend(json_uninstall_steps(&path, before, mode, &root)?);
+    steps.extend(json_uninstall_steps(backups, &path, before, mode, &root)?);
     Ok(Plan::new(steps))
 }
 
@@ -284,7 +289,7 @@ mod tests {
         )
         .unwrap();
         let exe = Path::new("/opt/bale");
-        install_plan_for(dir.path(), exe, true)
+        install_plan_for(dir.path(), exe, &dir.path().join("backups"), true)
             .unwrap()
             .apply()
             .unwrap();
@@ -307,5 +312,11 @@ mod tests {
             hook_command(Path::new(r"C:\Program Files\bale\bale.exe"), true),
             r#""C:\Program Files\bale\bale.exe" hook cursor setup"#
         );
+    }
+
+    #[test]
+    fn windows_entry_is_recognised_as_bales() {
+        let cmd = hook_command(Path::new(r"C:\Program Files\bale\bale.exe"), true);
+        assert_eq!(bale_call(&cmd, &HOOK_ARGS), Some(BaleCall::Plain));
     }
 }

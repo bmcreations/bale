@@ -32,6 +32,7 @@ use bale_core::registry::Origin;
 use bale_core::BaleHome;
 use serde_json::{json, Map, Value};
 
+use crate::cmdline::bale_call;
 use crate::install::{backup_path, json_uninstall_steps, read_config, Plan, Step};
 use crate::{display_path, remove_tree, Tool};
 
@@ -322,9 +323,24 @@ fn hook_tails(kind: &str) -> [String; 2] {
     ]
 }
 
-/// Whether `cmd` runs bale's hook for `kind` in any form, plain or wrapped.
+/// Whether `cmd` runs bale's hook for `kind` in any form, plain or wrapped,
+/// read from the command's words: bale's exe, then `hook claude <kind>` or
+/// the old `hook claude-worktree-<kind>`.
 fn mentions_hook(cmd: &str, kind: &str) -> bool {
-    hook_tails(kind).iter().any(|t| cmd.contains(t.as_str()))
+    let old = format!("claude-worktree-{kind}");
+    bale_call(cmd, &["hook", "claude", kind]).is_some() || bale_call(cmd, &["hook", &old]).is_some()
+}
+
+/// `cmd` with a wrapped call of the old `hook claude-worktree-<kind>` name
+/// renamed to `hook claude <kind>`, the rest of the user's command kept as
+/// written; `None` when `cmd` is not such a call.
+fn renamed_wrapped(cmd: &str, kind: &str) -> Option<String> {
+    let old = format!("claude-worktree-{kind}");
+    bale_call(cmd, &["hook", &old])?;
+    let [new_tail, old_tail] = hook_tails(kind);
+    let at = cmd.rfind(old_tail.as_str())?;
+    let out = format!("{}{new_tail}{}", &cmd[..at], &cmd[at + old_tail.len()..]);
+    bale_call(&out, &["hook", "claude", kind]).map(|_| out)
 }
 
 /// The exe path in `cmd` when `cmd` is exactly bale's own entry for `kind`
@@ -371,7 +387,7 @@ fn hook_group(exe: &Path, kind: &str) -> Value {
 /// entry goes before any user WorktreeRemove hook. A user WorktreeCreate hook
 /// is refused: Claude Code would run both, and two hooks creating the same
 /// worktree conflict.
-pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
+pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
     let path = home.join(".claude").join("settings.json");
     let meta = match fs::symlink_metadata(&path) {
         Ok(m) => Some(m),
@@ -433,18 +449,29 @@ pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
                 continue;
             }
             ours = true;
-            if bale_hook_path(cmd, kind).is_none() {
+            if bale_hook_path(cmd, kind).is_some() {
+                if cmd != want {
+                    // bale's own entry from another binary path or the old
+                    // name: point it here.
+                    h["command"] = Value::String(want.clone());
+                    changed = true;
+                }
+            } else if let Some(renamed) = renamed_wrapped(cmd, kind) {
+                // The user's command around bale, naming bale's old hook:
+                // only bale's words change.
+                notes.push(Step::Note(format!(
+                    "note: rewrote stale {event} hook `{cmd}` in {}",
+                    display_path(&path)
+                )));
+                h["command"] = Value::String(renamed);
+                changed = true;
+            } else {
                 // The user's own command around bale, e.g. `env ... bale hook ...`.
                 notes.push(Step::Note(format!(
                     "note: left unchanged in {}: {event} hook `{cmd}` runs bale but is \
                      not bale's plain entry",
                     display_path(&path)
                 )));
-            } else if cmd != want {
-                // bale's own entry from another binary path or the old name:
-                // point it here.
-                h["command"] = Value::String(want.clone());
-                changed = true;
             }
         }
         if ours {
@@ -476,7 +503,7 @@ pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
                 .to_path_buf(),
         ),
         Step::Settings {
-            backup: Some(backup_path(&path)),
+            backup: Some(backup_path(backups, &path)),
             path,
             before,
             after,
@@ -490,7 +517,7 @@ pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
 /// `<home>/.claude/settings.json`, as install recognises them; a command the
 /// user wrapped around bale stays. Groups, events and `hooks` emptied by the
 /// removal go too, and the file when nothing is left.
-pub fn uninstall_plan(home: &Path) -> Result<Plan> {
+pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
     let path = home.join(".claude").join("settings.json");
     let Some((before, mode)) = read_config(&path)? else {
         return Ok(Plan::new(vec![Step::Note(format!(
@@ -554,7 +581,7 @@ pub fn uninstall_plan(home: &Path) -> Result<Plan> {
         )));
         return Ok(Plan::new(steps));
     }
-    steps.extend(json_uninstall_steps(&path, before, mode, &root)?);
+    steps.extend(json_uninstall_steps(backups, &path, before, mode, &root)?);
     Ok(Plan::new(steps))
 }
 
@@ -610,6 +637,19 @@ mod tests {
         ));
         assert!(mentions_hook("'/x/bale' hook claude create", "create"));
         assert!(!mentions_hook("'/x/bale' hook claude remove", "create"));
+    }
+
+    #[test]
+    fn mentions_hook_reads_the_command_words() {
+        assert!(mentions_hook("nice '/x/bale' hook claude create", "create"));
+        assert!(mentions_hook("env A=1 bale hook claude create", "create"));
+        for not in [
+            "echo ' hook claude create'",
+            "'/x/bale' hook claude creates",
+            "'/x/my-tool' hook claude create",
+        ] {
+            assert!(!mentions_hook(not, "create"), "{not}");
+        }
     }
 
     #[test]

@@ -119,37 +119,44 @@ impl FromStr for Tool {
 
 /// The plan that hooks `tool` up to bale at `exe`. Claude Code's settings
 /// live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
-/// they require; Codex needs neither.
+/// they require; Codex needs neither. A JSON config bale reformats is first
+/// backed up in `backups` (`$BALE_HOME/backups`).
 pub fn install_plan<'a>(
     tool: Tool,
     exe: &Path,
     home: &Path,
     repo: Option<&'a Path>,
+    backups: &Path,
 ) -> Result<Plan> {
     let need = |repo: Option<&'a Path>| {
         repo.with_context(|| format!("--repo is required for {}", tool.name()))
     };
     match tool {
-        Tool::Claude => claude::install_plan(home, exe),
+        Tool::Claude => claude::install_plan(home, exe, backups),
         Tool::Git => git::install_plan(need(repo)?, exe),
         Tool::Conductor => conductor::install_plan(need(repo)?, exe),
-        Tool::Cursor => cursor::install_plan(need(repo)?, exe),
+        Tool::Cursor => cursor::install_plan(need(repo)?, exe, backups),
         Tool::Codex => codex::install_plan(exe),
     }
 }
 
 /// The plan that removes what [`install_plan`] added for `tool`, found the
 /// way install finds it. Arguments as for [`install_plan`].
-pub fn uninstall_plan(tool: Tool, home: &Path, repo: Option<&Path>) -> Result<Plan> {
+pub fn uninstall_plan(
+    tool: Tool,
+    home: &Path,
+    repo: Option<&Path>,
+    backups: &Path,
+) -> Result<Plan> {
     let need = |repo: Option<&'_ Path>| {
         repo.map(Path::to_path_buf)
             .with_context(|| format!("--repo is required for {}", tool.name()))
     };
     match tool {
-        Tool::Claude => claude::uninstall_plan(home),
+        Tool::Claude => claude::uninstall_plan(home, backups),
         Tool::Git => git::uninstall_plan(&need(repo)?),
         Tool::Conductor => conductor::uninstall_plan(&need(repo)?),
-        Tool::Cursor => cursor::uninstall_plan(&need(repo)?),
+        Tool::Cursor => cursor::uninstall_plan(&need(repo)?, backups),
         Tool::Codex => Ok(codex::uninstall_plan()),
     }
 }
@@ -262,7 +269,7 @@ mod tests {
     fn repo_is_required_for_git_conductor_cursor() {
         let p = Path::new("/nowhere");
         for t in [Tool::Git, Tool::Conductor, Tool::Cursor] {
-            let err = install_plan(t, p, p, None).err().unwrap().to_string();
+            let err = install_plan(t, p, p, None, p).err().unwrap().to_string();
             assert_eq!(err, format!("--repo is required for {}", t.name()));
         }
     }
@@ -270,7 +277,7 @@ mod tests {
     #[test]
     fn codex_needs_no_repo() {
         let p = Path::new("/nowhere");
-        assert!(install_plan(Tool::Codex, p, p, None).is_ok());
+        assert!(install_plan(Tool::Codex, p, p, None, p).is_ok());
     }
 
     #[test]

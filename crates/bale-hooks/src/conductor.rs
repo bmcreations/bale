@@ -141,9 +141,27 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
                 if current.contains(&want) {
                     continue;
                 }
-                if current.contains(&format!(" hook conductor {kind}")) {
-                    // bale from another path, or wrapped by the user: never
-                    // chain a second bale call.
+                if let Some((user, bale)) = unchain(kind, current) {
+                    // bale's own command from another exe path: point it
+                    // here, the user's script byte for byte as it was.
+                    let repointed = match user {
+                        Some(_) => {
+                            let at = current.len() - bale.len();
+                            format!("{}{want}", &current[..at])
+                        }
+                        None => want,
+                    };
+                    let decor = value.decor().clone();
+                    *value = Value::from(repointed);
+                    *value.decor_mut() = decor;
+                    changed = true;
+                    continue;
+                }
+                if bale_call(current, &["hook", "conductor", kind]).is_some()
+                    || current.contains(&format!(" hook conductor {kind}"))
+                {
+                    // Wrapped by the user, or in a shape bale did not write:
+                    // never chain a second bale call.
                     notes.push(Step::Note(format!(
                         "note: left unchanged in {}: scripts.{kind} `{current}` already \
                          runs bale; edit it by hand to use {}",

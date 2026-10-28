@@ -16,15 +16,44 @@ const LAUNCHD_LABEL: &str = "dev.bale.sweep";
 /// Builds the whole install. Without hooks it installs the sweep schedule;
 /// otherwise only the listed tools' hooks, each needing `repo` where its
 /// config lives in the repo.
-pub fn plan(hooks: &[Tool], repo: Option<&Path>) -> Result<Plan> {
+pub fn plan(hooks: &[Tool], repo: Option<&Path>, bale: &BaleHome) -> Result<Plan> {
     let exe = bale_exe()?;
     let home = home_dir()?;
     if hooks.is_empty() {
         return schedule_plan(&home, &exe);
     }
+    tools_plan(hooks, repo, |tool| {
+        bale_hooks::install_plan(tool, &exe, &home, repo, &backups_dir(bale))
+    })
+}
+
+/// Where bale keeps the originals of configs it reformats.
+fn backups_dir(bale: &BaleHome) -> PathBuf {
+    bale.0.join("backups")
+}
+
+/// `each` for every tool in `hooks`, once each in first-seen order, noting
+/// that `--repo` means nothing to Claude Code's per-user hooks.
+fn tools_plan(
+    hooks: &[Tool],
+    repo: Option<&Path>,
+    mut each: impl FnMut(Tool) -> Result<Plan>,
+) -> Result<Plan> {
     let mut plan = Plan::default();
+    let mut seen = Vec::new();
     for &tool in hooks {
-        plan.extend(bale_hooks::install_plan(tool, &exe, &home, repo)?);
+        if seen.contains(&tool) {
+            continue;
+        }
+        seen.push(tool);
+        if tool == Tool::Claude && repo.is_some() {
+            plan.extend(Plan::new(vec![Step::Note(
+                "note: Claude Code hooks are per-user (~/.claude/settings.json); --repo is \
+                 ignored for claude"
+                    .to_string(),
+            )]));
+        }
+        plan.extend(each(tool)?);
     }
     Ok(plan)
 }
@@ -38,9 +67,9 @@ pub fn uninstall_plan(hooks: &[Tool], repo: Option<&Path>, bale: &BaleHome) -> R
     if hooks.is_empty() {
         plan.extend(unschedule_plan(&home)?);
     }
-    for &tool in hooks {
-        plan.extend(bale_hooks::uninstall_plan(tool, &home, repo)?);
-    }
+    plan.extend(tools_plan(hooks, repo, |tool| {
+        bale_hooks::uninstall_plan(tool, &home, repo, &backups_dir(bale))
+    })?);
     plan.extend(Plan::new(vec![Step::Note(kept_note(bale)?)]));
     Ok(plan)
 }

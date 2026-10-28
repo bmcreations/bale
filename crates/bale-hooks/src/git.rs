@@ -14,9 +14,11 @@ use crate::display_path;
 use crate::install::{Plan, Step};
 
 /// First line after the shebang of the git hook bale writes; marks it as
-/// ours. It names the old `--git-hook` flag, but hooks already written carry
-/// it, so it stays as the key that recognises them.
-pub const GIT_HOOK_MARKER: &str = "# Installed by `bale install --git-hook`.";
+/// ours.
+pub const GIT_HOOK_MARKER: &str = "# Installed by `bale install --hooks git`.";
+
+/// The marker hooks written before `--hooks` carry; still recognised as bale's.
+const OLD_GIT_HOOK_MARKER: &str = "# Installed by `bale install --git-hook`.";
 
 /// post-checkout: registers the cwd when git just created it as a linked
 /// worktree (`prev` all zeros, branch checkout). Never fails the checkout.
@@ -145,7 +147,9 @@ fn hooks_dir(g: &Git) -> Result<PathBuf> {
 
 /// Whether `script` is a post-checkout hook bale wrote.
 fn is_bale_hook(script: &str) -> bool {
-    script.lines().any(|l| l == GIT_HOOK_MARKER)
+    script
+        .lines()
+        .any(|l| l == GIT_HOOK_MARKER || l == OLD_GIT_HOOK_MARKER)
 }
 
 /// Removes bale's post-checkout hook from `repo`'s hooks dir and moves the
@@ -205,6 +209,23 @@ fn canon_lenient(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_marker_names_the_current_flag_and_old_hooks_still_count() {
+        let s = git_hook_script(Path::new("/opt/bale"));
+        assert_eq!(
+            s.lines().nth(1),
+            Some("# Installed by `bale install --hooks git`.")
+        );
+        assert!(!s.contains("--git-hook"), "{s}");
+        assert!(is_bale_hook(&s));
+        let old = s.replace(
+            "# Installed by `bale install --hooks git`.",
+            "# Installed by `bale install --git-hook`.",
+        );
+        assert!(is_bale_hook(&old));
+        assert!(!is_bale_hook("#!/bin/sh\necho mine\n"));
+    }
 
     #[test]
     fn git_hook_script_runs_bale_once_and_chains() {
