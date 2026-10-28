@@ -1164,7 +1164,14 @@ fn install_hooks_claude_keeps_user_hooks() {
     let v: Value = serde_json::from_str(&first).unwrap();
     let user: Value = serde_json::from_str(USER_HOOKS).unwrap();
     assert_eq!(v["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
-    // bale's archive-side entry runs before the user's.
+    // Claude Code runs matching hooks in parallel, so install says the
+    // user's remove hook races bale's.
+    assert!(
+        stdout(&out).contains("in parallel") && stdout(&out).contains("exit 3"),
+        "{}",
+        stdout(&out)
+    );
+    // bale's entry is listed first; that sets no order.
     let remove = v["hooks"]["WorktreeRemove"].as_array().unwrap();
     assert_eq!(remove.len(), 2, "{v}");
     let bale = remove[0]["hooks"][0]["command"].as_str().unwrap();
@@ -2373,7 +2380,9 @@ fn claude_hooks_follow_claude_config_dir() {
         assert!(out.status.success(), "{cmd}: {}", stderr(&out));
         out
     };
-    run("install");
+    let out = run("install");
+    // No other remove hook, so no note about one.
+    assert!(!stdout(&out).contains("in parallel"), "{}", stdout(&out));
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains(" hook claude remove"), "{text}");
     assert!(!settings_path(&env).exists());

@@ -398,8 +398,9 @@ fn hook_group(exe: &Path, kind: &str) -> Value {
 }
 
 /// Adds bale's WorktreeCreate and WorktreeRemove entries to
-/// Claude Code's user settings.json (see [`settings_location`]), keeping every other hook. bale's remove
-/// entry goes before any user WorktreeRemove hook. A user WorktreeCreate hook
+/// Claude Code's user settings.json (see [`settings_location`]), keeping
+/// every other hook. A user WorktreeRemove hook stays and runs in parallel
+/// with bale's, which install notes. A user WorktreeCreate hook
 /// is refused: Claude Code would run both, and two hooks creating the same
 /// worktree conflict.
 pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
@@ -502,7 +503,18 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 path.display()
             );
         }
-        // Before the user's remove hooks, so bale colds the tree first.
+        if kind == "remove" && !groups.is_empty() {
+            // Claude Code runs an event's matching hooks in parallel, so
+            // where bale's entry sits sets no order.
+            notes.push(Step::Note(format!(
+                "note: {} already has a {event} hook; Claude Code runs it in parallel \
+                 with bale's, and bale reports the tree as busy (exit 3) while that \
+                 hook's process still has the tree open",
+                display_path(&path)
+            )));
+        }
+        // Listed first; Claude Code runs matching hooks in parallel, so this
+        // is layout, not order.
         groups.insert(0, hook_group(exe, kind));
         changed = true;
     }

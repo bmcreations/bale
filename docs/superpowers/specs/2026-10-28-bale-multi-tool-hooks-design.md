@@ -92,7 +92,10 @@ bale install --hooks git --repo <REPO>  # as today
 - **claude create** calls core `new`. No other tool lets a command replace worktree creation.
 - **install** edits keep the commands already in the file and run bale's after them, for setup, or before
   them, for archive. It prints the diff first, and `--print-only` writes nothing. Conductor and Cursor
-  files are usually committed, so the output says so.
+  files are usually committed, so the output says so. Claude Code runs an event's matching hooks in
+  parallel (code.claude.com/docs/en/hooks), so settings.json order sets no order between bale's
+  `WorktreeRemove` entry and a user's; install notes such a hook, and bale exits 3 while that hook's
+  process still has the tree open.
 
 Tools without a remove hook (Cursor, Codex) get adopt on setup, the git hook and the scheduled sweep. An
 idle tree is baled within one sweep interval. No `git` wrapper; the parent spec's reasons stand.
