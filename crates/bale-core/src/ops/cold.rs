@@ -499,14 +499,23 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
-                Ok(match restore_check(&record.id, &trash, wip, &dest, &ex)? {
-                    Verdict::Same(snapshot) if snapshot.changed()?.is_none() => {
-                        record_check(&dest, *snapshot)?;
-                        None
+                let snapshot = match restore_check(&record.id, &trash, wip, &dest, &ex)? {
+                    Verdict::Same(snapshot) => snapshot,
+                    Verdict::Differs(reason) => {
+                        return Ok(Some(Outcome::Skipped(not_restorable(&reason))))
                     }
-                    Verdict::Same(_) => Some(Outcome::Busy(Vec::new())),
-                    Verdict::Differs(reason) => Some(Outcome::Skipped(not_restorable(&reason))),
-                })
+                };
+                // As `finish`: a process that has the tree open may still
+                // write to it.
+                let holders = busy_holders(&trash)?;
+                if !holders.is_empty() {
+                    return Ok(Some(Outcome::Busy(holders)));
+                }
+                if snapshot.changed()?.is_some() {
+                    return Ok(Some(Outcome::Busy(Vec::new())));
+                }
+                record_check(&dest, *snapshot)?;
+                Ok(None)
             });
             match checked {
                 Ok(None) => {}
@@ -2102,6 +2111,54 @@ mod tests {
 
     /// A crash right after the move, with a write that landed before it:
     /// the next run must check the trash, find the write and keep it.
+    /// Recovery checks an unmarked trash for holders before deleting it, as
+    /// `finish` does: a process that has the moved tree open moves it back.
+    #[test]
+    fn recovery_keeps_an_unmarked_trash_a_process_holds() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(after);
+        assert!(crashed.is_err());
+        let trash = trash_siblings(&wt).unwrap();
+        assert_eq!(trash.len(), 1);
+
+        let holder = KillOnDrop(
+            Command::new("sleep")
+                .arg("30")
+                .current_dir(&trash[0])
+                .spawn()
+                .unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let out = cold(&home, &id);
+        drop(holder);
+
+        assert!(
+            matches!(&out, Ok(Outcome::Busy(h)) if !h.is_empty()),
+            "{out:?}"
+        );
+        assert!(wt.join(".gitignore").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+    }
+
     /// A removal that fails partway names the entry it failed on, so the
     /// user can see what blocks it.
     #[cfg(unix)]
