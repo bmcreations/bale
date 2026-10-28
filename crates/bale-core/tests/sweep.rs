@@ -1,6 +1,6 @@
 mod support;
 
-use bale_core::ops::cold::{save_ignored, save_wip};
+use bale_core::ops::cold::{exclusions, save_ignored, save_wip};
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::register;
 use bale_core::registry::{Level, Registry};
@@ -196,7 +196,12 @@ fn cooling_with_checkout_gone_resumes_cold() {
         ],
     );
     save_wip(&wt, &id).unwrap();
-    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    save_ignored(
+        &wt,
+        &fx.home().saved_dir(&id),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap();
     let trash = wt.with_file_name(".bale-trash-wt-123");
     fs::rename(&wt, &trash).unwrap();
     set_level(&fx, &id, Level::Cooling);

@@ -705,3 +705,34 @@ fn cooling_recovery_saves_the_current_branch() {
         "refs/heads/feat-b"
     );
 }
+
+/// up keeps a `build/` holding a tracked file; cold must then save that
+/// dir's ignored files, not skip them for their regenerable name.
+#[test]
+fn ignored_file_in_a_kept_build_dir_survives_cold() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+    fs::write(wt.join(".gitignore"), "*.env\n").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/keep.txt"), "keep\n").unwrap();
+    git(
+        &wt,
+        &["add", "settings.gradle.kts", ".gitignore", "build/keep.txt"],
+    );
+    git(&wt, &["commit", "-m", "keep"]);
+    fs::write(wt.join("build/secret.env"), "SECRET=1\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    open(&fx.home(), &id).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(wt.join("build/keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("build/secret.env")).unwrap(),
+        "SECRET=1\n"
+    );
+}

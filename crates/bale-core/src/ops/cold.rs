@@ -17,7 +17,9 @@ use crate::config::{load_config, Config};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
-use crate::ops::up::{is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX};
+use crate::ops::up::{
+    bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
+};
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
 
@@ -77,7 +79,7 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     if require_clean && git::is_dirty(&root).unwrap_or(true) {
         return Ok(Outcome::Skipped("dirty".into()));
     }
-    if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
+    if let Some(reason) = refusal(&root, &exclusions(home, &root)?)? {
         return Ok(Outcome::Skipped(reason));
     }
     match up_locked(home, id)? {
@@ -97,17 +99,42 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     finish(home, &registry, record, &root)
 }
 
-/// Config `ignored_denylist` plus `regenerable` names for the tree at `root`.
-fn deny_list(home: &BaleHome, root: &Path) -> Result<Vec<String>> {
-    let cfg = load_config(home, Some(root))?;
-    let mut deny = cfg.ignored_denylist_extra;
-    deny.extend(cfg.regenerable_extra);
-    Ok(deny)
+/// What cold leaves out of the ignored-file save for a tree. Capture,
+/// verify and recovery all build it with [`exclusions`], so they can't
+/// disagree about which files belong in the save.
+#[derive(Debug, Clone)]
+pub struct Exclusions {
+    /// Config `ignored_denylist_extra`: an entry without `/` matches any
+    /// path component, one with `/` matches a path prefix.
+    pub deny: Vec<String>,
+    /// The regenerable dirs `up` would remove, relative to the tree root. A
+    /// regenerable-named dir that `up` keeps is not here, so its ignored
+    /// files are saved.
+    pub regen: Vec<PathBuf>,
+    /// Config `regenerable_extra` names, for submodules, which are checked
+    /// by name (see `refusal`).
+    pub regen_extra: Vec<String>,
+}
+
+/// [`Exclusions`] for the tree at `dir`, from the config and what
+/// `bale_able` would remove there now.
+pub fn exclusions(home: &BaleHome, dir: &Path) -> Result<Exclusions> {
+    let cfg = load_config(home, Some(dir))?;
+    let (removable, _) = bale_able_from(dir, regenerable_dirs(dir, &detect(dir), &cfg))?;
+    let regen = removable
+        .iter()
+        .filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf))
+        .collect();
+    Ok(Exclusions {
+        deny: cfg.ignored_denylist_extra,
+        regen,
+        regen_extra: cfg.regenerable_extra,
+    })
 }
 
 /// Why this tree must not go cold, if it must not. The main checkout is an
 /// error; everything else is a skip reason.
-fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
+fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     let info = git::worktrees(root)?
         .into_iter()
         .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
@@ -170,6 +197,9 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
         r#"echo "$displaypath""#,
     ])?;
     let subs: Vec<&str> = subs.lines().filter(|l| !l.is_empty()).collect();
+    // Inside a submodule regenerable output is judged by name: none of it
+    // is saved, and up leaves it in place (root's git can't see into it).
+    let sub_deny: Vec<String> = ex.deny.iter().chain(&ex.regen_extra).cloned().collect();
     let root_regen = if subs.is_empty() {
         Vec::new()
     } else {
@@ -185,7 +215,7 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
         }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
-        let scan = scan_ignored_with(&dir, &submodule_deny(deny, sub), &regen)?;
+        let scan = scan_ignored_with(&dir, &submodule_deny(&sub_deny, sub), &regen)?;
         if !scan.entries.is_empty() || !scan.nested.is_empty() {
             ignored.push(sub);
         }
@@ -239,7 +269,7 @@ fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
             }
         }
     }
-    nested.extend(scan_ignored(root, deny)?.nested);
+    nested.extend(scan_ignored(root, ex)?.nested);
     if !nested.is_empty() {
         return Ok(Some(format!("nested repository: {}", join_paths(&nested))));
     }
@@ -256,14 +286,14 @@ fn finish(
 ) -> Result<Outcome> {
     let id = record.id.clone();
     let dest = home.saved_dir(&id);
-    let prepared = (|| -> Result<(Vec<Holder>, Vec<String>)> {
+    let prepared = (|| -> Result<(Vec<Holder>, Exclusions)> {
         save_wip(root, &id)?;
-        let deny = deny_list(home, root)?;
-        save_ignored(root, &dest, &deny)?;
-        verify(root, &id, &dest, &deny)?;
-        Ok((busy_holders(root)?, deny))
+        let ex = exclusions(home, root)?;
+        save_ignored(root, &dest, &ex)?;
+        verify(root, &id, &dest, &ex)?;
+        Ok((busy_holders(root)?, ex))
     })();
-    let (holders, deny) = match prepared {
+    let (holders, ex) = match prepared {
         Ok(h) => h,
         Err(e) => {
             back_to_baled(registry, &mut record, root)?;
@@ -294,7 +324,9 @@ fn finish(
     // `recover` checks again before deleting it.
     let checked = (|| -> Result<Option<Outcome>> {
         let wip = wip_commit(&trash, &id)?;
-        if verify_in(&trash, &wip, &dest, &deny, Place::Moved)?.is_some() {
+        // The same exclusions as the save: the trash is checked against
+        // exactly what was captured.
+        if verify_in(&trash, &wip, &dest, &ex, Place::Moved)?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
         let holders = busy_holders(&trash)?;
@@ -350,7 +382,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
     if fs::symlink_metadata(&path).is_ok() {
         let root =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
-        if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
+        if let Some(reason) = refusal(&root, &exclusions(home, &root)?)? {
             back_to_baled(registry, &mut record, &root)?;
             return Ok(Outcome::Skipped(reason));
         }
@@ -400,8 +432,8 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             }
             // Still a working checkout: prove the saved state covers it (and
             // is not stale) before deleting it.
-            let deny = deny_list(home, &trash)?;
-            let change = verify_in(&trash, wip_sha.trim(), &dest, &deny, Place::Moved)
+            let change = exclusions(home, &trash)
+                .and_then(|ex| verify_in(&trash, wip_sha.trim(), &dest, &ex, Place::Moved))
                 .with_context(|| format!("keeping {}: could not check it", trash.display()))?;
             if change.is_some() {
                 // It holds work the save does not: keep it, stay `Cooling`.
@@ -605,12 +637,11 @@ fn ls_files_v(g: &Git) -> Result<Vec<(char, String)>> {
 }
 
 /// Copies the worktree's ignored files to `dest/files/` (dirs 0700, files
-/// 0600 on unix) and writes `dest/manifest.json`. Regenerable dirs,
-/// `node_modules` and `deny` are skipped: an entry without `/` matches any
-/// path component, one with `/` matches a path prefix. Symlinks are saved as
-/// symlinks and never followed. `dest` is cleared first.
-pub fn save_ignored(dir: &Path, dest: &Path, deny: &[String]) -> Result<Vec<SavedFile>> {
-    let scan = scan_ignored(dir, deny)?;
+/// 0600 on unix) and writes `dest/manifest.json`. `ex.regen`, `node_modules`
+/// and `ex.deny` are skipped. Symlinks are saved as symlinks and never
+/// followed. `dest` is cleared first.
+pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<SavedFile>> {
+    let scan = scan_ignored(dir, ex)?;
     if !scan.nested.is_empty() {
         bail!(
             "nested repository among ignored files: {}",
@@ -663,8 +694,9 @@ struct IgnoredScan {
     nested: Vec<PathBuf>,
 }
 
-fn scan_ignored(dir: &Path, deny: &[String]) -> Result<IgnoredScan> {
-    scan_ignored_with(dir, deny, &regen_dirs(dir))
+fn scan_ignored(dir: &Path, ex: &Exclusions) -> Result<IgnoredScan> {
+    let regen: Vec<PathBuf> = ex.regen.iter().map(|r| dir.join(r)).collect();
+    scan_ignored_with(dir, &ex.deny, &regen)
 }
 
 /// `deny` as it applies inside the submodule at `sub` (relative to the
@@ -897,9 +929,9 @@ pub(crate) fn sha_file(path: &Path) -> Result<String> {
 /// Checks the saved state before anything is deleted: each manifest entry
 /// matches both the source and the copy, and the working tree still builds
 /// exactly the wip commit's tree.
-fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
+fn verify(root: &Path, id: &str, dest: &Path, ex: &Exclusions) -> Result<()> {
     let wip = wip_commit(root, id)?;
-    match verify_in(root, &wip, dest, deny, Place::InPlace)? {
+    match verify_in(root, &wip, dest, ex, Place::InPlace)? {
         None => Ok(()),
         Some(change) => bail!("{change}"),
     }
@@ -921,7 +953,7 @@ fn verify_in(
     root: &Path,
     wip: &str,
     dest: &Path,
-    deny: &[String],
+    ex: &Exclusions,
     place: Place,
 ) -> Result<Option<String>> {
     let manifest = dest.join(MANIFEST);
@@ -929,7 +961,7 @@ fn verify_in(
         fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
     let saved: Vec<SavedFile> =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
-    let mut want: Vec<PathBuf> = scan_ignored(root, deny)?
+    let mut want: Vec<PathBuf> = scan_ignored(root, ex)?
         .entries
         .into_iter()
         .map(|(rel, _)| rel)
@@ -1037,6 +1069,14 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    fn none() -> Exclusions {
+        Exclusions {
+            deny: Vec::new(),
+            regen: Vec::new(),
+            regen_extra: Vec::new(),
+        }
     }
 
     fn repo() -> (tempfile::TempDir, PathBuf) {
@@ -1324,10 +1364,10 @@ mod tests {
         fs::write(root.join(".env"), "A=1\n").unwrap();
         let dest = tmp.path().join("dest");
         save_wip(&root, "x").unwrap();
-        save_ignored(&root, &dest, &[]).unwrap();
-        verify(&root, "x", &dest, &[]).unwrap();
+        save_ignored(&root, &dest, &none()).unwrap();
+        verify(&root, "x", &dest, &none()).unwrap();
         fs::write(root.join(".env"), "A=2\n").unwrap();
-        let err = verify(&root, "x", &dest, &[]).unwrap_err();
+        let err = verify(&root, "x", &dest, &none()).unwrap_err();
         assert!(format!("{err:#}").contains(".env"), "{err:#}");
     }
 
@@ -1336,9 +1376,9 @@ mod tests {
         let (tmp, root) = repo();
         let dest = tmp.path().join("dest");
         save_wip(&root, "x").unwrap();
-        save_ignored(&root, &dest, &[]).unwrap();
+        save_ignored(&root, &dest, &none()).unwrap();
         fs::write(root.join(".env"), "late\n").unwrap();
-        let err = verify(&root, "x", &dest, &[]).unwrap_err();
+        let err = verify(&root, "x", &dest, &none()).unwrap_err();
         assert!(format!("{err:#}").contains("unsaved [.env]"), "{err:#}");
     }
 
@@ -1347,9 +1387,9 @@ mod tests {
         let (tmp, root) = repo();
         let dest = tmp.path().join("dest");
         save_wip(&root, "x").unwrap();
-        save_ignored(&root, &dest, &[]).unwrap();
+        save_ignored(&root, &dest, &none()).unwrap();
         fs::write(root.join("late.txt"), "late\n").unwrap();
-        let err = verify(&root, "x", &dest, &[]).unwrap_err();
+        let err = verify(&root, "x", &dest, &none()).unwrap_err();
         assert!(
             format!("{err:#}").contains("changed while saving"),
             "{err:#}"

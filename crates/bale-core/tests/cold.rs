@@ -1,7 +1,7 @@
 mod support;
 
 use bale_core::git::worktrees;
-use bale_core::ops::cold::{cold, cold_if_clean, save_ignored, save_wip};
+use bale_core::ops::cold::{cold, cold_if_clean, exclusions, save_ignored, save_wip};
 use bale_core::ops::up::{register, Outcome};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
@@ -296,7 +296,9 @@ fn save_ignored_honours_extra_deny() {
     fs::create_dir_all(wt.join("cache/deep")).unwrap();
     fs::write(wt.join("cache/deep/c"), "c").unwrap();
     let dest = fx.home().saved_dir("x");
-    let saved = save_ignored(&wt, &dest, &["cache".to_string()]).unwrap();
+    let mut ex = exclusions(&fx.home(), &wt).unwrap();
+    ex.deny.push("cache".to_string());
+    let saved = save_ignored(&wt, &dest, &ex).unwrap();
     let rels: Vec<_> = saved.iter().map(|s| s.rel.clone()).collect();
     assert_eq!(rels, vec![PathBuf::from("a.log")]);
     assert!(dest.join("manifest.json").exists());
@@ -315,7 +317,7 @@ fn symlinked_ignored_dir_is_not_followed() {
     fs::create_dir_all(wt.join("dir")).unwrap();
     symlink(outside.to_str().unwrap(), &wt.join("dir/inner"));
     let dest = fx.home().saved_dir("x");
-    let saved = save_ignored(&wt, &dest, &[]).unwrap();
+    let saved = save_ignored(&wt, &dest, &exclusions(&fx.home(), &wt).unwrap()).unwrap();
     assert_eq!(saved.len(), 2, "{saved:?}");
     assert!(saved.iter().all(|s| s.symlink_target.is_some()));
     assert!(fs::symlink_metadata(dest.join("files/link"))
@@ -375,7 +377,12 @@ fn recovers_cooling_after_rename() {
         ],
     );
     save_wip(&wt, &id).unwrap();
-    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    save_ignored(
+        &wt,
+        &fx.home().saved_dir(&id),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap();
     let trash = wt.with_file_name(".bale-trash-wt-123");
     fs::rename(&wt, &trash).unwrap();
     set_level(&fx, &id, Level::Cooling);
@@ -391,7 +398,12 @@ fn cooling_without_wip_ref_keeps_trash() {
     let fx = Fixture::new();
     let wt = dirty_worktree(&fx);
     let id = register(&fx.home(), &wt).unwrap().id;
-    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    save_ignored(
+        &wt,
+        &fx.home().saved_dir(&id),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap();
     let trash = wt.with_file_name(".bale-trash-wt-123");
     fs::rename(&wt, &trash).unwrap();
     set_level(&fx, &id, Level::Cooling);
@@ -510,7 +522,12 @@ fn save_ignored_refuses_nested_repo() {
     let wt = fx.add_worktree("wt", "feature");
     fs::write(wt.join(".gitignore"), "vendor/\n").unwrap();
     nested_repo(&wt.join("vendor/lib"));
-    let err = save_ignored(&wt, &fx.home().saved_dir("x"), &[]).unwrap_err();
+    let err = save_ignored(
+        &wt,
+        &fx.home().saved_dir("x"),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
 }
 
@@ -624,7 +641,12 @@ fn recovery_keeps_trash_that_fails_verify() {
         ],
     );
     save_wip(&wt, &id).unwrap();
-    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    save_ignored(
+        &wt,
+        &fx.home().saved_dir(&id),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap();
     // Edited after the save, e.g. a stale wip ref from an earlier cycle.
     fs::write(wt.join("f"), "newer\n").unwrap();
     let trash = wt.with_file_name(".bale-trash-wt-123");
@@ -791,7 +813,12 @@ fn recovery_keeps_trash_without_git_entry() {
         ],
     );
     save_wip(&wt, &id).unwrap();
-    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    save_ignored(
+        &wt,
+        &fx.home().saved_dir(&id),
+        &exclusions(&fx.home(), &wt).unwrap(),
+    )
+    .unwrap();
     let trash = wt.with_file_name(".bale-trash-wt-123");
     fs::rename(&wt, &trash).unwrap();
     // A removal that got as far as the `.git` file: git run in the trash
