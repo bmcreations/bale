@@ -816,6 +816,11 @@ fn cold_refuses_committed_submodule_head_move() {
         matches!(&out, Outcome::Skipped(r) if r.contains("submodule lib") && r.contains("commit")),
         "{out:?}"
     );
+    // Refused before anything is saved: the post-rename check would refuse
+    // too, but only after writing the wip ref and the saved dir.
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert!(!wip_resolves(&fx, &id));
+    assert!(!fx.home().saved_dir(&id).exists());
     assert_eq!(git(&lib, &["rev-parse", "HEAD"]), moved);
     assert_eq!(fs::read_to_string(lib.join("new.txt")).unwrap(), "x\n");
 }
