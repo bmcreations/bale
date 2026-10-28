@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
 use anyhow::Result;
 use bale_core::ops::cold::cold;
+use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{resolve, up, Outcome};
@@ -41,6 +43,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Adopt a repo's existing linked worktrees: show the plan, or bale them with --apply.
+    Migrate {
+        /// Repo paths (the main checkout or any of its worktrees).
+        #[arg(required = true)]
+        repos: Vec<PathBuf>,
+        /// Register and bale the worktrees; without it nothing changes.
+        #[arg(long)]
+        apply: bool,
+    },
     /// List registered worktrees.
     Ls {
         /// Print the records as JSON.
@@ -71,6 +82,7 @@ fn main() -> ExitCode {
             Ok(code)
         }),
         Command::Sweep { dry_run } => cmd_sweep(&home, dry_run).map(|()| ExitCode::SUCCESS),
+        Command::Migrate { repos, apply } => cmd_migrate(&home, &repos, apply),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -127,6 +139,97 @@ fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
         vec![(true, format!("bale: {line}"))]
     } else {
         vec![(false, line)]
+    }
+}
+
+/// Prints the plan and totals; with `apply`, bales and prints the result.
+/// Exits 1 when any row failed.
+fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<ExitCode> {
+    let rows = plan(home, repos)?;
+    for line in plan_lines(&rows) {
+        println!("{line}");
+    }
+    if !do_apply {
+        println!("dry run: nothing changed; re-run with --apply");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let report = apply(home, &rows)?;
+    println!(
+        "baled {}, busy {}, reported {}, errors {}",
+        report.baled,
+        report.busy,
+        report.reported,
+        report.errors.len()
+    );
+    println!(
+        "free space: {} before, {} after",
+        human(report.free_before),
+        human(report.free_after)
+    );
+    for (path, err) in &report.errors {
+        eprintln!("bale: {}: {err}", path.display());
+    }
+    Ok(if report.errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// The plan table followed by a totals line.
+fn plan_lines(rows: &[PlanRow]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<10}  {:<11}  {:<22}  {:<20}  PATH",
+        "TOTAL", "REGENERABLE", "FLAGS", "ACTION"
+    )];
+    for r in rows {
+        let flags: Vec<&str> = [
+            (r.dirty, "dirty"),
+            (r.busy, "busy"),
+            (r.temp_location, "temp"),
+            (r.prunable, "prunable"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        let flags = if flags.is_empty() {
+            "-".to_string()
+        } else {
+            flags.join(",")
+        };
+        lines.push(format!(
+            "{:<10}  {:<11}  {:<22}  {:<20}  {}",
+            human(r.total_bytes),
+            human(r.regenerable_bytes),
+            flags,
+            r.action,
+            r.path.display()
+        ));
+    }
+    let regen: u64 = rows.iter().map(|r| r.regenerable_bytes).sum();
+    let to_bale = rows.iter().filter(|r| r.action == BALE).count();
+    lines.push(format!(
+        "{} worktrees, {} regenerable, {} to bale",
+        rows.len(),
+        human(regen),
+        to_bale
+    ));
+    lines
+}
+
+/// Bytes in binary units with one decimal, e.g. `1.5 GiB`.
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -198,6 +301,36 @@ mod tests {
         let lines = sweep_lines("abc", &Action::Up, "error: boom");
         assert_eq!(count(&lines, "boom"), 1, "{lines:?}");
         assert!(lines.iter().all(|(err, _)| *err), "{lines:?}");
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1536), "1.5 KiB");
+        assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn plan_table_shows_flags_and_totals() {
+        let row = |action: &str, dirty: bool, regen: u64| PlanRow {
+            path: PathBuf::from("/w"),
+            total_bytes: 2048,
+            regenerable_bytes: regen,
+            dirty,
+            busy: false,
+            temp_location: false,
+            prunable: false,
+            action: action.into(),
+        };
+        let lines = plan_lines(&[row("bale", true, 1024), row("report (temp)", false, 0)]);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[1].contains("dirty") && lines[1].contains("bale"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("report (temp)"), "{lines:?}");
+        assert_eq!(lines[3], "2 worktrees, 1.0 KiB regenerable, 1 to bale");
     }
 
     #[test]

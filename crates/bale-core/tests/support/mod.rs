@@ -28,7 +28,10 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 
 impl Fixture {
     pub fn new() -> Fixture {
-        let tmp = TempDir::new().expect("tempdir");
+        Fixture::init(TempDir::new().expect("tempdir"))
+    }
+
+    fn init(tmp: TempDir) -> Fixture {
         let repo = tmp.path().join("my repo é");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -53,5 +56,15 @@ impl Fixture {
 
     pub fn home(&self) -> BaleHome {
         BaleHome(self.tmp.path().join("bale home"))
+    }
+}
+
+impl Fixture {
+    /// Like `new`, but under cargo's per-target tmp dir, which is outside the
+    /// system temp dir (so `migrate` does not see it as a temp location).
+    pub fn outside_temp() -> Fixture {
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(&base).unwrap();
+        Fixture::init(TempDir::new_in(base).expect("tempdir"))
     }
 }
