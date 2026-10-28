@@ -1085,3 +1085,46 @@ fn open_refuses_bytes_changed_by_config_added_after_cold() {
     );
     assert!(env.bale_home().join(id).join("manifest.json").exists());
 }
+
+/// `core.symlinks=false` set between cold and open makes checkout write a
+/// tracked symlink as a regular file holding its target, which git's own
+/// diff accepts. open must check the link against what cold saw and stop,
+/// keeping the saved state.
+#[cfg(unix)]
+#[test]
+fn open_refuses_symlink_written_as_a_file() {
+    let env = Env::new();
+    let wt = env.add_worktree("feat");
+    fs::write(wt.join("r"), "target\n").unwrap();
+    std::os::unix::fs::symlink("r", wt.join("link")).unwrap();
+    env.git(&wt, &["add", "r", "link"]);
+    env.git(&wt, &["commit", "-q", "-m", "link"]);
+    let wt_arg = wt.to_str().unwrap();
+    for args in [["up", wt_arg], ["cold", wt_arg]] {
+        let out = env.bale(&env.repo, &args, None);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert!(!wt.exists(), "cold did not go through");
+
+    env.git(&env.repo, &["config", "core.symlinks", "false"]);
+    let out = env.bale(&env.repo, &["open", wt_arg], None);
+    assert!(!out.status.success(), "open went through");
+    assert!(stderr(&out).contains("link"), "{}", stderr(&out));
+
+    let out = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rec = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| canon(Path::new(r["path"].as_str().unwrap())) == canon(&wt))
+        .unwrap()
+        .clone();
+    assert_eq!(rec["level"], "opening");
+    let id = rec["id"].as_str().unwrap();
+    env.git(
+        &env.repo,
+        &["rev-parse", "--verify", &format!("refs/bale/{id}/wip")],
+    );
+    assert!(env.bale_home().join(id).join("manifest.json").exists());
+}

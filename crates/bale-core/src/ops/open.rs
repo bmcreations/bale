@@ -402,6 +402,17 @@ fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
             );
         }
     }
+    for l in &saved.manifest.links {
+        let path = record.path.join(&l.rel);
+        let is_link = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if !is_link || fs::read_link(&path)? != l.target {
+            bail!(
+                "restored {} is not the symlink to {} that went cold (did git config change since?)",
+                l.rel.display(),
+                l.target.display()
+            );
+        }
+    }
     for f in &saved.manifest.files {
         check_entry(&record.path.join(&f.rel), f)
             .with_context(|| format!("restored {} does not match", f.rel.display()))?;

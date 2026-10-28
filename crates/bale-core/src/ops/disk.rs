@@ -45,6 +45,19 @@ pub struct Manifest {
     /// before these were recorded; open then skips the check.
     #[serde(default)]
     pub hashes: Vec<SavedHash>,
+    /// The target of every symlink open writes (tracked and saved), as
+    /// cold's check read it. Open checks each is still a symlink to the
+    /// same target: with `core.symlinks=false` set since, checkout writes
+    /// a regular file holding the target, which git's own diff accepts.
+    /// Empty in saves made before these were recorded.
+    #[serde(default)]
+    pub links: Vec<SavedLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedLink {
+    pub rel: PathBuf,
+    pub target: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +475,8 @@ pub(crate) struct Snapshot {
     root: Stamp,
     /// The sha256 of every regular file the compare read.
     pub(crate) hashes: Vec<SavedHash>,
+    /// The target of every symlink the compare read.
+    pub(crate) links: Vec<SavedLink>,
 }
 
 impl Snapshot {
@@ -683,8 +698,8 @@ fn check_in(
             )));
         }
     }
-    let mut hashes = Vec::new();
-    if let Some(reason) = compare(tree, work, &skip, &seen, &mut hashes)? {
+    let (mut hashes, mut links) = (Vec::new(), Vec::new());
+    if let Some(reason) = compare(tree, work, &skip, &seen, &mut hashes, &mut links)? {
         return Ok(Verdict::Differs(reason));
     }
     Ok(Verdict::Same(Box::new(Snapshot {
@@ -693,6 +708,7 @@ fn check_in(
         seen,
         root,
         hashes,
+        links,
     })))
 }
 
@@ -736,6 +752,7 @@ fn compare(
     skip: &Skip,
     seen: &BTreeMap<PathBuf, (Kind, Stamp)>,
     hashes: &mut Vec<SavedHash>,
+    links: &mut Vec<SavedLink>,
 ) -> Result<Option<String>> {
     let have: BTreeMap<&PathBuf, Kind> = seen.iter().map(|(r, (k, _))| (r, *k)).collect();
     let want: BTreeMap<PathBuf, Kind> = entries(restored, skip)?
@@ -784,6 +801,12 @@ fn compare(
                         tb.display(),
                         ta.display()
                     )));
+                }
+                if !skip.in_sub(rel) {
+                    links.push(SavedLink {
+                        rel: (*rel).clone(),
+                        target: ta,
+                    });
                 }
             }
             Kind::Dir => {
