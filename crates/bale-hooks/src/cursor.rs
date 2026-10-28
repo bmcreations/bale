@@ -1,11 +1,14 @@
 //! Cursor's worktree setup hook (`bale hook cursor setup`) and its install
 //! into a repo's `.cursor/worktrees.json`.
 //!
-//! Unverified against the Cursor app. The contract used here: `worktrees.json`
-//! holds `setup-worktree` (or the OS-specific `setup-worktree-unix` /
-//! `setup-worktree-windows`), an array of shell commands, or a path to a
-//! script, that Cursor runs in a new worktree. Cursor has no remove hook;
-//! removal is covered by the git hook and `bale sweep`.
+//! Contract, from https://cursor.com/docs/configuration/worktrees (read
+//! 2026-10-28): Cursor reads `worktrees.json` from the worktree, then from the
+//! project root. It holds `setup-worktree`, `setup-worktree-unix` and
+//! `setup-worktree-windows`; the OS-specific key wins over `setup-worktree`.
+//! A value is either an array of commands "executed sequentially in the
+//! worktree", or a string path to a script relative to `worktrees.json`, which
+//! bale refuses to edit. Cursor has no remove hook; removal is covered by the
+//! git hook and `bale sweep`. Not run against the Cursor app.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +53,9 @@ pub fn setup(home: &BaleHome) -> ExitCode {
 }
 
 /// The command line bale's entry runs. `windows` picks the quoting of the
-/// shell Cursor uses for the OS the entry is installed for.
+/// shell Cursor uses for the OS the entry is installed for. The docs don't
+/// name the Windows shell; their array example uses cmd-style `%VAR%`, so the
+/// exe is quoted for cmd.exe with no PowerShell `& ` prefix, which cmd rejects.
 fn hook_command(exe: &Path, windows: bool) -> String {
     let exe = if windows {
         windows_quote(&display_path(exe))
@@ -169,7 +174,8 @@ fn install_plan_for(repo: &Path, exe: &Path, windows: bool) -> Result<Plan> {
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Cursor worktree of this \
-             repo runs bale",
+             repo runs bale. The entry holds this machine's absolute path to bale, so \
+             teammates need bale at the same path",
             display_path(&path)
         )),
     ]))
