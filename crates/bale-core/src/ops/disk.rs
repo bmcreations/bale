@@ -689,9 +689,9 @@ fn check_in(
     let root = stamp(&root_meta);
     let seen = entries(tree, &skip)?;
     // The walk starts below the root, so its attributes are checked here.
-    if let Some(name) = user_xattrs(tree)?.into_iter().next() {
+    if let Some(what) = unsaved_attr(tree)? {
         return Ok(Verdict::Differs(format!(
-            "the tree's root has extended attribute {name}, which can't be saved"
+            "the tree's root has {what}, which can't be saved"
         )));
     }
     if let (Some(x), Some(y)) = (
@@ -782,9 +782,9 @@ fn compare(
     }
     for (rel, kind) in &have {
         let (a, b) = (tree.join(rel), restored.join(rel));
-        if let Some(name) = user_xattrs(&a)?.into_iter().next() {
+        if let Some(what) = unsaved_attr(&a)? {
             return Ok(Some(format!(
-                "{} has extended attribute {name}, which can't be saved",
+                "{} has {what}, which can't be saved",
                 rel.display()
             )));
         }
@@ -887,6 +887,78 @@ fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
         }
     }
     Ok(n)
+}
+
+/// What `path` carries that open would not write back, if anything: an
+/// extended attribute outside [`OS_XATTRS`], or (macOS) a file flag other
+/// than [`OS_FLAGS`] or an extended access control list. On Linux an ACL is
+/// a `system.posix_acl_*` xattr, so the xattr check covers it.
+fn unsaved_attr(path: &Path) -> Result<Option<String>> {
+    if let Some(name) = user_xattrs(path)?.into_iter().next() {
+        return Ok(Some(format!("extended attribute {name}")));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        let meta =
+            fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut flags = meta.st_flags() & !OS_FLAGS;
+        // Finder's invisible bit, the same one its FinderInfo allowed below
+        // carries.
+        if path.file_name() == Some(".DS_Store".as_ref()) {
+            flags &= !libc::UF_HIDDEN;
+        }
+        if flags != 0 {
+            return Ok(Some(format!("file flags {flags:#x} (chflags)")));
+        }
+        if has_acl(path)? {
+            return Ok(Some("an access control list".into()));
+        }
+    }
+    Ok(None)
+}
+
+/// File flags the OS sets and keeps up on its own, which nothing needs back:
+/// transparent compression and document-ID tracking. `hidden` is allowed
+/// on `.DS_Store` only, where Finder sets it. Every other flag (`hidden`
+/// elsewhere, `uchg`, `nodump`, a dataless iCloud file, ...) refuses.
+#[cfg(target_os = "macos")]
+const OS_FLAGS: u32 = libc::UF_COMPRESSED | libc::UF_TRACKED;
+
+/// Whether `path` (not following a symlink) has an extended ACL with at
+/// least one entry.
+#[cfg(target_os = "macos")]
+fn has_acl(path: &Path) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn acl_get_link_np(path: *const c_char, ty: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} has a NUL in its path", path.display()))?;
+    // SAFETY: `c` is NUL-terminated.
+    let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let e = io::Error::last_os_error();
+        // ENOENT: no ACL. The others: the filesystem has none.
+        if matches!(
+            e.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Ok(false);
+        }
+        return Err(e).with_context(|| format!("reading the ACL of {}", path.display()));
+    }
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: `acl` is a valid ACL from acl_get_link_np, freed once below.
+    let has = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+    unsafe { acl_free(acl) };
+    Ok(has)
 }
 
 /// Extended attributes the OS or apps set on their own, which nothing

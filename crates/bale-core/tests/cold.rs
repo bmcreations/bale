@@ -611,6 +611,55 @@ fn cold_refuses_extended_attribute_on_the_root() {
     assert!(wt.join("f").exists());
 }
 
+/// Runs `cmd args.. path` and asserts it succeeded.
+#[cfg(target_os = "macos")]
+fn run_on(cmd: &str, args: &[&str], path: &Path) {
+    let ok = std::process::Command::new(cmd)
+        .args(args)
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "{cmd} {args:?} {}", path.display());
+}
+
+/// A file flag (`chflags hidden`) is not saved, so cold refuses and names
+/// the file.
+#[cfg(target_os = "macos")]
+#[test]
+fn cold_refuses_file_with_bsd_flags() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("notes.txt"), "n\n").unwrap();
+    run_on("chflags", &["hidden"], &wt.join("notes.txt"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("notes.txt") && r.contains("flags")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("notes.txt")).unwrap(), "n\n");
+}
+
+/// An access control list (`chmod +a`) is not saved, so cold refuses and
+/// names the dir.
+#[cfg(target_os = "macos")]
+#[test]
+fn cold_refuses_entry_with_acl() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::create_dir(wt.join("shared")).unwrap();
+    fs::write(wt.join("shared/notes.txt"), "n\n").unwrap();
+    run_on("chmod", &["+a", "everyone allow read"], &wt.join("shared"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("shared") && r.contains("access control list")),
+        "{out:?}"
+    );
+    assert!(wt.join("shared/notes.txt").exists());
+}
+
 /// What apps set on their own does not stop cold: Xcode's text encoding
 /// hint on project files, and Finder's flags on `.DS_Store`.
 #[cfg(target_os = "macos")]
