@@ -1,0 +1,12 @@
+[package]
+name = "bale-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bale"
+path = "src/main.rs"
+
+[dependencies]
+bale-core = { path = "../bale-core" }
+clap = { version = "4", features = ["derive"] }
