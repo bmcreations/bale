@@ -1382,3 +1382,52 @@ fn resolve_refuses_a_gitfile_pointing_at_the_main_repo() {
     assert!(matches!(&out, Outcome::Skipped(_)), "{out:?}");
     assert!(!wip_resolves(&fx, &before.id));
 }
+
+/// An Xcode worktree whose ignored `build/dd` is a DerivedData root holding
+/// an SPM checkout (a git clone).
+fn xcode_derived_data_worktree(fx: &Fixture) -> PathBuf {
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "build/\nvendor-ignored/\n").unwrap();
+    fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+    let dd = wt.join("build/dd");
+    fs::create_dir_all(dd.join("Build")).unwrap();
+    let mut dict = plist::Dictionary::new();
+    dict.insert(
+        "WorkspacePath".into(),
+        plist::Value::String(wt.join("App.xcodeproj").to_string_lossy().into_owned()),
+    );
+    plist::Value::Dictionary(dict)
+        .to_file_xml(dd.join("info.plist"))
+        .unwrap();
+    nested_repo(&dd.join("SourcePackages/checkouts/pkg"));
+    wt
+}
+
+#[test]
+fn cold_removes_derived_data_with_spm_checkouts() {
+    let fx = Fixture::new();
+    let wt = xcode_derived_data_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold), "{out:?}");
+    assert!(!wt.exists());
+
+    let report = bale_core::ops::open::open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert!(wt.join("App.xcodeproj").is_dir());
+    assert!(!wt.join("build/dd").exists());
+}
+
+#[test]
+fn cold_still_refuses_user_repo_beside_derived_data() {
+    let fx = Fixture::new();
+    let wt = xcode_derived_data_worktree(&fx);
+    nested_repo(&wt.join("vendor-ignored/lib"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("nested repository")),
+        "{out:?}"
+    );
+    assert!(wt.join("vendor-ignored/lib/.git").is_dir());
+}

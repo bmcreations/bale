@@ -109,3 +109,66 @@ fn skips_git_and_returns_symlink_itself() {
         assert!(got.is_empty());
     }
 }
+
+fn write_plist(dir: &Path, with_workspace_path: bool) {
+    fs::create_dir_all(dir).unwrap();
+    let mut dict = plist::Dictionary::new();
+    if with_workspace_path {
+        dict.insert(
+            "WorkspacePath".into(),
+            plist::Value::String("/src/App.xcworkspace".into()),
+        );
+    }
+    plist::Value::Dictionary(dict)
+        .to_file_xml(dir.join("info.plist"))
+        .unwrap();
+}
+
+#[test]
+fn xcode_derived_data_roots_are_regenerable() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    fs::create_dir_all(r.join("App.xcodeproj")).unwrap();
+    // Real DerivedData roots, whatever their name.
+    for name in ["build/dd", "DerivedData"] {
+        write_plist(&r.join(name), true);
+        fs::create_dir_all(r.join(name).join("Build")).unwrap();
+    }
+    // info.plist but no Build/.
+    write_plist(&r.join("no-build"), true);
+    // Build/ but no plist.
+    fs::create_dir_all(r.join("no-plist/Build")).unwrap();
+    // Build/ with an unparseable plist.
+    fs::create_dir_all(r.join("bad-plist/Build")).unwrap();
+    fs::write(r.join("bad-plist/info.plist"), "not a plist").unwrap();
+    // Build/ with a plist lacking WorkspacePath.
+    write_plist(&r.join("no-key"), false);
+    fs::create_dir_all(r.join("no-key/Build")).unwrap();
+
+    let got = set(regenerable_dirs(r, &detect(r), &cfg(&[])));
+    assert_eq!(got, set(vec![r.join("build/dd"), r.join("DerivedData")]));
+}
+
+#[test]
+fn derived_data_is_ignored_without_xcode_or_swiftpm() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    touch(r, "settings.gradle.kts");
+    write_plist(&r.join("dd"), true);
+    fs::create_dir_all(r.join("dd/Build")).unwrap();
+    assert!(regenerable_dirs(r, &detect(r), &cfg(&[])).is_empty());
+}
+
+#[test]
+fn derived_data_is_not_descended_into() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    touch(r, "Package.swift");
+    write_plist(&r.join("dd"), true);
+    fs::create_dir_all(r.join("dd/Build")).unwrap();
+    touch(r, "dd/SourcePackages/.build/x");
+    assert_eq!(
+        regenerable_dirs(r, &detect(r), &cfg(&[])),
+        vec![r.join("dd")]
+    );
+}

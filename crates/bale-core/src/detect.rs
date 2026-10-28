@@ -1,6 +1,7 @@
 //! Build-system detection and the regenerable directories each one produces.
 
 use crate::config::Config;
+use crate::derived_data::is_derived_data_root;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -59,7 +60,8 @@ pub fn detect(root: &Path) -> Vec<BuildSystem> {
 
 /// Lists regenerable directories under `root` for the given build systems plus
 /// `cfg.regenerable_extra`. Paths are absolute when `root` is. Symlinks are not
-/// followed; a matching symlink is returned as the link itself. A match is never
+/// followed; a matching symlink is returned as the link itself. On Xcode and SwiftPM trees an Xcode DerivedData root (any name) also
+/// matches. A match is never
 /// descended into, and `.git` is skipped.
 pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
     if systems.is_empty() {
@@ -73,6 +75,9 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
         }
     }
     names.extend(cfg.regenerable_extra.iter().map(String::as_str));
+    let xcode = systems
+        .iter()
+        .any(|s| matches!(s, BuildSystem::Xcode | BuildSystem::SwiftPm));
 
     let mut out = Vec::new();
     let mut it = WalkDir::new(root).follow_links(false).into_iter();
@@ -90,7 +95,8 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
             it.skip_current_dir();
             continue;
         }
-        if names.iter().any(|n| *n == name) {
+        let derived_data = xcode && ft.is_dir() && is_derived_data_root(entry.path());
+        if derived_data || names.iter().any(|n| *n == name) {
             out.push(entry.into_path());
             if ft.is_dir() {
                 it.skip_current_dir();

@@ -585,3 +585,41 @@ fn registers_a_worktree_of_a_submodule() {
     let rec = register(&fx.home(), &wt).unwrap();
     assert_eq!(rec.level, Level::Hot);
 }
+
+/// An Xcode worktree whose ignored `build/dd` is a DerivedData root.
+fn xcode_worktree(fx: &Fixture) -> PathBuf {
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+    write_plist(&wt.join("build/dd"), &wt.join("App.xcodeproj"));
+    fs::create_dir_all(wt.join("build/dd/Build/Products")).unwrap();
+    fs::write(wt.join("build/dd/Build/Products/big.bin"), vec![0u8; 1024]).unwrap();
+    fs::create_dir_all(wt.join("src")).unwrap();
+    fs::write(wt.join("src/main.swift"), "print(1)\n").unwrap();
+    wt
+}
+
+#[test]
+fn up_removes_in_tree_derived_data() {
+    let fx = Fixture::new();
+    let wt = xcode_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!wt.join("build/dd").exists());
+    assert!(wt.join("src/main.swift").exists());
+    assert!(trash_left(&wt).is_empty());
+}
+
+#[test]
+fn derived_data_with_tracked_file_is_kept() {
+    let fx = Fixture::new();
+    let wt = xcode_worktree(&fx);
+    fs::write(wt.join("build/dd/keep.txt"), "keep\n").unwrap();
+    support::git(&wt, &["add", "-f", "build/dd/keep.txt"]);
+    support::git(&wt, &["commit", "-qm", "keep"]);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    up(&fx.home(), &id).unwrap();
+    assert!(wt.join("build/dd/keep.txt").exists());
+    assert!(wt.join("build/dd/Build/Products/big.bin").exists());
+}
