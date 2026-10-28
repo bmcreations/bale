@@ -1466,24 +1466,41 @@ fn install_conductor_keeps_existing_scripts_and_comments() {
     assert_eq!(lines[0], "# Team scripts for Conductor.");
     assert_eq!(lines[1], "[scripts]");
     assert_eq!(lines[2], "# Install deps first.");
+    // toml_edit writes a value with a newline as a multi-line string.
+    assert_eq!(lines[3..5], ["setup = \"\"\"", "{ npm install"], "{after}");
     assert!(
-        lines[3].starts_with("setup = \"npm install && '")
-            && lines[3].ends_with(" hook conductor setup\" # keep this comment"),
+        lines[5].starts_with("} && '")
+            && lines[5].ends_with(" hook conductor setup\"\"\" # keep this comment"),
         "{after}"
     );
-    assert_eq!(lines[4], "run = \"npm start\"");
+    assert_eq!(lines[6], "run = \"npm start\"");
+    // The user's archive runs first, while the tree still exists.
+    assert_eq!(lines[7..9], ["archive = \"\"\"", "{ echo bye"], "{after}");
     assert!(
-        lines[5].starts_with("archive = \"'")
-            && lines[5].ends_with(" hook conductor archive; echo bye\""),
+        lines[9].starts_with("}; '") && lines[9].ends_with(" hook conductor archive\"\"\""),
         "{after}"
     );
     assert_eq!(
-        lines[6..],
+        lines[10..],
         ["", "[other]", "key = 1 # unrelated"],
         "{after}"
     );
     let backup = path.with_file_name("settings.toml.bak-bale");
     assert!(!backup.exists(), "backup left in the repo");
+
+    // A reinstall over the chained values changes nothing.
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "conductor", "--repo", repo],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), after);
 }
 
 #[test]

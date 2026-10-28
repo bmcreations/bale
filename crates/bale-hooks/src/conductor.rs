@@ -62,17 +62,24 @@ fn hook_command(exe: &Path, kind: &str) -> String {
     )
 }
 
-/// `existing` with bale's `want` chained in: after it for setup, so the
-/// user's setup runs first; before it for archive, so bale colds the tree
-/// before the user's archive runs.
+/// `existing` with bale's `want` chained after it. The user's script goes
+/// in a brace group closed on its own line, so a trailing `# comment` or
+/// heredoc in it cannot swallow bale's command.
 fn chain(kind: &str, existing: &str, want: &str) -> String {
     let existing = existing.trim_end();
     if existing.trim().is_empty() {
         return want.to_string();
     }
     match kind {
-        "setup" => format!("{existing} && {want}"),
-        _ => format!("{want}; {existing}"),
+        // bale registers only after the user's setup succeeds; a failing
+        // setup keeps its status.
+        "setup" => format!("{{ {existing}\n}} && {want}"),
+        // The user's archive runs first, while the tree still exists: once
+        // bale colds it the directory is gone, and a cleanup step such as
+        // `docker compose down` may need it. bale runs even when that step
+        // fails, and its status (0 gone, 3 busy, 4 skipped, 1 error) is the
+        // script's.
+        _ => format!("{{ {existing}\n}}; {want}"),
     }
 }
 
@@ -186,11 +193,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chain_puts_setup_after_and_archive_before() {
-        assert_eq!(chain("setup", "npm i\n", "B"), "npm i && B");
-        assert_eq!(chain("archive", "echo bye", "B"), "B; echo bye");
+    fn chain_wraps_the_users_script_in_a_brace_group() {
+        assert_eq!(chain("setup", "npm i\n", "B"), "{ npm i\n} && B");
+        assert_eq!(chain("archive", "echo bye", "B"), "{ echo bye\n}; B");
         assert_eq!(chain("setup", "  ", "B"), "B");
         assert_eq!(chain("archive", "", "B"), "B");
+    }
+
+    /// Runs `script` with sh; returns its stdout and exit code.
+    #[cfg(unix)]
+    fn sh(script: &str) -> (String, i32) {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code().unwrap(),
+        )
+    }
+
+    /// Each existing setup shape, with and without a failing last command:
+    /// bale runs exactly when the user's script succeeds, the user's output
+    /// is unchanged, and a failure keeps its status.
+    #[cfg(unix)]
+    #[test]
+    fn setup_chain_runs_bale_only_after_success() {
+        let want = "echo BALE";
+        let cases = [
+            (
+                "npm i # c",
+                "{ npm i # c\n} && echo BALE",
+                "echo one # c",
+                "echo one # c\nfalse",
+            ),
+            (
+                "cat <<EOF\nx\nEOF",
+                "{ cat <<EOF\nx\nEOF\n} && echo BALE",
+                "cat <<EOF\nx\nEOF",
+                "cat <<EOF\nx\nEOF\nfalse",
+            ),
+            (
+                "echo one\necho two",
+                "{ echo one\necho two\n} && echo BALE",
+                "echo one\necho two",
+                "echo one\nfalse",
+            ),
+        ];
+        for (existing, chained, ok, failing) in cases {
+            assert_eq!(chain("setup", existing, want), chained);
+            let (alone, _) = sh(ok);
+            let (out, code) = sh(&chain("setup", ok, want));
+            assert_eq!((out, code), (format!("{alone}BALE\n"), 0), "{ok:?}");
+            let (alone, alone_code) = sh(failing);
+            let (out, code) = sh(&chain("setup", failing, want));
+            assert_eq!((out, code), (alone, alone_code), "{failing:?}");
+            assert_ne!(code, 0, "{failing:?}");
+        }
+    }
+
+    /// The user's archive runs first, while the tree still exists; bale runs
+    /// even when it fails, and bale's status is the hook's.
+    #[cfg(unix)]
+    #[test]
+    fn archive_chain_runs_user_first_and_returns_bales_status() {
+        let want = "echo BALE; (exit 3)";
+        for existing in ["echo bye # c", "echo bye\nfalse", "cat <<EOF\nbye\nEOF"] {
+            let chained = chain("archive", existing, want);
+            assert_eq!(chained, format!("{{ {existing}\n}}; {want}"));
+            let (out, code) = sh(&chained);
+            assert_eq!((out, code), ("bye\nBALE\n".to_string(), 3), "{existing:?}");
+        }
     }
 
     #[test]
