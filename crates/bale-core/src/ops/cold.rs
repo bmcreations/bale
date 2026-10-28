@@ -255,15 +255,15 @@ fn finish(
     root: &Path,
 ) -> Result<Outcome> {
     let id = record.id.clone();
-    let prepared = (|| -> Result<Vec<Holder>> {
-        let dest = home.saved_dir(&id);
+    let dest = home.saved_dir(&id);
+    let prepared = (|| -> Result<(Vec<Holder>, Vec<String>)> {
         save_wip(root, &id)?;
         let deny = deny_list(home, root)?;
         save_ignored(root, &dest, &deny)?;
         verify(root, &id, &dest, &deny)?;
-        busy_holders(root)
+        Ok((busy_holders(root)?, deny))
     })();
-    let holders = match prepared {
+    let (holders, deny) = match prepared {
         Ok(h) => h,
         Err(e) => {
             back_to_baled(registry, &mut record, root)?;
@@ -280,12 +280,35 @@ fn finish(
         back_to_baled(registry, &mut record, root)?;
         return Err(e);
     }
+    #[cfg(test)]
+    tests::BEFORE_RENAME.with(|h| {
+        if let Some(hook) = h.get() {
+            hook(root)
+        }
+    });
     if let Err(e) = fs::rename(root, &trash) {
         back_to_baled(registry, &mut record, root)?;
         if is_busy_error(&e) {
             return Ok(Outcome::Busy(Vec::new()));
         }
         return Err(e).with_context(|| format!("moving {} aside", root.display()));
+    }
+    // A write between the check above and the rename (lsof saw no holder,
+    // but a process can open the tree after it ran) would be lost. Check the
+    // moved tree again and move it back if anything changed.
+    if verify_in(&trash, &id, &dest, &deny, Place::Moved).is_err() {
+        // Drop the marker first: with it gone, `recover` checks the trash
+        // again before deleting it, so a failed move back (which leaves the
+        // record `Cooling`) cannot lose the late change.
+        let cleared = match fs::remove_file(dest.join(TRASH_MARKER)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        fs::rename(&trash, root)
+            .with_context(|| format!("moving {} back after a late change", trash.display()))?;
+        cleared.with_context(|| format!("clearing the trash marker in {}", dest.display()))?;
+        back_to_baled(registry, &mut record, root)?;
+        return Ok(Outcome::Busy(Vec::new()));
     }
     // A failed removal leaves the record `Cooling`; the next run finishes it.
     remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
@@ -365,7 +388,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             // Still a working checkout: prove the saved state covers it (and
             // is not stale) before deleting it.
             let deny = deny_list(home, &trash)?;
-            verify(&trash, &record.id, &dest, &deny)
+            verify_in(&trash, &record.id, &dest, &deny, Place::Moved)
                 .with_context(|| format!("keeping {}", trash.display()))?;
         }
         remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
@@ -485,6 +508,23 @@ pub fn save_wip(dir: &Path, id: &str) -> Result<()> {
 /// (so force-added files stay), with assume-unchanged bits cleared (so their
 /// edits are seen). Without a real index it starts from `read-tree HEAD`.
 fn snapshot_tree(dir: &Path) -> Result<String> {
+    snapshot_tree_in(dir, Place::InPlace)
+}
+
+/// Where the checkout `snapshot_tree_in` reads sits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// At the path git records for it.
+    InPlace,
+    /// Moved aside (a `.bale-trash-*` dir). A submodule's git dir names its
+    /// checkout by a path relative to the old location, so any git run inside
+    /// the submodule fails; `git add -A` runs one to probe a submodule for
+    /// changes. Gitlinks are left out of `add -A` and re-read with
+    /// `update-index`, which takes the submodule's HEAD without entering it.
+    Moved,
+}
+
+fn snapshot_tree_in(dir: &Path, place: Place) -> Result<String> {
     let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
     let index = tmp.path().join("index");
     let real = Git::at(dir).run(&["rev-parse", "--path-format=absolute", "--git-path", "index"])?;
@@ -505,8 +545,36 @@ fn snapshot_tree(dir: &Path) -> Result<String> {
         args.extend(chunk.iter().map(String::as_str));
         g.run(&args)?;
     }
-    g.run(&["add", "-A"])?;
+    if place == Place::InPlace {
+        g.run(&["add", "-A"])?;
+        return Ok(g.run(&["write-tree"])?.trim().to_string());
+    }
+    let gitlinks = gitlinks(&g)?;
+    let excludes: Vec<String> = gitlinks
+        .iter()
+        .map(|p| format!(":(exclude,literal){p}"))
+        .collect();
+    let mut args = vec!["add", "-A", "--", "."];
+    args.extend(excludes.iter().map(String::as_str));
+    g.run(&args)?;
+    for chunk in gitlinks.chunks(200) {
+        let mut args = vec!["update-index", "--"];
+        args.extend(chunk.iter().map(String::as_str));
+        g.run(&args)?;
+    }
     Ok(g.run(&["write-tree"])?.trim().to_string())
+}
+
+/// Paths of the index's submodule entries (mode 160000).
+fn gitlinks(g: &Git) -> Result<Vec<String>> {
+    let out = g.run(&["ls-files", "-s", "-z"])?;
+    Ok(out
+        .split('\0')
+        .filter_map(|e| {
+            let (meta, path) = e.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect())
 }
 
 /// `(tag, path)` for each entry of `git ls-files -v`.
@@ -815,6 +883,10 @@ pub(crate) fn sha_file(path: &Path) -> Result<String> {
 /// matches both the source and the copy, and the working tree still builds
 /// exactly the wip commit's tree.
 fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
+    verify_in(root, id, dest, deny, Place::InPlace)
+}
+
+fn verify_in(root: &Path, id: &str, dest: &Path, deny: &[String], place: Place) -> Result<()> {
     let manifest = dest.join(MANIFEST);
     let text =
         fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
@@ -868,7 +940,7 @@ fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
         }
     }
 
-    let rebuilt = snapshot_tree(root)?;
+    let rebuilt = snapshot_tree_in(root, place)?;
     let wip = Git::at(root).run(&["rev-parse", &format!("refs/bale/{id}/wip^{{tree}}")])?;
     if rebuilt != wip.trim() {
         bail!(
@@ -882,7 +954,14 @@ fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::process::Command;
+
+    thread_local! {
+        /// Test-only seam: runs in `finish` after the tree is verified and
+        /// before it is moved aside.
+        pub(super) static BEFORE_RENAME: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -908,6 +987,142 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "i"],
         );
         (tmp, root)
+    }
+
+    /// A write after `finish` verified the tree but before the rename would
+    /// be lost; the check of the moved tree catches it and moves it back.
+    #[test]
+    fn write_before_rename_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        BEFORE_RENAME.with(|h| {
+            h.set(Some(|root: &Path| {
+                fs::write(root.join("late.txt"), "late\n").unwrap()
+            }))
+        });
+        let out = cold(&home, &id);
+        BEFORE_RENAME.with(|h| h.set(None));
+
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late\n");
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+        let entry = git::find_worktree(&repo, &wt).unwrap();
+        assert_eq!(entry.locked, None);
+
+        // Nothing changes on the next try, so it goes cold.
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+        assert!(!wt.exists());
+    }
+
+    /// A worktree of `repo` at `wt` with `repo2` added as submodule `lib`.
+    fn with_submodule(tmp: &Path, repo: &Path) -> PathBuf {
+        let sub = tmp.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["config", "user.name", "t"]);
+        git(&sub, &["config", "user.email", "t@t"]);
+        git(
+            &sub,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "s",
+            ],
+        );
+        let wt = tmp.join("wt");
+        git(
+            repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "lib",
+            ],
+        );
+        git(
+            &wt,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "sub"],
+        );
+        wt
+    }
+
+    /// The moved tree's submodule can't run git (its checkout path is
+    /// relative to the old location); the re-check still works there.
+    #[test]
+    fn write_before_rename_with_submodule_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let wt = with_submodule(tmp.path(), &repo);
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        BEFORE_RENAME.with(|h| {
+            h.set(Some(|root: &Path| {
+                fs::write(root.join("late.txt"), "late\n").unwrap()
+            }))
+        });
+        let out = cold(&home, &id);
+        BEFORE_RENAME.with(|h| h.set(None));
+
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("late.txt").is_file());
+        assert!(wt.join("lib/.git").exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+        assert!(!wt.exists());
+    }
+
+    /// A commit inside the submodule in the window changes its gitlink.
+    #[test]
+    fn submodule_commit_before_rename_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let wt = with_submodule(tmp.path(), &repo);
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        BEFORE_RENAME.with(|h| {
+            h.set(Some(|root: &Path| {
+                git(
+                    &root.join("lib"),
+                    &[
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-q",
+                        "--allow-empty",
+                        "-m",
+                        "late",
+                    ],
+                )
+            }))
+        });
+        let out = cold(&home, &id);
+        BEFORE_RENAME.with(|h| h.set(None));
+
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert!(wt.join("lib/.git").exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
     }
 
     #[test]
