@@ -48,8 +48,9 @@ fn tools_plan(
         seen.push(tool);
         if tool == Tool::Claude && repo.is_some() {
             plan.extend(Plan::new(vec![Step::Note(
-                "note: Claude Code hooks are per-user (~/.claude/settings.json); --repo is \
-                 ignored for claude"
+                "note: Claude Code hooks are per-user (~/.claude/settings.json, or \
+                 $CLAUDE_CONFIG_DIR/settings.json when that is set); --repo is ignored for \
+                 claude"
                     .to_string(),
             )]));
         }

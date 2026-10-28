@@ -109,7 +109,7 @@ enum Command {
     ///
     /// A config file left empty is deleted when bale finds no backup of it
     /// and git does not track it. That includes a ~/.claude/settings.json
-    /// installed by an older bale whose settings.json.bak-bale was since
+    /// ($CLAUDE_CONFIG_DIR/settings.json when that is set) installed by an older bale whose settings.json.bak-bale was since
     /// deleted: bale treats it as its own.
     Uninstall {
         /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex.

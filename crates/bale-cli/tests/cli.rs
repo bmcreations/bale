@@ -2381,11 +2381,18 @@ fn install_claude_notes_that_repo_is_ignored() {
         );
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(
-            stdout(&out).contains("--repo is ignored"),
+            stdout(&out).contains("--repo is ignored")
+                && stdout(&out).contains("CLAUDE_CONFIG_DIR"),
             "{cmd}: {}",
             stdout(&out)
         );
     }
+    let out = env.bale(&env.repo, &["uninstall", "--help"], None);
+    assert!(
+        stdout(&out).contains("CLAUDE_CONFIG_DIR"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
