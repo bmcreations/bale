@@ -281,32 +281,7 @@ fn check_resumable(record: &Record, saved: &Saved) -> Result<()> {
         );
     }
 
-    let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
-    let g = Git::at(path).env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str());
-    g.run(&["read-tree", &saved.wip])?;
-    g.run(&["update-index", "-q", "--refresh"])?;
-    let mut foreign = Vec::new();
-    let changed = g.run(&["diff-files", "--name-status", "-z"])?;
-    let mut fields = changed.split('\0').filter(|s| !s.is_empty());
-    while let (Some(status), Some(name)) = (fields.next(), fields.next()) {
-        // Not written yet is fine; anything else differs from the wip tree.
-        if status != "D" {
-            foreign.push(name.to_string());
-        }
-    }
-    let others = g.run(&["ls-files", "-z", "--others"])?;
-    for name in others.split('\0').filter(|s| !s.is_empty()) {
-        let rel = Path::new(name);
-        let known = saved
-            .manifest
-            .files
-            .iter()
-            .find(|f| f.rel == rel)
-            .is_some_and(|f| check_entry(&path.join(rel), f).is_ok());
-        if !known {
-            foreign.push(name.to_string());
-        }
-    }
+    let foreign = differences(path, saved, true)?;
     if !foreign.is_empty() {
         bail!(
             "{} holds files bale open did not write ({}); move them away, then rerun",
@@ -405,8 +380,8 @@ fn restage_ignored_additions(g: &Git, saved: &Saved) -> Result<()> {
     Ok(())
 }
 
-/// Every saved file matches its manifest entry and the working tree builds
-/// exactly the wip tree.
+/// Every saved file, dir and mode matches the manifest, and every other path
+/// matches the wip tree.
 fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
     for f in &saved.manifest.files {
         check_entry(&record.path.join(&f.rel), f)
@@ -429,21 +404,49 @@ fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
             );
         }
     }
-    let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
-    let g = Git::at(&record.path).env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str());
-    g.run(&["read-tree", &saved.wip])?;
-    g.run(&["add", "-A"])?;
-    let rebuilt = g.run(&["write-tree"])?;
-    let want = g.run(&["rev-parse", &format!("{}^{{tree}}", saved.wip)])?;
-    if rebuilt.trim() != want.trim() {
+    let differ = differences(&record.path, saved, false)?;
+    if !differ.is_empty() {
         bail!(
-            "restored tree {} is not refs/bale/{}/wip's {}",
-            rebuilt.trim(),
+            "restored tree differs from refs/bale/{}/wip and the manifest: {}",
             record.id,
-            want.trim()
+            differ.join(", ")
         );
     }
     Ok(())
+}
+
+/// Paths under `path` that differ from the wip tree and are not a saved
+/// file matching the manifest. Judged by the wip's own path list, never the
+/// ignore rules in force now, which can change while the tree is cold. A
+/// wip file not on disk counts only when `missing_ok` is false.
+fn differences(path: &Path, saved: &Saved, missing_ok: bool) -> Result<Vec<String>> {
+    let tmp = tempfile::TempDir::new().context("creating a temporary index dir")?;
+    let g = Git::at(path).env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str());
+    g.run(&["read-tree", &saved.wip])?;
+    g.run(&["update-index", "-q", "--refresh"])?;
+    let mut differ = Vec::new();
+    let changed = g.run(&["diff-files", "--name-status", "-z"])?;
+    let mut fields = changed.split('\0').filter(|s| !s.is_empty());
+    while let (Some(status), Some(name)) = (fields.next(), fields.next()) {
+        if !(missing_ok && status == "D") {
+            differ.push(name.to_string());
+        }
+    }
+    // No --exclude-standard: every path outside the wip tree is listed.
+    let others = g.run(&["ls-files", "-z", "--others"])?;
+    for name in others.split('\0').filter(|s| !s.is_empty()) {
+        let rel = Path::new(name);
+        let known = saved
+            .manifest
+            .files
+            .iter()
+            .find(|f| f.rel == rel)
+            .is_some_and(|f| check_entry(&path.join(rel), f).is_ok());
+        if !known {
+            differ.push(name.to_string());
+        }
+    }
+    Ok(differ)
 }
 
 /// A note naming submodules `read-tree` left unchecked-out, if any.

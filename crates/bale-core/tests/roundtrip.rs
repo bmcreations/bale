@@ -288,3 +288,22 @@ fn fifo_is_refused() {
     assert_refused(&fx, &wt, &id, "pipe");
     assert!(fs::symlink_metadata(wt.join("pipe")).is_ok());
 }
+
+/// open checks the restore against the wip tree and the manifest, not the
+/// ignore rules in force when it runs.
+#[test]
+fn exclude_line_removed_while_cold_still_opens() {
+    let fx = Fixture::new();
+    let exclude = fx.repo.join(".git/info/exclude");
+    let (wt, id) = worktree(
+        &fx,
+        |_| fs::write(&exclude, "local.cfg\n").unwrap(),
+        |wt| fs::write(wt.join("local.cfg"), "mine\n").unwrap(),
+    );
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    fs::write(&exclude, "").unwrap();
+
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert_eq!(fs::read_to_string(wt.join("local.cfg")).unwrap(), "mine\n");
+}
