@@ -355,8 +355,11 @@ fn finish(
 }
 
 /// Renames the moved-aside checkout back to `root` and sets `Baled`. A failed
-/// rename leaves the record `Cooling` and the trash unmarked.
+/// rename leaves the trash where it is and the record `Cooling`, and the
+/// error names both paths.
 fn move_back(registry: &Registry, record: &mut Record, trash: &Path, root: &Path) -> Result<()> {
+    #[cfg(test)]
+    tests::run_seam(&tests::BEFORE_MOVE_BACK, trash);
     fs::rename(trash, root)
         .with_context(|| format!("moving {} back to {}", trash.display(), root.display()))?;
     back_to_baled(registry, record, root)
@@ -376,7 +379,8 @@ fn back_to_baled(registry: &Registry, record: &mut Record, root: &Path) -> Resul
 
 /// Resumes a `Cooling` record. A present checkout is saved again from
 /// scratch; a missing one is only finished off (trash removed, `Cold`) when
-/// the wip ref and the manifest both exist.
+/// the wip ref and the manifest both exist. An unmarked trash that differs
+/// from the save, or can't be checked, is moved back and set `Baled`.
 fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<Outcome> {
     let path = record.path.clone();
     if fs::symlink_metadata(&path).is_ok() {
@@ -431,13 +435,24 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 );
             }
             // Still a working checkout: prove the saved state covers it (and
-            // is not stale) before deleting it.
-            let change = exclusions(home, &trash)
-                .and_then(|ex| verify_in(&trash, wip_sha.trim(), &dest, &ex, Place::Moved))
-                .with_context(|| format!("keeping {}: could not check it", trash.display()))?;
-            if change.is_some() {
-                // It holds work the save does not: keep it, stay `Cooling`.
-                return Ok(Outcome::Busy(Vec::new()));
+            // is not stale) before deleting it. If it holds work the save
+            // does not, or can't be checked, it goes back to the recorded
+            // path as a `Baled` tree; nothing is deleted.
+            let checked = exclusions(home, &trash)
+                .and_then(|ex| verify_in(&trash, wip_sha.trim(), &dest, &ex, Place::Moved));
+            match checked {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    move_back(registry, &mut record, &trash, &path)?;
+                    return Ok(Outcome::Busy(Vec::new()));
+                }
+                Err(e) => {
+                    let e = e.context(format!("could not check {}", trash.display()));
+                    return match move_back(registry, &mut record, &trash, &path) {
+                        Ok(()) => Err(e),
+                        Err(back) => Err(e.context(format!("{back:#}; keeping it"))),
+                    };
+                }
             }
         }
         remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
@@ -1037,6 +1052,9 @@ mod tests {
         /// Test-only seam: runs in `finish` with the trash path right after
         /// the move, before the moved tree is checked.
         pub(super) static AFTER_RENAME: Seam = const { RefCell::new(None) };
+        /// Test-only seam: runs in `move_back` with the trash path before
+        /// it is renamed back.
+        pub(super) static BEFORE_MOVE_BACK: Seam = const { RefCell::new(None) };
     }
 
     pub(super) fn run_seam(seam: &'static LocalKey<Seam>, path: &Path) {
@@ -1277,10 +1295,47 @@ mod tests {
         assert_eq!(trash.len(), 1);
 
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Busy(Vec::new()));
-        assert_eq!(
-            fs::read_to_string(trash[0].join("late.txt")).unwrap(),
-            "late\n"
+        assert_eq!(fs::read_to_string(wt.join("late.txt")).unwrap(), "late\n");
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+        assert_eq!(git::find_worktree(&repo, &wt).unwrap().locked, None);
+    }
+
+    /// When the move back fails (something took the path), the trash stays
+    /// where it is, the record stays `Cooling`, and the error names both.
+    #[test]
+    fn failed_move_back_in_recovery_keeps_the_trash() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
         );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        let before = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
+        });
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop((before, after));
+        assert!(crashed.is_err());
+        let trash = trash_siblings(&wt).unwrap();
+
+        let taken = wt.clone();
+        let seam = set_seam(&BEFORE_MOVE_BACK, move |_: &Path| {
+            fs::create_dir_all(taken.join("other")).unwrap()
+        });
+        let err = cold(&home, &id).unwrap_err();
+        drop(seam);
+
+        let text = format!("{err:#}");
+        assert!(text.contains(&trash[0].display().to_string()), "{text}");
+        assert!(text.contains(&wt.display().to_string()), "{text}");
+        assert!(trash[0].join("late.txt").is_file());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Cooling);
     }
 
     /// recover lists regenerable dirs with git in the moved tree; a
@@ -1312,8 +1367,11 @@ mod tests {
         assert_eq!(trash.len(), 1);
 
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Busy(Vec::new()));
-        assert!(trash[0].join("late.txt").is_file());
-        assert!(trash[0].join("lib/.git").exists());
+        assert!(wt.join("late.txt").is_file());
+        assert!(wt.join("lib/.git").exists());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
     }
 
     /// A git failure while checking the moved tree is an error, not a busy

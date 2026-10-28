@@ -653,11 +653,45 @@ fn recovery_keeps_trash_that_fails_verify() {
     fs::rename(&wt, &trash).unwrap();
     set_level(&fx, &id, Level::Cooling);
 
-    // A changed tree is not an error: cold reports it busy and keeps it.
+    // A changed tree is not an error: cold moves it back and reports busy.
     let out = cold(&fx.home(), &id).unwrap();
     assert_eq!(out, Outcome::Busy(Vec::new()));
-    assert_eq!(fs::read_to_string(trash.join("f")).unwrap(), "newer\n");
-    assert_eq!(level(&fx, &id), Level::Cooling);
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "newer\n");
+    assert!(!trash.exists());
+    assert_eq!(level(&fx, &id), Level::Baled);
+    assert_eq!(linked(&fx).locked, None);
+}
+
+/// A trash recovery can't check goes back too, with the error.
+#[test]
+fn recovery_moves_back_trash_it_cannot_check() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    save_wip(&wt, &id).unwrap();
+    let dest = fx.home().saved_dir(&id);
+    save_ignored(&wt, &dest, &exclusions(&fx.home(), &wt).unwrap()).unwrap();
+    fs::write(dest.join("manifest.json"), "not json").unwrap();
+    let trash = wt.with_file_name(".bale-trash-wt-123");
+    fs::rename(&wt, &trash).unwrap();
+    set_level(&fx, &id, Level::Cooling);
+
+    let err = cold(&fx.home(), &id).unwrap_err();
+    assert!(format!("{err:#}").contains("could not check"), "{err:#}");
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
+    assert!(!trash.exists());
+    assert_eq!(level(&fx, &id), Level::Baled);
+    assert_eq!(linked(&fx).locked, None);
 }
 
 /// Makes `wt` a Gradle build and gives its submodule `lib` a `build/` dir.
