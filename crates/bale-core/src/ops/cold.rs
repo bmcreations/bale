@@ -16,7 +16,9 @@ use crate::busy::{busy_holders, Holder};
 use crate::config::{load_config, Config};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git::{self, Git};
-use crate::ops::disk::{self, read_manifest, record_tree, write_manifest, Manifest, Skip};
+use crate::ops::disk::{
+    self, read_manifest, record_tree, restore_mismatch, write_manifest, Manifest, Skip,
+};
 use crate::lock::WorkspaceLock;
 use crate::ops::up::{
     bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
@@ -352,6 +354,9 @@ fn finish(
         if verify_in(&trash, &wip, &dest, &ex, Place::Moved)?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
+        if let Some(reason) = restore_mismatch(&trash, &wip, &dest, &ex.regen, &ex.deny)? {
+            return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+        }
         let holders = busy_holders(&trash)?;
         if !holders.is_empty() {
             return Ok(Some(Outcome::Busy(holders)));
@@ -375,6 +380,11 @@ fn finish(
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
+}
+
+/// The skip reason for a tree `open` would not give back as it is.
+fn not_restorable(reason: &str) -> String {
+    format!("open would not restore it as it is: {reason}")
 }
 
 /// Renames the moved-aside checkout back to `root` and sets `Baled`. A failed
@@ -461,13 +471,19 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             // is not stale) before deleting it. If it holds work the save
             // does not, or can't be checked, it goes back to the recorded
             // path as a `Baled` tree; nothing is deleted.
-            let checked = exclusions(home, &trash)
-                .and_then(|ex| verify_in(&trash, wip_sha.trim(), &dest, &ex, Place::Moved));
+            let checked = exclusions(home, &trash).and_then(|ex| {
+                let wip = wip_sha.trim();
+                if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
+                    return Ok(Some(Outcome::Busy(Vec::new())));
+                }
+                Ok(restore_mismatch(&trash, wip, &dest, &ex.regen, &ex.deny)?
+                    .map(|reason| Outcome::Skipped(not_restorable(&reason))))
+            });
             match checked {
                 Ok(None) => {}
-                Ok(Some(_)) => {
+                Ok(Some(outcome)) => {
                     move_back(registry, &mut record, &trash, &path)?;
-                    return Ok(Outcome::Busy(Vec::new()));
+                    return Ok(outcome);
                 }
                 Err(e) => {
                     let e = e.context(format!("could not check {}", trash.display()));
@@ -1866,6 +1882,62 @@ mod tests {
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
         assert_eq!(git::find_worktree(&repo, &wt).unwrap().locked, None);
+    }
+
+    /// `add -A` drops a `.GIT` dir, so the git-side check of the moved
+    /// tree passes; the restore comparison does not.
+    #[test]
+    fn case_variant_git_dir_after_rename_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let seam = set_seam(&AFTER_RENAME, |trash: &Path| {
+            fs::create_dir_all(trash.join("d/.GIT")).unwrap();
+            fs::write(trash.join("d/.GIT/keep"), "k").unwrap();
+        });
+        let out = cold(&home, &id).unwrap();
+        drop(seam);
+
+        assert!(matches!(&out, Outcome::Skipped(r) if r.contains("d would not be restored")));
+        assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+    }
+
+    /// Recovery checks an unmarked trash with the same restore comparison.
+    #[test]
+    fn crash_after_rename_keeps_a_case_variant_git_dir() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let before = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::create_dir_all(root.join("d/.GIT")).unwrap();
+            fs::write(root.join("d/.GIT/keep"), "k").unwrap();
+        });
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop((before, after));
+        assert!(crashed.is_err());
+
+        let out = cold(&home, &id).unwrap();
+        assert!(matches!(&out, Outcome::Skipped(r) if r.contains("d would not be restored")));
+        assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
     }
 
     /// When the move back fails (something took the path), the trash stays

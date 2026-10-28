@@ -37,16 +37,16 @@ fn round_trip(fx: &Fixture, wt: &Path, id: &str) {
     assert_eq!(report.outcome, Outcome::Done(Level::Hot));
 }
 
-/// Cold must not go through: the tree stays, Baled.
-fn assert_refused(fx: &Fixture, wt: &Path, id: &str) -> Outcome {
+/// Cold must not go through: the tree stays, Baled, and the skip reason
+/// names `path`.
+fn assert_refused(fx: &Fixture, wt: &Path, id: &str, path: &str) {
     let out = cold(&fx.home(), id).unwrap();
-    assert!(
-        matches!(out, Outcome::Busy(_) | Outcome::Skipped(_)),
-        "expected a refusal, got {out:?}"
-    );
+    let Outcome::Skipped(reason) = &out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(reason.contains(path), "{reason}");
     assert!(wt.is_dir(), "the tree was deleted");
-    assert_ne!(level(fx, id), Level::Cold);
-    out
+    assert_eq!(level(fx, id), Level::Baled);
 }
 
 #[cfg(unix)]
@@ -137,4 +137,154 @@ fn empty_dirs_round_trip() {
     assert!(wt.join("e2/inner").is_dir());
     assert!(wt.join("x/emptyign").is_dir());
     assert_eq!(fs::read_to_string(wt.join("x/keep")).unwrap(), "k");
+}
+
+/// A clean filter that drops lines: the wip blob lacks them and checkout
+/// would not write them back.
+#[test]
+fn lossy_clean_filter_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            git(r, &["config", "filter.strip.clean", "sed /SECRET/d"]);
+            git(r, &["config", "filter.strip.smudge", "cat"]);
+            fs::write(r.join(".gitattributes"), "*.nb filter=strip\n").unwrap();
+            commit_all(r);
+        },
+        |wt| fs::write(wt.join("a.nb"), "keep\nSECRET=1\n").unwrap(),
+    );
+    assert_refused(&fx, &wt, &id, "a.nb");
+    assert_eq!(
+        fs::read_to_string(wt.join("a.nb")).unwrap(),
+        "keep\nSECRET=1\n"
+    );
+}
+
+#[test]
+fn crlf_file_under_autocrlf_input_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            git(r, &["config", "core.autocrlf", "input"]);
+        },
+        |wt| fs::write(wt.join("c.txt"), "a\r\nb\r\n").unwrap(),
+    );
+    assert_refused(&fx, &wt, &id, "c.txt");
+    assert_eq!(fs::read(wt.join("c.txt")).unwrap(), b"a\r\nb\r\n");
+}
+
+/// Checkout expands `$Id$`, so a new file holding it would come back
+/// changed.
+#[test]
+fn unexpanded_ident_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            fs::write(r.join(".gitattributes"), "*.id ident\n").unwrap();
+            commit_all(r);
+        },
+        |wt| fs::write(wt.join("x.id"), "$Id$\n").unwrap(),
+    );
+    assert_refused(&fx, &wt, &id, "x.id");
+    assert_eq!(fs::read_to_string(wt.join("x.id")).unwrap(), "$Id$\n");
+}
+
+/// A committed ident file as checkout wrote it comes back the same.
+#[test]
+fn checked_out_ident_file_goes_cold() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            fs::write(r.join(".gitattributes"), "*.id ident\n").unwrap();
+            fs::write(r.join("x.id"), "$Id$\n").unwrap();
+            commit_all(r);
+        },
+        |_| {},
+    );
+    let before = fs::read(wt.join("x.id")).unwrap();
+    assert_ne!(before, b"$Id$\n");
+    round_trip(&fx, &wt, &id);
+    assert_eq!(fs::read(wt.join("x.id")).unwrap(), before);
+}
+
+/// The default on Windows: checkout writes CRLF for an LF blob, so CRLF
+/// files round-trip and must not be refused.
+#[test]
+fn crlf_files_under_autocrlf_true_round_trip() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            git(r, &["config", "core.autocrlf", "true"]);
+            fs::write(r.join(".gitattributes"), "* text=auto\n").unwrap();
+            fs::write(r.join("t.txt"), "one\r\ntwo\r\n").unwrap();
+            commit_all(r);
+        },
+        |wt| {
+            fs::write(wt.join("t.txt"), "one\r\nthree\r\n").unwrap();
+            fs::write(wt.join("new.txt"), "n\r\n").unwrap();
+        },
+    );
+    round_trip(&fx, &wt, &id);
+    assert_eq!(fs::read(wt.join("t.txt")).unwrap(), b"one\r\nthree\r\n");
+    assert_eq!(fs::read(wt.join("new.txt")).unwrap(), b"n\r\n");
+}
+
+/// git never adds a `.git` dir in any case, so `add -A` drops `.GIT`.
+#[test]
+fn case_variant_git_dir_in_untracked_dir_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |_| {},
+        |wt| {
+            fs::create_dir_all(wt.join("d/.GIT")).unwrap();
+            fs::write(wt.join("d/.GIT/keep"), "k").unwrap();
+        },
+    );
+    assert_refused(&fx, &wt, &id, "d would not be restored");
+    assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
+}
+
+#[test]
+fn case_variant_git_dir_in_tracked_dir_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            fs::create_dir_all(r.join("src")).unwrap();
+            fs::write(r.join("src/a.txt"), "a").unwrap();
+            commit_all(r);
+        },
+        |wt| {
+            fs::create_dir_all(wt.join("src/.GIT")).unwrap();
+            fs::write(wt.join("src/.GIT/keep"), "k").unwrap();
+        },
+    );
+    assert_refused(&fx, &wt, &id, "src/.GIT");
+    assert_eq!(fs::read_to_string(wt.join("src/.GIT/keep")).unwrap(), "k");
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |_| {},
+        |wt| {
+            let ok = std::process::Command::new("mkfifo")
+                .arg(wt.join("pipe"))
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        },
+    );
+    assert_refused(&fx, &wt, &id, "pipe");
+    assert!(fs::symlink_metadata(wt.join("pipe")).is_ok());
 }

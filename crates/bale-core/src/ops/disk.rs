@@ -1,16 +1,17 @@
 //! The saved state as `open` writes it to disk: the manifest of ignored
 //! files, file modes and empty dirs, and the code that applies it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::ops::cold::{copy_file, copy_symlink, create_private, SavedFile, MANIFEST};
+use crate::git::Git;
+use crate::ops::cold::{copy_file, copy_symlink, create_private, SavedFile, FILES, MANIFEST};
 use crate::ops::up::TRASH_PREFIX;
 
 /// `dest/manifest.json`.
@@ -218,4 +219,213 @@ pub(crate) fn make_parents(root: &Path, rel: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What a disk entry is, as far as a restore can reproduce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Dir,
+    File,
+    Symlink,
+    /// A fifo, socket or device: neither git nor the manifest can hold it.
+    Other,
+}
+
+impl Kind {
+    fn of(ft: fs::FileType) -> Kind {
+        if ft.is_symlink() {
+            Kind::Symlink
+        } else if ft.is_dir() {
+            Kind::Dir
+        } else if ft.is_file() {
+            Kind::File
+        } else {
+            Kind::Other
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Dir => "dir",
+            Kind::File => "file",
+            Kind::Symlink => "symlink",
+            Kind::Other => "special file",
+        }
+    }
+}
+
+/// Why `open` would not give back the tree at `tree` byte for byte, if it
+/// would not. Runs open's own restore (checkout of `wip` through git's
+/// filters and eol rules, then the manifest in `dest`) into a temporary dir
+/// beside `tree`, and compares the two with plain file reads: the paths both
+/// ways, file types, file bytes, modes (unix) and symlink targets. A fifo,
+/// socket or device in the tree is a mismatch. `Err` means the check itself
+/// failed.
+pub(crate) fn restore_mismatch(
+    tree: &Path,
+    wip: &str,
+    dest: &Path,
+    regen: &[PathBuf],
+    deny: &[String],
+) -> Result<Option<String>> {
+    let manifest = read_manifest(dest)?;
+    let g = Git::at(tree);
+    let git_dir = g.run(&["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(git_dir.trim_end_matches(['\n', '\r']));
+    let gitlinks = g.run(&["ls-tree", "-r", "-z", wip])?;
+    let gitlinks = gitlinks
+        .split('\0')
+        .filter_map(|e| {
+            let (meta, path) = e.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| PathBuf::from(path))
+        })
+        .collect();
+    let skip = Skip {
+        regen: regen.to_vec(),
+        deny: deny.to_vec(),
+        gitlinks,
+    };
+
+    // Beside the tree, so it is on the same filesystem (case folding, exec
+    // bits and symlinks behave the same).
+    let parent = tree
+        .parent()
+        .with_context(|| format!("{} has no parent directory", tree.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".bale-check-")
+        .tempdir_in(parent)
+        .with_context(|| format!("creating a check dir in {}", parent.display()))?;
+    let work = tmp.path().join("tree");
+    fs::create_dir(&work).with_context(|| format!("creating {}", work.display()))?;
+    // A private index: the tree's own git dir is shared with the real one.
+    Git::at(&work)
+        .env("GIT_DIR", git_dir.as_os_str())
+        .env("GIT_WORK_TREE", work.as_os_str())
+        .env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str())
+        .run(&["read-tree", "-u", "--reset", wip])?;
+    apply_manifest(&work, &manifest, &dest.join(FILES))?;
+    compare(tree, &work, &skip)
+}
+
+/// Every entry under `root` the walk keeps, by exact name.
+fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, Kind>> {
+    let mut found = BTreeMap::new();
+    let mut it = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .follow_root_links(false)
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(item) = it.next() {
+        let item = item.with_context(|| format!("walking {}", root.display()))?;
+        let rel = item
+            .path()
+            .strip_prefix(root)
+            .context("walk left the tree")?
+            .to_path_buf();
+        let kind = Kind::of(item.file_type());
+        if skip.skips(&rel, item.depth(), item.file_name()) {
+            if kind == Kind::Dir {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+        if kind == Kind::Dir && skip.gitlinks.contains(&rel) {
+            it.skip_current_dir();
+        }
+        found.insert(rel, kind);
+    }
+    Ok(found)
+}
+
+fn compare(tree: &Path, restored: &Path, skip: &Skip) -> Result<Option<String>> {
+    let have = entries(tree, skip)?;
+    let want = entries(restored, skip)?;
+    if let Some((rel, _)) = have.iter().find(|(_, k)| **k == Kind::Other) {
+        return Ok(Some(format!(
+            "{}: a fifo, socket or device can't be saved",
+            rel.display()
+        )));
+    }
+    if let Some(rel) = have.keys().find(|r| !want.contains_key(*r)) {
+        return Ok(Some(format!("{} would not be restored", rel.display())));
+    }
+    if let Some(rel) = want.keys().find(|r| !have.contains_key(*r)) {
+        return Ok(Some(format!(
+            "{} would be restored but is not in the tree",
+            rel.display()
+        )));
+    }
+    for (rel, kind) in &have {
+        let (a, b) = (tree.join(rel), restored.join(rel));
+        let other = want[rel];
+        if *kind != other {
+            return Ok(Some(format!(
+                "{} would be restored as a {}, not a {}",
+                rel.display(),
+                other.name(),
+                kind.name()
+            )));
+        }
+        match kind {
+            Kind::Symlink => {
+                let (ta, tb) = (fs::read_link(&a)?, fs::read_link(&b)?);
+                if ta != tb {
+                    return Ok(Some(format!(
+                        "{} would point at {}, not {}",
+                        rel.display(),
+                        tb.display(),
+                        ta.display()
+                    )));
+                }
+            }
+            Kind::File => {
+                let (ma, mb) = (fs::symlink_metadata(&a)?, fs::symlink_metadata(&b)?);
+                if let (Some(x), Some(y)) = (file_mode(&ma), file_mode(&mb)) {
+                    if x != y {
+                        return Ok(Some(format!(
+                            "{} would be restored with mode {y:o}, not {x:o}",
+                            rel.display()
+                        )));
+                    }
+                }
+                if ma.len() != mb.len() || !same_bytes(&a, &b)? {
+                    return Ok(Some(format!(
+                        "{} would be restored with different bytes",
+                        rel.display()
+                    )));
+                }
+            }
+            Kind::Dir | Kind::Other => {}
+        }
+    }
+    Ok(None)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    let mut fa = fs::File::open(a).with_context(|| format!("opening {}", a.display()))?;
+    let mut fb = fs::File::open(b).with_context(|| format!("opening {}", b.display()))?;
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Reads until `buf` is full or the file ends.
+fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
 }
