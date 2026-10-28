@@ -581,8 +581,9 @@ enum Place {
     /// At the path git records for it.
     InPlace,
     /// Moved aside (a `.bale-trash-*` dir). A submodule's git dir names its
-    /// checkout by a path relative to the old location, so any git run inside
-    /// the submodule fails; `git add -A` runs one to probe a submodule for
+    /// checkout by a path relative to the old location, so git run inside
+    /// the submodule without an explicit git dir and work tree fails (see
+    /// `submodule_change`); `git add -A` runs one to probe a submodule for
     /// changes. Gitlinks are left out of `add -A` and re-read with
     /// `update-index --remove`, which takes the submodule's HEAD without
     /// entering it (and drops the entry when the dir is gone).
@@ -711,7 +712,12 @@ fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
     let Some(target) = text.trim_end_matches(['\n', '\r']).strip_prefix("gitdir: ") else {
         bail!("{} does not name a git dir", dot_git.display());
     };
-    Ok(Some(dir.join(target)))
+    // Resolved here: on Windows `dir` is a verbatim path, where `..` is not
+    // collapsed for git.
+    let git_dir = dir.join(target);
+    let git_dir =
+        fs::canonicalize(&git_dir).with_context(|| format!("resolving {}", git_dir.display()))?;
+    Ok(Some(git_dir))
 }
 
 /// Paths of the index's submodule entries (mode 160000).
