@@ -896,7 +896,20 @@ fn snapshot_tree_in(dir: &Path, place: Place) -> Result<String> {
     let real = PathBuf::from(real.trim_end_matches(['\n', '\r']));
     let g = Git::at(dir).env("GIT_INDEX_FILE", index.as_os_str());
     if real.is_file() {
+        // Git re-reads an entry whose stat time is not older than the index
+        // file's mtime ("racily clean"), so the copy keeps the real index's
+        // mtime: a fresh one (as `fs::copy` gives on Linux) hides an edit
+        // that kept the file's size within the same timestamp tick. Read
+        // first, so an index rewritten during the copy only looks older.
+        let mtime = fs::metadata(&real)
+            .and_then(|m| m.modified())
+            .with_context(|| format!("reading the mtime of {}", real.display()))?;
         fs::copy(&real, &index).with_context(|| format!("copying {}", real.display()))?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&index)
+            .and_then(|f| f.set_modified(mtime))
+            .with_context(|| format!("setting the mtime of {}", index.display()))?;
     } else {
         g.run(&["read-tree", "HEAD"])?;
     }

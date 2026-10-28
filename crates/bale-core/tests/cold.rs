@@ -137,6 +137,42 @@ fn cold_saves_everything_and_removes_dir() {
     assert_eq!(entry.locked.as_deref(), Some("baled by bale"));
 }
 
+/// Sets `path`'s mtime to `t`.
+fn set_mtime(path: &Path, t: SystemTime) {
+    let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(t).unwrap();
+}
+
+/// An edit that leaves a tracked file's size and stat time as the index
+/// recorded them is seen only by git's racy-clean check, which compares
+/// entries against the index file's mtime. With `core.checkStat=minimal`
+/// (whole seconds, no ctime or inode) this is what Linux git does when the
+/// edit lands in the same second as the checkout. `fs::copy` gives a fresh
+/// mtime on Linux, so there this fails unless bale sets the index copy's
+/// mtime back; macOS and Windows copies keep it.
+#[test]
+fn cold_saves_an_edit_only_the_racy_check_sees() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(&wt, &["config", "core.checkStat", "minimal"]);
+    let past = SystemTime::now() - std::time::Duration::from_secs(10);
+    // The index records `f` at `past`.
+    set_mtime(&wt.join("f"), past);
+    git(&wt, &["update-index", "--refresh"]);
+    // Same size, same mtime, and the index no older than the entry.
+    fs::write(wt.join("f"), "two\n").unwrap();
+    set_mtime(&wt.join("f"), past);
+    let index = git(
+        &wt,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    set_mtime(Path::new(index.trim_end()), past);
+
+    let id = register(&fx.home(), &wt).unwrap().id;
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    assert_eq!(show(&fx, &format!("refs/bale/{id}/wip:f")), "two\n");
+}
+
 #[test]
 fn user_locked_tree_is_skipped_untouched() {
     let fx = Fixture::new();
