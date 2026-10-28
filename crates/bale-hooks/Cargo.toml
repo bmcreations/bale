@@ -8,3 +8,4 @@ anyhow = "1.0.104"
 bale-core = { path = "../bale-core" }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tempfile = "3.27.0"
+toml_edit = "=0.22.27"

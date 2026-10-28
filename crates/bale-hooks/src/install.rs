@@ -24,8 +24,9 @@ pub enum Step {
         from: PathBuf,
         to: PathBuf,
     },
-    /// Rewrites a JSON config file atomically, backing up `before` to
-    /// `<name>.bak-bale` the first time.
+    /// Rewrites a config file atomically. A JSON file, which serde_json
+    /// reformats, has `before` backed up to `<name>.bak-bale` the first time;
+    /// other formats are edited in place and get no backup.
     Settings {
         path: PathBuf,
         before: Option<String>,
@@ -72,7 +73,7 @@ impl Plan {
                 } => {
                     println!("update {}:", display_path(path));
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if before.is_some() {
+                    if before.is_some() && is_json(path) {
                         println!("{}", reformat_note(path));
                     }
                 }
@@ -126,11 +127,11 @@ impl Plan {
                     mode,
                 } => {
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if before.is_some() {
+                    if before.is_some() && is_json(path) {
                         println!("{}", reformat_note(path));
                     }
                     let backup = backup_path(path);
-                    if before.is_some() && fs::symlink_metadata(&backup).is_err() {
+                    if before.is_some() && is_json(path) && fs::symlink_metadata(&backup).is_err() {
                         fs::copy(path, &backup)
                             .with_context(|| format!("backing up {}", path.display()))?;
                     }
@@ -177,6 +178,11 @@ impl Plan {
     pub fn extend(&mut self, other: Plan) {
         self.0.extend(other.0);
     }
+}
+
+/// Whether `path` is a JSON file, which serde_json rewrites in its own layout.
+fn is_json(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "json")
 }
 
 /// `<name>.bak-bale` beside `path`.

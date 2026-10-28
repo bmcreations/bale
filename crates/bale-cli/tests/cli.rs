@@ -56,7 +56,21 @@ impl Env {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR");
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("CONDUCTOR_WORKSPACE_PATH")
+            .env_remove("CONDUCTOR_ROOT_PATH")
+            .env_remove("CONDUCTOR_WORKSPACE_NAME");
+    }
+
+    /// `bale` with extra environment variables, set after isolation.
+    fn bale_env(&self, dir: &Path, args: &[&str], vars: &[(&str, &Path)]) -> Output {
+        let mut cmd = Command::cargo_bin("bale").unwrap();
+        cmd.args(args).current_dir(dir);
+        self.isolate(&mut cmd);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
     }
 
     fn git_out(&self, dir: &Path, args: &[&str]) -> Output {
@@ -1337,4 +1351,186 @@ fn open_refuses_symlink_written_as_a_file() {
         &["rev-parse", "--verify", &format!("refs/bale/{id}/wip")],
     );
     assert!(env.bale_home().join(id).join("manifest.json").exists());
+}
+
+const CONDUCTOR_WS: &str = "CONDUCTOR_WORKSPACE_PATH";
+
+#[test]
+fn conductor_setup_adopts_from_env() {
+    let env = Env::new();
+    let wt = env.add_worktree("conductor-ws");
+    let out = env.bale_env(
+        &env.repo,
+        &["hook", "conductor", "setup"],
+        &[(CONDUCTOR_WS, &wt)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.is_registered(&wt));
+}
+
+#[test]
+fn conductor_setup_outside_worktree_exits_0() {
+    let env = Env::new();
+    let outside = env.tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let out = env.bale(&outside, &["hook", "conductor", "setup"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("bale"), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+}
+
+#[test]
+fn conductor_archive_colds_and_open_restores() {
+    let env = Env::new();
+    fs::write(env.repo.join(".gitignore"), ".env\n").unwrap();
+    env.git(&env.repo, &["add", ".gitignore"]);
+    env.git(&env.repo, &["commit", "-q", "-m", "ignore"]);
+    let wt = env.add_worktree("archived");
+    fs::write(wt.join("draft.txt"), "uncommitted\n").unwrap();
+    fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+
+    // Not registered before: archive registers, then colds.
+    assert!(!env.is_registered(&wt));
+    let out = env.bale_env(
+        &env.repo,
+        &["hook", "conductor", "archive"],
+        &[(CONDUCTOR_WS, &wt)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(fs::symlink_metadata(&wt).is_err(), "dir still exists");
+
+    let out = env.bale(&env.repo, &["open", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(wt.join("draft.txt")).unwrap(),
+        "uncommitted\n"
+    );
+    assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), "SECRET=1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn conductor_archive_busy_exits_3() {
+    let env = Env::new();
+    let wt = env.add_worktree("busy");
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .current_dir(&wt)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let out = env.bale_env(
+        &env.repo,
+        &["hook", "conductor", "archive"],
+        &[(CONDUCTOR_WS, &wt)],
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("busy"), "{}", stderr(&out));
+    assert!(wt.join("f").is_file());
+}
+
+fn conductor_settings(env: &Env) -> PathBuf {
+    env.repo.join(".conductor").join("settings.toml")
+}
+
+const CONDUCTOR_TOML: &str = "\
+# Team scripts for Conductor.
+[scripts]
+# Install deps first.
+setup = \"npm install\" # keep this comment
+run = \"npm start\"
+archive = \"echo bye\"
+
+[other]
+key = 1 # unrelated
+";
+
+#[test]
+fn install_conductor_keeps_existing_scripts_and_comments() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, CONDUCTOR_TOML).unwrap();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "conductor", "--repo", repo],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("committed"), "{}", stdout(&out));
+    let after = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = after.lines().collect();
+    assert_eq!(lines[0], "# Team scripts for Conductor.");
+    assert_eq!(lines[1], "[scripts]");
+    assert_eq!(lines[2], "# Install deps first.");
+    assert!(
+        lines[3].starts_with("setup = \"npm install && '")
+            && lines[3].ends_with(" hook conductor setup\" # keep this comment"),
+        "{after}"
+    );
+    assert_eq!(lines[4], "run = \"npm start\"");
+    assert!(
+        lines[5].starts_with("archive = \"'")
+            && lines[5].ends_with(" hook conductor archive; echo bye\""),
+        "{after}"
+    );
+    assert_eq!(
+        lines[6..],
+        ["", "[other]", "key = 1 # unrelated"],
+        "{after}"
+    );
+    let backup = path.with_file_name("settings.toml.bak-bale");
+    assert!(!backup.exists(), "backup left in the repo");
+}
+
+#[test]
+fn install_conductor_twice_is_noop() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    let repo = env.repo.to_str().unwrap();
+    let args = ["install", "--hooks", "conductor", "--repo", repo];
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let first = fs::read_to_string(&path).unwrap();
+    assert!(first.contains("[scripts]"), "{first}");
+    assert!(first.contains(" hook conductor setup\""), "{first}");
+    assert!(first.contains(" hook conductor archive\""), "{first}");
+
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("\n+ "), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), first);
+}
+
+#[test]
+fn install_conductor_does_not_chain_bale_twice() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text = "[scripts]\n\
+                setup = \"npm i && '/old/bale' hook conductor setup\"\n\
+                archive = \"'/old/bale' hook conductor archive; echo bye\"\n";
+    fs::write(&path, text).unwrap();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "conductor", "--repo", repo],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert!(
+        !stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
 }

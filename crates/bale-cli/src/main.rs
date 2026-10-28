@@ -85,7 +85,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Entry points for Claude Code and git hooks.
+    /// Entry points for Claude Code, git and Conductor hooks.
     Hook {
         #[command(subcommand)]
         kind: HookKind,
@@ -122,6 +122,11 @@ enum HookKind {
         #[command(subcommand)]
         event: GitHook,
     },
+    /// Conductor's setup and archive scripts.
+    Conductor {
+        #[command(subcommand)]
+        event: ConductorHook,
+    },
 }
 
 #[derive(Subcommand)]
@@ -130,6 +135,14 @@ enum ClaudeHook {
     Create,
     /// WorktreeRemove: JSON on stdin, colds the worktree.
     Remove,
+}
+
+#[derive(Subcommand)]
+enum ConductorHook {
+    /// setup: registers $CONDUCTOR_WORKSPACE_PATH (or the cwd); always exits 0.
+    Setup,
+    /// archive: colds $CONDUCTOR_WORKSPACE_PATH (or the cwd).
+    Archive,
 }
 
 #[derive(Subcommand)]
@@ -210,6 +223,12 @@ fn main() -> ExitCode {
             HookKind::Git {
                 event: GitHook::PostCheckout { prev, new, flag },
             } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
+            HookKind::Conductor {
+                event: ConductorHook::Setup,
+            } => Ok(bale_hooks::conductor::setup(&home)),
+            HookKind::Conductor {
+                event: ConductorHook::Archive,
+            } => Ok(bale_hooks::conductor::archive(&home)),
         },
         Command::Install {
             hooks,

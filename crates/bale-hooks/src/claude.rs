@@ -172,7 +172,7 @@ pub fn remove(home: &BaleHome) -> Result<ExitCode> {
 const HOOKS: [(&str, &str); 2] = [("WorktreeCreate", "create"), ("WorktreeRemove", "remove")];
 
 /// `s` single-quoted for sh, which Claude Code runs command hooks with.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

@@ -13,6 +13,7 @@ use bale_core::ops::up::{resolve, Outcome};
 use bale_core::BaleHome;
 
 pub mod claude;
+pub mod conductor;
 pub mod git;
 pub mod install;
 pub mod proc;
@@ -99,6 +100,7 @@ pub fn install_plan(tool: Tool, exe: &Path, home: &Path, repo: Option<&Path>) ->
     match (tool, repo) {
         (Tool::Claude, _) => claude::install_plan(home, exe),
         (Tool::Git, Some(repo)) => git::install_plan(repo, exe),
+        (Tool::Conductor, Some(repo)) => conductor::install_plan(repo, exe),
         _ => bail!("{} hooks are not supported yet", tool.name()),
     }
 }
@@ -202,8 +204,8 @@ mod tests {
             let err = install_plan(t, p, p, None).err().unwrap().to_string();
             assert_eq!(err, format!("--repo is required for {}", t.name()));
         }
-        let err = install_plan(Tool::Conductor, p, p, Some(p)).err().unwrap();
-        assert_eq!(err.to_string(), "conductor hooks are not supported yet");
+        let err = install_plan(Tool::Cursor, p, p, Some(p)).err().unwrap();
+        assert_eq!(err.to_string(), "cursor hooks are not supported yet");
     }
 
     #[test]
