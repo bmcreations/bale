@@ -70,7 +70,7 @@ bale hook codex setup [<path>]
 
 bale install                          # scheduled sweep, as today
 bale install --hooks claude,conductor,cursor,codex [--repo <REPO>]
-bale install --git-hook <REPO>        # as today
+bale install --hooks git --repo <REPO>  # as today
 ```
 
 `--repo` is required for conductor and cursor, whose config lives in the repo
