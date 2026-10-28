@@ -202,6 +202,11 @@ against what was captured before it is used.
 4. Write the registry record as `baling`.
 5. Rename each regenerable directory to a trash name inside the workspace, then delete the trash names.
    This makes a crash leave either a full directory or a trash name that the next run finishes deleting.
+   The trash names (`.bale-trash-<name>-<digits>`) are chosen and written to the `baling` record before
+   anything moves, and removal, on the first run or a resume, touches only those recorded paths. Each must
+   still carry bale's trash name, sit under the root outside any nested repository, and hold no `.git`, or
+   `up` errors and keeps it. A user file that happens to start with `.bale-trash-`, or another worktree's
+   trash nested in the tree, is never removed.
    A directory with a regenerable name that holds files git tracks, or untracked files that are not
    ignored, is kept and reported: it is source, not build output. A regenerable-named entry that is itself
    untracked and not ignored, including a symlink, is kept the same way. So is a regenerable-named directory
@@ -245,26 +250,50 @@ Everything in `bale up`, then:
    similar entries from a configurable list. An ignored file inside a regenerable-named directory that `up`
    keeps is saved. Inside a submodule, ignored files under a regenerable name count as regenerable and are not
    saved. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
-   shared store. The manifest also records the permission bits of every regular file `open` writes (on
-   unix) and every directory with nothing in it, since git keeps neither a file's full mode nor empty
-   directories.
+   shared store. The manifest also records the permission bits of every regular file and directory `open`
+   writes, and of the tree's root (on unix), and every directory with nothing in it, since git keeps
+   neither a full mode nor empty directories. Hard links are not preserved: each link comes back as a
+   separate file with the same bytes, so no data is lost.
 4. Verify the saved state by hashing it against the tree. This in-place check is an early refusal; the
    safety of the delete rests on step 5.
 5. Rename the checkout directory to a trash name and check the moved tree against what `open` would give
    back. bale runs `open`'s own restore (the wip commit read into a private index and checked out, then the
    saved files, modes and empty directories) into a directory beside the trash, and compares the two with
    plain file reads, not through git: the path set both ways by exact name, file types, bytes, modes on
-   unix, and symlink targets. The walk skips only the root's `.git`, the regenerable directories `up`
-   removed, what step 3 skips (`node_modules` and the denylist), and the inside of submodule directories.
-   Submodules are checked through git instead, nested submodules too: a tracked edit, an untracked file, a
-   new commit, or an ignored file that is not regenerable inside a submodule counts as a change, since the
-   wip commit holds only the submodule's commit. Then check again for processes holding the moved tree. A
-   process that opened the tree after the busy check could have written to it. On any change, move the tree
-   back and return the record to `baled`. A disk difference is reported as skipped, naming the first
+   unix (files, directories and the root), and symlink targets. The check dir is checked out with HEAD
+   where it was in the tree, so config that depends on the branch (`includeIf "onbranch:..."`) applies as
+   it will at `open`. The walk skips only the root's `.git`, the regenerable directories `up` removed, and
+   what step 3 skips (`node_modules` and the denylist). A skipped directory still has every path the wip
+   commit holds under it walked and compared, since `open` writes those. Any entry with an extended
+   attribute other than the ones the OS sets on its own (`com.apple.provenance`, `com.apple.quarantine`,
+   `com.apple.lastuseddate#PS`, `com.apple.macl`, `security.selinux`) counts as a difference: nothing
+   saves xattrs, and a Finder tag is the user's.
+
+   Each checked-out submodule, nested ones too, is restored the same way: its commit in the wip tree is
+   checked out from the submodule's own git dir (so its own config applies, as it will for `git submodule
+   update`) and compared byte for byte. Inside a submodule the walk also skips its `.git`, its regenerable
+   directories and the root's that fall inside it, and the deny and `regenerable_extra` entries rebased
+   onto it. A file whose mode the checkout would not give back, such as a 0600 file, refuses. Submodules
+   are also checked through git: a tracked edit, an untracked file, a new commit, or an ignored file that
+   is not regenerable inside a submodule counts as a change, since the wip commit holds only the
+   submodule's commit.
+
+   The compare hashes (sha256) every regular file it reads outside submodules, from the bytes it compared,
+   and keeps the stat (device, inode, size, mode, mtime and ctime on unix; size, mtime and creation time
+   elsewhere) of every entry it walked. Then check again for processes holding the moved tree, and stat
+   every entry again: a process that opened the tree after the busy check, or wrote after the compare read
+   a file, could have changed it. A rewrite that keeps the size and lands within the filesystem's mtime
+   granularity can still slip past the stat. On any change, move the tree back and return the record to
+   `baled`. A disk difference is reported as skipped, naming the first
    differing path; a submodule change or a new holder is reported busy (with the holders, when there are
    some). If a check itself fails, move the tree back the same way and report the error. Only when both checks pass,
-   record the trash name and the wip commit it was checked against, then remove the trash directory. The
-   worktree stays locked in git.
+   write the hashes into the manifest, record the trash name and the wip commit it was checked against,
+   then remove the trash directory. The worktree stays locked in git.
+
+   The check dir is named `.bale-check-<id>-<6 random characters>` and removed when the check ends. One a
+   crash leaves (it holds copies of the tree's files, saved secrets included) is removed by the next
+   recovery of that workspace or by `bale gc`, both under the workspace's lock. Other workspaces' check
+   dirs in the same parent are left alone.
 
    Because the compare reads the disk, a tree whose files git would not give back byte for byte stays:
    a clean filter that changes content, `core.autocrlf=input` on a CRLF file, a new `ident` file holding an
@@ -276,10 +305,17 @@ Everything in `bale up`, then:
 ### `bale open`
 
 1. Check out the branch at the same path. If the directory was moved, use `git worktree repair`.
-2. Apply `refs/bale/<id>/wip` and restore the saved files, checking hashes, then the recorded modes and
-   empty directories. Check the result against the wip commit's own path list and the manifest, never the
-   ignore rules in force at open time: an exclude line removed while the tree was cold turns a saved ignored
-   file into an untracked one, and that must not fail the open.
+2. With HEAD where `cold` left it (on the recorded branch, or detached), check out `refs/bale/<id>/wip`
+   through the same steps as cold's check, so branch-dependent config applies the same way. Restore the
+   saved files, checking hashes, then the recorded modes and empty directories. Check the result, still
+   with HEAD there, against the wip commit's own path list and the manifest, never the ignore rules in
+   force at open time: an exclude line removed while the tree was cold turns a saved ignored file into an
+   untracked one, and that must not fail the open. Then compare the raw bytes of every file against the
+   hashes cold recorded. If git config changed while the tree was cold (a filter, eol rules), the checkout
+   can write different bytes that git's own diff still calls equal; `open` then stops naming the file,
+   with the record left `opening` and the saved state kept. A save made before hashes were recorded has
+   none, and this check is skipped for it. Submodules are not checked out; `open` notes them for `git
+   submodule update --init`. Only after the check does HEAD detach for the index reset.
 3. Rewrite machine-specific absolute paths that are known to break, such as `sdk.dir` in
    `local.properties`. This only matters if the path or machine changed.
 4. Release bale's git lock (a lock with any other reason stays) and mark it hot.
@@ -338,6 +374,7 @@ A record left `cooling` by a crash resumes on the next `cold` or sweep.
 - If the checkout is still at its path, `cold` saves and verifies it again from step 2.
 - If the checkout is gone and `refs/bale/<id>/wip` does not resolve, or the saved manifest is missing,
   nothing is deleted: `cold` reports an error and leaves any trash directory beside the path.
+- Stale `.bale-check-<id>-*` dirs beside the path are removed first.
 - Otherwise each trash directory beside the path is handled in turn:
   - If step 5 recorded it (both the trash name and the wip commit match), it was already checked and is
     deleted.
