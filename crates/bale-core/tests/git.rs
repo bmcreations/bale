@@ -28,7 +28,10 @@ fn lists_main_and_linked() {
 fn detached_worktree_has_no_branch() {
     let fx = Fixture::new();
     let p = fx.repo.parent().unwrap().join("det");
-    sh(&fx.repo, &["worktree", "add", "--detach", p.to_str().unwrap()]);
+    sh(
+        &fx.repo,
+        &["worktree", "add", "--detach", p.to_str().unwrap()],
+    );
     let list = git::worktrees(&fx.repo).unwrap();
     let w = list.iter().find(|w| !w.is_main).unwrap();
     assert_eq!(w.branch, None);
@@ -40,7 +43,13 @@ fn lock_respects_foreign_lock() {
     let wt = fx.add_worktree("wt", "feat");
     sh(
         &fx.repo,
-        &["worktree", "lock", "--reason", "someone else", wt.to_str().unwrap()],
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "someone else",
+            wt.to_str().unwrap(),
+        ],
     );
     git::lock_worktree(&fx.repo, &wt).unwrap();
     assert!(!git::unlock_worktree_if_ours(&fx.repo, &wt).unwrap());
@@ -88,7 +97,10 @@ fn common_and_admin_dirs() {
     let admin = git::admin_dir(&wt).unwrap();
     assert_ne!(canon(&admin), canon(&common));
     assert!(admin.starts_with(&common) || canon(&admin).starts_with(canon(&common)));
-    assert_eq!(canon(&git::admin_dir(&fx.repo).unwrap()), canon(&fx.repo.join(".git")));
+    assert_eq!(
+        canon(&git::admin_dir(&fx.repo).unwrap()),
+        canon(&fx.repo.join(".git"))
+    );
 }
 
 #[test]
@@ -112,7 +124,9 @@ fn retry_on_index_lock() {
 fn other_errors_return_immediately_with_stderr() {
     let fx = Fixture::new();
     let start = std::time::Instant::now();
-    let err = Git::at(&fx.repo).run(&["rev-parse", "nope-ref"]).unwrap_err();
+    let err = Git::at(&fx.repo)
+        .run(&["rev-parse", "nope-ref"])
+        .unwrap_err();
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
     let msg = format!("{err:#}");
     assert!(

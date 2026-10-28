@@ -65,7 +65,10 @@ fn corrupt_record_is_reported_not_skipped() {
     let bad = h.records_dir().join("bad.json");
     std::fs::write(&bad, "{").unwrap();
     let err = reg.all().unwrap_err();
-    assert!(format!("{err:#}").contains(&bad.display().to_string()), "{err:#}");
+    assert!(
+        format!("{err:#}").contains(&bad.display().to_string()),
+        "{err:#}"
+    );
     assert!(reg.get("bad").is_err());
 }
 
