@@ -264,23 +264,30 @@ Everything in `bale up`, then:
    where it was in the tree, so config that depends on the branch (`includeIf "onbranch:..."`) applies as
    it will at `open`. The walk skips only the root's `.git`, the regenerable directories `up` removed, and
    what step 3 skips (`node_modules` and the denylist). A skipped directory still has every path the wip
-   commit holds under it walked and compared, since `open` writes those. Any entry with an extended
-   attribute other than the ones the OS or apps set on their own (`com.apple.provenance`,
+   commit holds under it walked and compared, since `open` writes those. Any entry, or the tree's root,
+   with an extended attribute other than the ones the OS or apps set on their own (`com.apple.provenance`,
    `com.apple.quarantine`, `com.apple.lastuseddate#PS`, `com.apple.macl`, `com.apple.TextEncoding`,
    `security.selinux`, and `com.apple.FinderInfo` on `.DS_Store` only) counts as a difference: nothing
-   saves xattrs, and a Finder tag or colour label is the user's.
+   saves xattrs, and a Finder tag or colour label is the user's. On macOS the same goes for a file flag
+   (`chflags`) other than `UF_COMPRESSED` and `UF_TRACKED`, which the OS keeps up itself (`hidden` is
+   allowed on `.DS_Store` only, where Finder sets it; `uchg`, `nodump` and a dataless iCloud file refuse),
+   and for an extended ACL with any entry. On Linux an ACL is a `system.posix_acl_*` xattr, so the xattr
+   rule covers it. Linux `chattr` attributes are not checked.
 
    Each checked-out submodule, nested ones too, is restored the same way: its commit in the wip tree is
    checked out from the submodule's own git dir (so its own config applies, as it will for `git submodule
    update`) and compared byte for byte. Inside a submodule the walk also skips its `.git`, its regenerable
    directories and the root's that fall inside it, and the deny and `regenerable_extra` entries rebased
-   onto it. A file whose mode the checkout would not give back, such as a 0600 file, refuses. Submodules
+   onto it. A file whose mode the checkout would not give back, such as a 0600 file, refuses. A wip commit
+   whose gitlink differs from HEAD's (a submodule moved to another commit, or one added) refuses, because
+   `open` resets the index to HEAD and `git submodule update` would then check out HEAD's commit; a
+   deleted submodule directory goes cold, since `open` gives that back as a deletion. Submodules
    are also checked through git: a tracked edit, an untracked file, a new commit, or an ignored file that
    is not regenerable inside a submodule counts as a change, since the wip commit holds only the
    submodule's commit.
 
    The compare hashes (sha256) every regular file it reads outside submodules, from the bytes it compared,
-   and keeps the stat (device, inode, size, mode, mtime and ctime on unix; size, mtime and creation time
+   records the target of every symlink outside submodules, and keeps the stat (device, inode, size, mode, mtime and ctime on unix; size, mtime and creation time
    elsewhere) of every entry it walked. Then check again for processes holding the moved tree, and stat
    every entry again: a process that opened the tree after the busy check, or wrote after the compare read
    a file, could have changed it. A rewrite that keeps the size and lands within the filesystem's mtime
@@ -288,13 +295,17 @@ Everything in `bale up`, then:
    `baled`. A disk difference is reported as skipped, naming the first
    differing path; a submodule change or a new holder is reported busy (with the holders, when there are
    some). If a check itself fails, move the tree back the same way and report the error. Only when both checks pass,
-   write the hashes into the manifest, record the trash name and the wip commit it was checked against,
-   then remove the trash directory. The worktree stays locked in git.
+   write the hashes and symlink targets into the manifest, record the trash name and the wip commit it
+   was checked against, then remove the trash directory. The worktree stays locked in git. If the removal
+   fails partway, the record stays `cooling` and the error names the first entry that could not be
+   removed, with what usually blocks it (a directory without write permission, an immutable flag, an ACL
+   that denies delete); the next `cold` finishes the removal.
 
    The check dir is named `.bale-check-<id>-<6 random characters>` and removed when the check ends. One a
    crash leaves (it holds copies of the tree's files, saved secrets included) is removed by the next
-   recovery of that workspace or by `bale gc`, both under the workspace's lock. Other workspaces' check
-   dirs in the same parent are left alone.
+   recovery of that workspace or by `bale gc`, both under the workspace's lock. `bale gc` lists each one it
+   removes, and a dry run lists the ones it would remove. Other workspaces' check dirs in the same parent
+   are left alone.
 
    Because the compare reads the disk, a tree whose files git would not give back byte for byte stays:
    a clean filter that changes content, `core.autocrlf=input` on a CRLF file, a new `ident` file holding an
@@ -312,10 +323,11 @@ Everything in `bale up`, then:
    with HEAD there, against the wip commit's own path list and the manifest, never the ignore rules in
    force at open time: an exclude line removed while the tree was cold turns a saved ignored file into an
    untracked one, and that must not fail the open. Then compare the raw bytes of every file against the
-   hashes cold recorded. If git config changed while the tree was cold (a filter, eol rules), the checkout
-   can write different bytes that git's own diff still calls equal; `open` then stops naming the file,
-   with the record left `opening` and the saved state kept. A save made before hashes were recorded has
-   none, and this check is skipped for it. Submodules are not checked out; `open` notes them for `git
+   hashes cold recorded, and check that every recorded symlink is still a symlink to the same target. If
+   git config changed while the tree was cold (a filter, eol rules, `core.symlinks=false`), the checkout
+   can write different bytes, or a regular file in place of a symlink, that git's own diff still calls
+   equal; `open` then stops naming the file, with the record left `opening` and the saved state kept. A
+   save made before hashes or symlink targets were recorded has none, and that check is skipped for it. Submodules are not checked out; `open` notes them for `git
    submodule update --init`. Only after the check does HEAD detach for the index reset.
 3. Rewrite machine-specific absolute paths that are known to break, such as `sdk.dir` in
    `local.properties`. This only matters if the path or machine changed.
@@ -358,7 +370,9 @@ the source it saves is about 1 GB per Android worktree.)*
 - If the branch is checked out in another worktree, `open` stays detached at the saved commit and reports it.
 - `cold` skips a tree, before saving anything, when any of these hold: a submodule (nested ones too) has
   uncommitted changes or untracked files, ignored files that are not regenerable, or its own `.git`
-  directory; a submodule directory that is not checked out holds files; the tree uses sparse checkout; or
+  directory; a submodule is checked out at a commit other than the one HEAD records (a commit made inside
+  it shows as ` M lib`); a submodule directory that is not checked out holds files; the tree uses sparse
+  checkout; or
   an index entry at the root or in a submodule is flagged assume-unchanged or skip-worktree, since `git
   status` skips edits to those. LFS pointer files need no special handling, because the checkout restores
   them. Anything step 5's disk compare would refuse is caught there, after the move, and the tree moves
@@ -381,8 +395,9 @@ A record left `cooling` by a crash resumes on the next `cold` or sweep. Before a
     deleted.
   - If it was not recorded and has no `.git`, it is kept and reported as an error, since git can't check it
     against the save.
-  - If it was not recorded, it is checked against the save with step 5's disk compare. If it matches, it is deleted. If it
-    changed, or the check fails, it is moved back to the recorded path and the record returns to `baled`;
+  - If it was not recorded, it is checked against the save with step 5's disk compare, then for processes
+    holding it and for changes since the compare, as step 5 does. If all pass, it is deleted. If it
+    changed, a process holds it, or the check fails, it is moved back to the recorded path and the record returns to `baled`;
     a change is reported busy, and a failed check as an error. If the move back fails, the trash stays where it
     is, the record stays `cooling`, and the error names both paths.
 - When every trash directory is gone, the record is written `cold`.
