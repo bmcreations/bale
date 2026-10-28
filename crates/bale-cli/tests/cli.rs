@@ -2111,6 +2111,13 @@ fn codex_setup_outside_worktree_exits_0() {
 fn install_codex_writes_nothing() {
     let env = Env::new();
     let before = listing(&env.home());
+    let repo_files = |env: &Env| -> Vec<PathBuf> {
+        listing(&env.repo)
+            .into_iter()
+            .filter(|p| !p.strip_prefix(&env.repo).unwrap().starts_with(".git"))
+            .collect()
+    };
+    let repo_before = repo_files(&env);
     let out = env.bale(&env.repo, &["install", "--hooks", "codex"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
@@ -2120,4 +2127,20 @@ fn install_codex_writes_nothing() {
     );
     assert!(text.contains("unconfirmed"), "{text}");
     assert_eq!(listing(&env.home()), before);
+    assert_eq!(repo_files(&env), repo_before);
+    assert!(!env.repo.join(".codex").exists());
+}
+
+#[test]
+fn codex_setup_resolves_relative_path_arg() {
+    let env = Env::new();
+    let wt = env.add_worktree("codex-rel");
+    let out = env.bale(
+        wt.parent().unwrap(),
+        &["hook", "codex", "setup", "codex-rel"],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.is_registered(&wt), "{}", stdout(&out));
+    assert_eq!(json_record(&env, &wt)["origin"]["tool"], "codex");
 }

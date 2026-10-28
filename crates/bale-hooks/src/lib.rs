@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use bale_core::busy::Holder;
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::up::{resolve, Outcome};
@@ -119,19 +119,21 @@ impl FromStr for Tool {
 /// The plan that hooks `tool` up to bale at `exe`. Claude Code's settings
 /// live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
 /// they require; Codex needs neither.
-pub fn install_plan(tool: Tool, exe: &Path, home: &Path, repo: Option<&Path>) -> Result<Plan> {
-    let needs_repo = matches!(tool, Tool::Git | Tool::Conductor | Tool::Cursor);
-    let repo = match repo {
-        None if needs_repo => bail!("--repo is required for {}", tool.name()),
-        repo => repo,
+pub fn install_plan<'a>(
+    tool: Tool,
+    exe: &Path,
+    home: &Path,
+    repo: Option<&'a Path>,
+) -> Result<Plan> {
+    let need = |repo: Option<&'a Path>| {
+        repo.with_context(|| format!("--repo is required for {}", tool.name()))
     };
-    match (tool, repo) {
-        (Tool::Claude, _) => claude::install_plan(home, exe),
-        (Tool::Git, Some(repo)) => git::install_plan(repo, exe),
-        (Tool::Conductor, Some(repo)) => conductor::install_plan(repo, exe),
-        (Tool::Cursor, Some(repo)) => cursor::install_plan(repo, exe),
-        (Tool::Codex, _) => codex::install_plan(exe),
-        _ => bail!("{} hooks are not supported yet", tool.name()),
+    match tool {
+        Tool::Claude => claude::install_plan(home, exe),
+        Tool::Git => git::install_plan(need(repo)?, exe),
+        Tool::Conductor => conductor::install_plan(need(repo)?, exe),
+        Tool::Cursor => cursor::install_plan(need(repo)?, exe),
+        Tool::Codex => codex::install_plan(exe),
     }
 }
 
@@ -240,12 +242,18 @@ mod tests {
     }
 
     #[test]
-    fn repo_is_required_before_support_is_checked() {
+    fn repo_is_required_for_git_conductor_cursor() {
         let p = Path::new("/nowhere");
         for t in [Tool::Git, Tool::Conductor, Tool::Cursor] {
             let err = install_plan(t, p, p, None).err().unwrap().to_string();
             assert_eq!(err, format!("--repo is required for {}", t.name()));
         }
+    }
+
+    #[test]
+    fn codex_needs_no_repo() {
+        let p = Path::new("/nowhere");
+        assert!(install_plan(Tool::Codex, p, p, None).is_ok());
     }
 
     #[test]
