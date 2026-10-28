@@ -240,14 +240,7 @@ pub fn claude_worktree_remove(home: &BaleHome) -> Result<ExitCode> {
     let code = match resolve(home, &path.to_string_lossy()).and_then(|id| cold(home, &id)) {
         Ok(Outcome::Done(_)) => ExitCode::SUCCESS,
         Ok(Outcome::Busy(holders)) => {
-            eprintln!(
-                "bale: {} is busy, left untouched; these processes hold it \
-                 (Claude Code's background tasks and servers count):",
-                path.display()
-            );
-            for h in holders {
-                eprintln!("  pid {} {} {}", h.pid, h.command, h.path.display());
-            }
+            eprint!("{}", busy_text(&path, &holders));
             ExitCode::from(3)
         }
         Ok(Outcome::Skipped(reason)) => {
@@ -267,6 +260,31 @@ pub fn claude_worktree_remove(home: &BaleHome) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     Ok(code)
+}
+
+/// What the remove hook prints for a busy tree. No holders means the tree
+/// changed while cold was saving it, not that a process holds it.
+fn busy_text(path: &Path, holders: &[bale_core::busy::Holder]) -> String {
+    if holders.is_empty() {
+        return format!(
+            "bale: {} changed while bale was making it cold, left untouched; try again\n",
+            path.display()
+        );
+    }
+    let mut text = format!(
+        "bale: {} is busy, left untouched; these processes hold it \
+         (Claude Code's background tasks and servers count):\n",
+        path.display()
+    );
+    for h in holders {
+        text.push_str(&format!(
+            "  pid {} {} {}\n",
+            h.pid,
+            h.command,
+            h.path.display()
+        ));
+    }
+    text
 }
 
 /// post-checkout: registers the cwd when git just created it as a linked
@@ -293,6 +311,28 @@ pub fn git_post_checkout(home: &BaleHome, prev: &str, flag: &str) -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn busy_without_holders_says_the_tree_changed() {
+        let text = busy_text(Path::new("/w/t"), &[]);
+        assert!(!text.contains("these processes hold it"), "{text}");
+        assert!(
+            text.contains("changed while bale was making it cold"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn busy_with_holders_lists_them() {
+        let holder = bale_core::busy::Holder {
+            pid: 7,
+            command: "gradle".into(),
+            path: PathBuf::from("/w/t"),
+        };
+        let text = busy_text(Path::new("/w/t"), &[holder]);
+        assert!(text.contains("these processes hold it"), "{text}");
+        assert!(text.contains("pid 7 gradle /w/t"), "{text}");
+    }
 
     fn table(rows: &[(u32, u32, &str)]) -> impl Fn(u32) -> Option<(u32, String)> {
         let map: HashMap<u32, (u32, String)> = rows
