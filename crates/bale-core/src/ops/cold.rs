@@ -1283,6 +1283,39 @@ mod tests {
         );
     }
 
+    /// recover lists regenerable dirs with git in the moved tree; a
+    /// submodule there (whose git dir points at the old path) must not
+    /// break that.
+    #[test]
+    fn crash_after_rename_with_submodule_keeps_a_late_write() {
+        let (tmp, repo) = repo();
+        let wt = with_submodule(tmp.path(), &repo);
+        fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+        fs::create_dir_all(wt.join("build")).unwrap();
+        fs::write(wt.join("build/k.txt"), "k\n").unwrap();
+        git(&wt, &["add", "settings.gradle.kts", "build/k.txt"]);
+        git(
+            &wt,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "gradle"],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let before = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("late.txt"), "late\n").unwrap()
+        });
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop((before, after));
+        assert!(crashed.is_err());
+        let trash = trash_siblings(&wt).unwrap();
+        assert_eq!(trash.len(), 1);
+
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Busy(Vec::new()));
+        assert!(trash[0].join("late.txt").is_file());
+        assert!(trash[0].join("lib/.git").exists());
+    }
+
     /// A git failure while checking the moved tree is an error, not a busy
     /// tree: the tree goes back and the cause is reported.
     #[test]
