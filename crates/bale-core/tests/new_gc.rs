@@ -562,3 +562,40 @@ fn gc_removes_stale_check_dirs_of_the_workspace() {
     assert!(theirs.join("tree/ro/.env").exists());
     assert!(lookalike.join("tree/ro/.env").exists());
 }
+
+/// A Hot record whose path now holds a folder that is not its checkout
+/// (git in it climbs into the main repo) keeps its saved state: the work
+/// open restored there is gone, and the save may be the only copy.
+#[test]
+fn gc_keeps_saved_state_when_the_path_is_not_the_checkout() {
+    let fx = Fixture::new();
+    let wt = fx.repo.join(".claude/worktrees/w");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            LOCK_REASON,
+            wt.to_str().unwrap(),
+        ],
+    );
+    plant_saved_state(&fx, &id);
+    fs::remove_dir_all(&wt).unwrap();
+    fs::create_dir_all(wt.join(".idea")).unwrap();
+    fs::write(wt.join(".idea/workspace.xml"), "<x/>\n").unwrap();
+
+    let report = gc(&fx.home(), false).unwrap();
+    assert!(report.cleaned.is_empty(), "{report:?}");
+    assert!(report.unlocked.is_empty(), "{report:?}");
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert_ne!(bale_refs(&fx, &id), "");
+    assert!(fx.home().saved_dir(&id).join("files/x").exists());
+    assert_eq!(lock_reason(&fx, &wt), Some(LOCK_REASON.to_string()));
+    assert!(registry(&fx).get(&id).unwrap().is_some());
+}

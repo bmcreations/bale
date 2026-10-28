@@ -30,8 +30,9 @@ pub struct GcReport {
 
 /// Removes a `Hot` or `Baled` record when its dir is gone and git no longer
 /// lists the worktree, deleting `refs/bale/<id>/*` and `$BALE_HOME/<id>`.
-/// For a `Hot` workspace whose dir exists, releases a worktree lock carrying
-/// bale's reason and deletes leftover saved state. Other levels, workspaces
+/// For a `Hot` workspace whose dir is still its own checkout, releases a
+/// worktree lock carrying bale's reason and deletes leftover saved state.
+/// Other levels, workspaces
 /// another bale process holds, and records whose repo cannot be probed are
 /// left alone. With `dry_run`, reports the same lists and changes nothing.
 pub fn gc(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
@@ -114,7 +115,13 @@ fn collect(
         return Ok(());
     }
 
-    // Hot and present: clear what an interrupted `bale open` left behind.
+    // Hot and present: clear what an interrupted `bale open` left behind,
+    // but only from the worktree's own checkout. A folder recreated at the
+    // path (git in it climbs into an enclosing repo, or fails) does not hold
+    // the work open restored, so the save may be its only copy.
+    if disk::ensure_checkout(&record.path, &record.admin_dir).is_err() {
+        return Ok(());
+    }
     if listed.is_some_and(|w| w.locked.as_deref() == Some(LOCK_REASON)) {
         if !dry_run {
             git::unlock_worktree_if_ours(&record.repo_common_dir, &record.path)?;
