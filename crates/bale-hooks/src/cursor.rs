@@ -200,8 +200,8 @@ const HOOK_ARGS: [&str; 3] = ["hook", "cursor", "setup"];
 
 /// Removes bale's setup entry from each setup array of
 /// `<repo>/.cursor/worktrees.json`; an entry the user wrapped around bale
-/// stays. A key emptied by the removal goes, and the file when nothing is
-/// left.
+/// stays. A key emptied by the removal goes, and the file when bale created
+/// it and nothing is left, as `json_uninstall_steps` decides.
 pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
     let path = repo.join(".cursor").join("worktrees.json");
     let Some((before, mode)) = read_config(&path)? else {
@@ -217,6 +217,7 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         .with_context(|| format!("{} is not a JSON object", path.display()))?;
     let mut changed = false;
     let mut steps = Vec::new();
+    let mut emptied = Vec::new();
     for key in SETUP_KEYS {
         let Some(commands) = obj.get_mut(key).and_then(Value::as_array_mut) else {
             continue;
@@ -242,7 +243,7 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         if commands.len() != n {
             changed = true;
             if commands.is_empty() {
-                obj.shift_remove(key);
+                emptied.push(vec![key]);
             }
         }
     }
@@ -253,7 +254,9 @@ pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
         )));
         return Ok(Plan::new(steps));
     }
-    steps.extend(json_uninstall_steps(backups, &path, before, mode, &root)?);
+    steps.extend(json_uninstall_steps(
+        backups, &path, before, mode, &root, &emptied,
+    )?);
     Ok(Plan::new(steps))
 }
 

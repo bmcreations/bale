@@ -26,9 +26,11 @@ pub enum Step {
     },
     /// Deletes a file; one already gone counts as deleted.
     Remove(PathBuf),
-    /// Rewrites a config file atomically. With `backup`, the file as it was
-    /// is copied there first unless a backup already exists: serde_json
-    /// reformats a JSON file, and the copy keeps the original layout.
+    /// Rewrites a config file atomically. With `backup`, set when install
+    /// adds bale to a file that had no bale entry, the file as it is now
+    /// replaces any older backup there (one that does not exist yet removes
+    /// it): serde_json reformats a JSON file, and the copy keeps the layout,
+    /// and uninstall reads a backup's presence as "the user made this file".
     Settings {
         path: PathBuf,
         before: Option<String>,
@@ -78,8 +80,8 @@ impl Plan {
                 } => {
                     println!("update {}:", display_path(path));
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if let (Some(_), Some(backup)) = (before, backup) {
-                        println!("{}", reformat_note(path, backup));
+                    if let Some(note) = reformat_note(path, before, backup) {
+                        println!("{note}");
                     }
                 }
                 Step::Run {
@@ -142,9 +144,11 @@ impl Plan {
                     backup,
                 } => {
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
-                    if let (Some(_), Some(backup)) = (before, backup) {
-                        println!("{}", reformat_note(path, backup));
-                        if fs::symlink_metadata(backup).is_err() {
+                    if let Some(note) = reformat_note(path, before, backup) {
+                        println!("{note}");
+                    }
+                    match (before, backup) {
+                        (Some(_), Some(backup)) => {
                             if let Some(dir) = backup.parent() {
                                 fs::create_dir_all(dir)
                                     .with_context(|| format!("creating {}", dir.display()))?;
@@ -152,6 +156,16 @@ impl Plan {
                             fs::copy(path, backup)
                                 .with_context(|| format!("backing up {}", path.display()))?;
                         }
+                        // bale creates the file: a backup left from an
+                        // earlier file at this path no longer describes it.
+                        (None, Some(backup)) => match fs::remove_file(backup) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(e)
+                                    .with_context(|| format!("deleting {}", backup.display()))
+                            }
+                            _ => {}
+                        },
+                        _ => {}
                     }
                     write_atomic(path, after)?;
                     if let Some(mode) = mode {
@@ -198,13 +212,22 @@ impl Plan {
     }
 }
 
-/// Where a JSON config's original is kept: in `backups` (bale's
-/// `$BALE_HOME/backups`), named for `path`'s whole absolute path so two
-/// repos' files of the same name keep separate backups.
+/// Where a config's original is kept: in `backups` (bale's
+/// `$BALE_HOME/backups`), named for the sha256 of `path`'s absolute path, so
+/// two repos' files of the same name keep separate backups, then the path's
+/// last characters for a reader, short enough for any filesystem.
 pub(crate) fn backup_path(backups: &Path, path: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    const TAIL: usize = 80;
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let name: String = path
-        .to_string_lossy()
+    let whole = path.to_string_lossy();
+    let hash: String = Sha256::digest(whole.as_bytes())
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // ASCII only, so a char is a byte.
+    let readable: Vec<char> = whole
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' {
@@ -214,7 +237,10 @@ pub(crate) fn backup_path(backups: &Path, path: &Path) -> PathBuf {
             }
         })
         .collect();
-    backups.join(format!("{name}.bak-bale"))
+    let tail: String = readable[readable.len().saturating_sub(TAIL)..]
+        .iter()
+        .collect();
+    backups.join(format!("{hash}-{}.bak-bale", tail.trim_start_matches('-')))
 }
 
 /// Where installs before backups moved to `$BALE_HOME` kept them: beside `path`.
@@ -224,12 +250,18 @@ fn old_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn reformat_note(path: &Path, backup: &Path) -> String {
+/// The note that install reformats a JSON file and where its original is
+/// kept. toml_edit keeps a TOML file's layout, so it gets none.
+fn reformat_note(path: &Path, before: &Option<String>, backup: &Option<PathBuf>) -> Option<String> {
+    let backup = backup.as_ref().filter(|_| before.is_some())?;
+    if path.extension().is_none_or(|e| e != "json") {
+        return None;
+    }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    format!(
+    Some(format!(
         "note: {name} is reformatted (2-space JSON); {} keeps the original",
         display_path(backup)
-    )
+    ))
 }
 
 /// A config file's text and permissions, or `None` when it does not exist.
@@ -251,39 +283,95 @@ pub(crate) fn read_config(path: &Path) -> Result<Option<(String, fs::Permissions
     Ok(Some((text, meta.permissions())))
 }
 
-/// The steps that write `root`, a JSON config with bale's entries removed:
-/// delete the file when nothing is left, else rewrite it, restoring the
-/// install's backup byte for byte when it holds the same JSON.
+/// The steps that write back a JSON config with bale's entries removed.
+/// `kept` is the config with them removed; `emptied` names the containers
+/// (key paths, innermost first) that the removal left empty, which install
+/// may have created.
+///
+/// A backup is install's copy of the file as the user had it, so its
+/// presence means the user made the file:
+/// - a backup that holds `kept` (with only the emptied containers it lacks
+///   left out) is restored byte for byte, and an old one beside the file is
+///   then deleted;
+/// - with a backup that does not match, the file is rewritten without the
+///   emptied containers and kept, even if nothing is left;
+/// - with no backup, bale created the file, and deletes it when nothing is
+///   left.
 pub(crate) fn json_uninstall_steps(
     backups: &Path,
     path: &Path,
     before: String,
     mode: fs::Permissions,
-    root: &serde_json::Value,
+    kept: &serde_json::Value,
+    emptied: &[Vec<&str>],
 ) -> Result<Vec<Step>> {
-    if root.as_object().is_some_and(|o| o.is_empty()) {
+    let settings = |after: String| Step::Settings {
+        path: path.to_path_buf(),
+        before: Some(before.clone()),
+        after,
+        mode: Some(mode.clone()),
+        backup: None,
+    };
+    let old = old_backup_path(path);
+    let mut any_backup = false;
+    for candidate in [backup_path(backups, path), old.clone()] {
+        if fs::symlink_metadata(&candidate).is_err() {
+            continue;
+        }
+        any_backup = true;
+        let Ok(text) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(original) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if prune(kept, emptied, Some(&original)) == original {
+            let mut steps = vec![settings(text)];
+            if candidate == old {
+                steps.push(Step::Remove(old));
+            }
+            return Ok(steps);
+        }
+    }
+    let root = prune(kept, emptied, None);
+    if !any_backup && root.as_object().is_some_and(|o| o.is_empty()) {
         return Ok(vec![Step::Remove(path.to_path_buf())]);
     }
-    let original = [backup_path(backups, path), old_backup_path(path)]
-        .iter()
-        .find_map(|b| fs::read_to_string(b).ok())
-        .filter(|text| {
-            serde_json::from_str::<serde_json::Value>(text)
-                .ok()
-                .as_ref()
-                == Some(root)
-        });
-    let after = match original {
-        Some(text) => text,
-        None => serde_json::to_string_pretty(root)? + "\n",
-    };
-    Ok(vec![Step::Settings {
-        path: path.to_path_buf(),
-        before: Some(before),
-        after,
-        mode: Some(mode),
-        backup: None,
-    }])
+    Ok(vec![settings(serde_json::to_string_pretty(&root)? + "\n")])
+}
+
+/// `kept` without the `emptied` containers that are still empty, except
+/// those `original` has at the same key path.
+fn prune(
+    kept: &serde_json::Value,
+    emptied: &[Vec<&str>],
+    original: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut out = kept.clone();
+    for keys in emptied {
+        let Some((last, parents)) = keys.split_last() else {
+            continue;
+        };
+        if original.is_some_and(|o| keys.iter().try_fold(o, |v, k| v.get(k)).is_some()) {
+            continue;
+        }
+        let Some(parent) = parents
+            .iter()
+            .try_fold(&mut out, |v, k| v.get_mut(k))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let empty = match parent.get(*last) {
+            Some(serde_json::Value::Array(a)) => a.is_empty(),
+            Some(serde_json::Value::Object(o)) => o.is_empty(),
+            _ => false,
+        };
+        if empty {
+            parent.shift_remove(*last);
+        }
+    }
+    out
 }
 
 /// Writes `content` to a temp file beside `path`, then renames it over `path`.
@@ -444,14 +532,25 @@ mod tests {
     #[test]
     fn backup_is_named_for_the_whole_path() {
         let b = Path::new("/b/backups");
-        assert_eq!(
-            backup_path(b, Path::new("/r1/.cursor/worktrees.json")),
-            b.join("-r1-.cursor-worktrees.json.bak-bale")
-        );
-        assert_ne!(
-            backup_path(b, Path::new("/r1/.cursor/worktrees.json")),
-            backup_path(b, Path::new("/r2/.cursor/worktrees.json"))
-        );
+        let name = |p: &str| {
+            backup_path(b, Path::new(p))
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let n = name("/r1/.cursor/worktrees.json");
+        assert!(n.ends_with("-r1-.cursor-worktrees.json.bak-bale"), "{n}");
+        assert_eq!(backup_path(b, Path::new("/r1/x")).parent(), Some(b));
+        assert_ne!(n, name("/r2/.cursor/worktrees.json"));
+        // Paths that read the same once punctuation is replaced still differ.
+        assert_ne!(name("/a-b/x"), name("/a/b/x"));
+        assert_ne!(name("/a b/x"), name("/a/b/x"));
+        // A deep path still gives a name the filesystem takes.
+        let deep = format!("/{}/settings.json", "d".repeat(400));
+        let n = name(&deep);
+        assert!(n.len() < 200, "{}", n.len());
+        assert!(n.ends_with("settings.json.bak-bale"), "{n}");
         // A relative `--repo` is named for where it is, not how it was typed.
         let rel = Path::new(".cursor/worktrees.json");
         assert_eq!(

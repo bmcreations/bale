@@ -2482,6 +2482,10 @@ fn uninstall_schedule_print_only_lists_steps() {
     let wt = env.add_worktree("cold-one");
     let out = env.bale(&env.repo, &["cold", wt.to_str().unwrap()], None);
     assert!(out.status.success(), "{}", stderr(&out));
+    let logs = env.home().join("Library/Logs/bale");
+    if cfg!(target_os = "macos") {
+        fs::create_dir_all(&logs).unwrap();
+    }
     let before = listing(&env.home());
     let bale_before = listing(&env.bale_home());
 
@@ -2500,6 +2504,10 @@ fn uninstall_schedule_print_only_lists_steps() {
         );
         let plist = home.join("Library/LaunchAgents/dev.bale.sweep.plist");
         assert!(text.contains(&format!("rm {}", plist.display())), "{text}");
+        assert!(
+            text.contains(&format!("{} is left in place", logs.display())),
+            "{text}"
+        );
     } else if cfg!(windows) {
         assert!(
             text.contains("run: schtasks /Delete /TN bale-sweep /F"),
@@ -2522,4 +2530,187 @@ fn uninstall_schedule_print_only_lists_steps() {
     assert!(text.contains("bale open"), "{text}");
     assert_eq!(listing(&env.home()), before);
     assert_eq!(listing(&env.bale_home()), bale_before);
+}
+
+#[test]
+fn install_refreshes_the_backup_after_an_uninstall() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, r#"{"model":"a"}"#).unwrap();
+    install(&env, "claude", false);
+    uninstall(&env, "claude", false);
+    assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"model":"a"}"#);
+
+    // The user's edit is what the next install backs up and uninstall restores.
+    let edit = r#"{"model":"b","permissions":{"allow":["X"]}}"#;
+    fs::write(&path, edit).unwrap();
+    install(&env, "claude", false);
+    let backups = backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), edit);
+    uninstall(&env, "claude", false);
+    assert_eq!(fs::read_to_string(&path).unwrap(), edit);
+
+    // The user deletes the file; the file bale then creates is bale's to delete.
+    fs::remove_file(&path).unwrap();
+    install(&env, "claude", false);
+    uninstall(&env, "claude", false);
+    assert!(!path.exists());
+}
+
+#[test]
+fn uninstall_keeps_files_the_user_made() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for original in ["{}", r#"{"hooks":{}}"#] {
+        fs::write(&path, original).unwrap();
+        install(&env, "claude", false);
+        let out = uninstall(&env, "claude", false);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "{}",
+            stdout(&out)
+        );
+    }
+
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let committed = r#"{"setup-worktree":[]}"#;
+    fs::write(&path, committed).unwrap();
+    install(&env, "cursor", true);
+    let out = uninstall(&env, "cursor", true);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        committed,
+        "{}",
+        stdout(&out)
+    );
+
+    // Edited after install, so the backup no longer matches: the file stays.
+    install(&env, "cursor", true);
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let bale_entry = v["setup-worktree"][0].clone();
+    v.as_object_mut().unwrap().shift_remove("setup-worktree");
+    v["setup-worktree-unix"] = serde_json::json!([bale_entry]);
+    fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    uninstall(&env, "cursor", true);
+    let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after, serde_json::json!({}));
+
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for original in ["", "[scripts]\n"] {
+        fs::write(&path, original).unwrap();
+        install(&env, "conductor", true);
+        let out = uninstall(&env, "conductor", true);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "{}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
+fn uninstall_restores_the_first_matching_backup_and_drops_an_old_one() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = r#"{"setup-worktree":["npm i"]}"#;
+    fs::write(&path, original).unwrap();
+    install(&env, "cursor", true);
+    // An install from before backups moved kept the original beside the
+    // file; a stale backup sits where bale keeps them now.
+    let backups = backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let old = path.with_file_name("worktrees.json.bak-bale");
+    fs::write(&old, original).unwrap();
+    fs::write(&backups[0], r#"{"stale":true}"#).unwrap();
+    let out = uninstall(&env, "cursor", true);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        original,
+        "{}",
+        stdout(&out)
+    );
+    assert!(!old.exists(), "{}", stdout(&out));
+}
+
+#[test]
+fn uninstall_conductor_keeps_a_scripts_table_with_comments() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    install(&env, "conductor", true);
+    // The user notes something in the [scripts] table bale created.
+    let text = fs::read_to_string(&path).unwrap();
+    let text = text.replacen("[scripts]\n", "[scripts]\n# run npm i here later\n", 1);
+    fs::write(&path, &text).unwrap();
+    let out = uninstall(&env, "conductor", true);
+    let after = fs::read_to_string(&path).unwrap();
+    assert!(after.contains("[scripts]"), "{after}\n{}", stdout(&out));
+    assert!(after.contains("# run npm i here later"), "{after}");
+    assert!(!after.contains("hook conductor"), "{after}");
+}
+
+/// The post-checkout hook `bale install --git-hook` wrote before `--hooks`.
+const OLD_GIT_HOOK: &str = "#!/bin/sh
+# Installed by `bale install --git-hook`.
+# Registers new linked worktrees with bale, then runs the previous hook.
+BALE='/old/bale'
+command -v \"$BALE\" >/dev/null 2>&1 || BALE=bale
+if command -v \"$BALE\" >/dev/null 2>&1; then
+  \"$BALE\" hook git-post-checkout \"$@\" || true
+fi
+PREV=\"$(dirname \"$0\")/post-checkout.pre-bale\"
+if [ -x \"$PREV\" ]; then
+  exec \"$PREV\" \"$@\"
+fi
+exit 0
+";
+
+#[test]
+fn uninstall_git_removes_only_an_unedited_bale_hook() {
+    let env = Env::new();
+    let hook = hooks_dir(&env).join("post-checkout");
+    let prev = hooks_dir(&env).join("post-checkout.pre-bale");
+    write_hook(&hook, "echo mine");
+    install(&env, "git", true);
+    // The user adds a line to bale's hook: nothing is removed.
+    let mut edited = fs::read_to_string(&hook).unwrap();
+    edited.push_str("echo added\n");
+    fs::write(&hook, &edited).unwrap();
+    let out = uninstall(&env, "git", true);
+    assert!(stdout(&out).contains("edited"), "{}", stdout(&out));
+    assert_eq!(fs::read_to_string(&hook).unwrap(), edited);
+    assert!(prev.is_file());
+
+    // A hook from a bale before `--hooks`, unedited: removed.
+    fs::remove_file(&prev).unwrap();
+    fs::write(&hook, OLD_GIT_HOOK).unwrap();
+    uninstall(&env, "git", true);
+    assert!(!hook.exists());
+}
+
+#[test]
+fn uninstall_git_notes_global_hooks_path() {
+    let env = Env::new();
+    let shared = env.tmp.path().join("user hooks");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(
+        env.home().join(".gitconfig"),
+        format!("[core]\n\thooksPath = {}\n", sh_path(&shared)),
+    )
+    .unwrap();
+    install(&env, "git", true);
+    let out = uninstall(&env, "git", true);
+    assert!(
+        stdout(&out).contains("global git config"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!shared.join("post-checkout").exists());
 }

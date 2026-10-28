@@ -111,6 +111,7 @@ dependencies = [
  "anyhow",
  "bale-core",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml_edit",
 ]

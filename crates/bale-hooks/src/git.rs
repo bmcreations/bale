@@ -48,14 +48,20 @@ fn post_checkout_untraced(home: &BaleHome, prev: &str, flag: &str) -> ExitCode {
 
 fn git_hook_script(exe: &Path) -> String {
     let exe = display_path(exe).replace('\\', "/").replace('\'', r"'\''");
+    render_hook(GIT_HOOK_MARKER, "git post-checkout", &exe)
+}
+
+/// The hook script with `marker`, running `bale hook <sub>`, with `quoted`
+/// as the text inside `BALE='...'`.
+fn render_hook(marker: &str, sub: &str, quoted: &str) -> String {
     format!(
         "#!/bin/sh\n\
-         {GIT_HOOK_MARKER}\n\
+         {marker}\n\
          # Registers new linked worktrees with bale, then runs the previous hook.\n\
-         BALE='{exe}'\n\
+         BALE='{quoted}'\n\
          command -v \"$BALE\" >/dev/null 2>&1 || BALE=bale\n\
          if command -v \"$BALE\" >/dev/null 2>&1; then\n\
-         \x20 \"$BALE\" hook git post-checkout \"$@\" || true\n\
+         \x20 \"$BALE\" hook {sub} \"$@\" || true\n\
          fi\n\
          PREV=\"$(dirname \"$0\")/post-checkout.pre-bale\"\n\
          if [ -x \"$PREV\" ]; then\n\
@@ -70,11 +76,7 @@ fn git_hook_script(exe: &Path) -> String {
 pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     let g = Git::at(repo);
     let dir = hooks_dir(&g)?;
-    // `<scope>\t<value>`, e.g. `global\t~/.githooks`.
-    let scope = g
-        .run(&["config", "--show-scope", "--get", "core.hooksPath"])
-        .ok()
-        .and_then(|s| s.split_once('\t').map(|(scope, _)| scope.to_string()));
+    let scope = hooks_path_scope(&g);
     let configured = scope.is_some();
     if configured {
         if let Ok(top) = g.run(&["rev-parse", "--show-toplevel"]) {
@@ -139,6 +141,14 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     Ok(Plan::new(steps))
 }
 
+/// Where `core.hooksPath` is set (`global`, `local`, ...), if it is.
+fn hooks_path_scope(g: &Git) -> Option<String> {
+    // `<scope>\t<value>`, e.g. `global\t~/.githooks`.
+    g.run(&["config", "--show-scope", "--get", "core.hooksPath"])
+        .ok()
+        .and_then(|s| s.split_once('\t').map(|(scope, _)| scope.to_string()))
+}
+
 /// The repo's hooks dir, absolute, honouring `core.hooksPath`.
 fn hooks_dir(g: &Git) -> Result<PathBuf> {
     let dir = g.run(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?;
@@ -152,36 +162,83 @@ fn is_bale_hook(script: &str) -> bool {
         .any(|l| l == GIT_HOOK_MARKER || l == OLD_GIT_HOOK_MARKER)
 }
 
-/// Removes bale's post-checkout hook from `repo`'s hooks dir and moves the
-/// hook it chained to, `post-checkout.pre-bale`, back. A hook without bale's
-/// marker is the user's and stays.
+/// Whether `script` is exactly a hook some bale wrote: this one's, or an
+/// earlier one's (the `--git-hook` marker, the `hook git-post-checkout`
+/// command), for whatever exe its `BALE=` line names.
+fn is_unedited_bale_hook(script: &str) -> bool {
+    let Some(quoted) = script
+        .lines()
+        .find_map(|l| l.strip_prefix("BALE='")?.strip_suffix('\''))
+    else {
+        return false;
+    };
+    [
+        (GIT_HOOK_MARKER, "git post-checkout"),
+        (OLD_GIT_HOOK_MARKER, "git post-checkout"),
+        (OLD_GIT_HOOK_MARKER, "git-post-checkout"),
+    ]
+    .iter()
+    .any(|(marker, sub)| render_hook(marker, sub, quoted) == script)
+}
+
+/// Removes bale's post-checkout hook from `repo`'s hooks dir, putting back
+/// the hook it chained to, `post-checkout.pre-bale`. A hook without bale's
+/// marker is the user's and stays; so does bale's hook once the user edited
+/// it.
 pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
-    let dir = hooks_dir(&Git::at(repo))?;
+    let g = Git::at(repo);
+    let dir = hooks_dir(&g)?;
+    let mut steps = Vec::new();
+    if let Some(scope @ ("global" | "system")) = hooks_path_scope(&g).as_deref() {
+        steps.push(Step::Note(format!(
+            "note: core.hooksPath comes from your {scope} git config, so {} serves every \
+             repo that uses it, not only {}",
+            display_path(&dir),
+            display_path(repo)
+        )));
+    }
     let hook = dir.join("post-checkout");
     let prev = dir.join("post-checkout.pre-bale");
     let script = match fs::read(&hook) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Plan::new(vec![Step::Note(format!(
+            steps.push(Step::Note(format!(
                 "{}: no bale post-checkout hook to remove",
                 display_path(&hook)
-            ))]));
+            )));
+            return Ok(Plan::new(steps));
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", hook.display())),
     };
     if !is_bale_hook(&script) {
-        return Ok(Plan::new(vec![Step::Note(format!(
+        steps.push(Step::Note(format!(
             "note: left unchanged: {} is not bale's",
             display_path(&hook)
-        ))]));
+        )));
+        return Ok(Plan::new(steps));
     }
-    let mut steps = vec![Step::Remove(hook.clone())];
-    if fs::symlink_metadata(&prev).is_ok() {
-        steps.push(Step::Rename {
+    if !is_unedited_bale_hook(&script) {
+        steps.push(Step::Note(format!(
+            "note: left unchanged: {} is bale's hook but was edited; remove bale's lines \
+             by hand{}",
+            display_path(&hook),
+            if fs::symlink_metadata(&prev).is_ok() {
+                format!(", then move {} back over it", display_path(&prev))
+            } else {
+                String::new()
+            }
+        )));
+        return Ok(Plan::new(steps));
+    }
+    // A rename replaces the hook in one step, so there is never no hook.
+    steps.push(if fs::symlink_metadata(&prev).is_ok() {
+        Step::Rename {
             from: prev,
             to: hook,
-        });
-    }
+        }
+    } else {
+        Step::Remove(hook)
+    });
     Ok(Plan::new(steps))
 }
 
@@ -225,6 +282,18 @@ mod tests {
         );
         assert!(is_bale_hook(&old));
         assert!(!is_bale_hook("#!/bin/sh\necho mine\n"));
+    }
+
+    #[test]
+    fn only_an_unedited_hook_counts_as_unedited() {
+        let s = git_hook_script(Path::new("/opt/it's/bale"));
+        assert!(is_unedited_bale_hook(&s));
+        let old = s
+            .replace(GIT_HOOK_MARKER, OLD_GIT_HOOK_MARKER)
+            .replace("hook git post-checkout", "hook git-post-checkout");
+        assert!(is_unedited_bale_hook(&old));
+        assert!(!is_unedited_bale_hook(&format!("{s}echo more\n")));
+        assert!(!is_unedited_bale_hook(&s.replace("exit 0", "exit 1")));
     }
 
     #[test]

@@ -102,7 +102,7 @@ fn unschedule_plan(home: &Path) -> Result<Plan> {
     };
     let steps = if cfg!(target_os = "macos") {
         let uid = current_uid()?;
-        vec![
+        let mut steps = vec![
             run(&[
                 "launchctl",
                 "bootout",
@@ -113,7 +113,17 @@ fn unschedule_plan(home: &Path) -> Result<Plan> {
                     .join("LaunchAgents")
                     .join(format!("{LAUNCHD_LABEL}.plist")),
             ),
-        ]
+        ];
+        // The sweep's logs; they may still be worth reading.
+        let logs = home.join("Library").join("Logs").join("bale");
+        if logs.is_dir() {
+            steps.push(Step::Note(format!(
+                "note: {} is left in place: it holds the sweep's logs; delete it when you \
+                 no longer need them",
+                display_path(&logs)
+            )));
+        }
+        steps
     } else if cfg!(windows) {
         vec![run(&["schtasks", "/Delete", "/TN", "bale-sweep", "/F"])]
     } else {

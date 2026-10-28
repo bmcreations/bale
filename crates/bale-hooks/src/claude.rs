@@ -428,6 +428,8 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
         .with_context(|| format!("\"hooks\" in {} is not an object", path.display()))?;
 
     let mut changed = false;
+    // Whether the file already ran bale; only a first install backs it up.
+    let mut any_ours = false;
     let mut notes = Vec::new();
     for (event, kind) in HOOKS {
         let groups = hooks
@@ -475,6 +477,7 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
             }
         }
         if ours {
+            any_ours = true;
             continue;
         }
         if kind == "create" && !groups.is_empty() {
@@ -503,7 +506,7 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 .to_path_buf(),
         ),
         Step::Settings {
-            backup: Some(backup_path(backups, &path)),
+            backup: (!any_ours).then(|| backup_path(backups, &path)),
             path,
             before,
             after,
@@ -516,7 +519,8 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
 /// Removes bale's own WorktreeCreate and WorktreeRemove entries from
 /// `<home>/.claude/settings.json`, as install recognises them; a command the
 /// user wrapped around bale stays. Groups, events and `hooks` emptied by the
-/// removal go too, and the file when nothing is left.
+/// removal go too, and the file when bale created it and nothing is left,
+/// as `json_uninstall_steps` decides.
 pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
     let path = home.join(".claude").join("settings.json");
     let Some((before, mode)) = read_config(&path)? else {
@@ -532,6 +536,7 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
         .with_context(|| format!("{} is not a JSON object", path.display()))?;
     let mut changed = false;
     let mut steps = Vec::new();
+    let mut emptied_events = Vec::new();
     if let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
         for (event, kind) in HOOKS {
             let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
@@ -563,15 +568,13 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
                 changed |= entries.len() != n;
             }
             if emptied.contains(&true) {
+                // A group the removal emptied held only bale's entry.
                 let mut flags = emptied.into_iter();
                 groups.retain(|_| !flags.next().unwrap_or(false));
                 if groups.is_empty() {
-                    hooks.shift_remove(event);
+                    emptied_events.push(vec!["hooks", event]);
                 }
             }
-        }
-        if changed && hooks.is_empty() {
-            obj.shift_remove("hooks");
         }
     }
     if !changed {
@@ -581,7 +584,15 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
         )));
         return Ok(Plan::new(steps));
     }
-    steps.extend(json_uninstall_steps(backups, &path, before, mode, &root)?);
+    emptied_events.push(vec!["hooks"]);
+    steps.extend(json_uninstall_steps(
+        backups,
+        &path,
+        before,
+        mode,
+        &root,
+        &emptied_events,
+    )?);
     Ok(Plan::new(steps))
 }
 

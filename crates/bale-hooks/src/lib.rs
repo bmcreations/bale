@@ -134,7 +134,7 @@ pub fn install_plan<'a>(
     match tool {
         Tool::Claude => claude::install_plan(home, exe, backups),
         Tool::Git => git::install_plan(need(repo)?, exe),
-        Tool::Conductor => conductor::install_plan(need(repo)?, exe),
+        Tool::Conductor => conductor::install_plan(need(repo)?, exe, backups),
         Tool::Cursor => cursor::install_plan(need(repo)?, exe, backups),
         Tool::Codex => codex::install_plan(exe),
     }
@@ -155,7 +155,7 @@ pub fn uninstall_plan(
     match tool {
         Tool::Claude => claude::uninstall_plan(home, backups),
         Tool::Git => git::uninstall_plan(&need(repo)?),
-        Tool::Conductor => conductor::uninstall_plan(&need(repo)?),
+        Tool::Conductor => conductor::uninstall_plan(&need(repo)?, backups),
         Tool::Cursor => cursor::uninstall_plan(&need(repo)?, backups),
         Tool::Codex => Ok(codex::uninstall_plan()),
     }

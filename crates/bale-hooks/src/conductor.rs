@@ -21,7 +21,7 @@ use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
 use crate::cmdline::{bale_call, BaleCall};
-use crate::install::{read_config, Plan, Step};
+use crate::install::{backup_path, read_config, Plan, Step};
 use crate::{display_path, remove_tree, Tool};
 
 /// The workspace a script runs for: `CONDUCTOR_WORKSPACE_PATH`, or the cwd.
@@ -88,8 +88,10 @@ fn chain(kind: &str, existing: &str, want: &str) -> String {
 }
 
 /// Chains bale into `<repo>/.conductor/settings.toml`'s `[scripts]` setup and
-/// archive, keeping the user's commands, other keys and comments.
-pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
+/// archive, keeping the user's commands, other keys and comments. The file
+/// as it was is backed up in `backups` when it did not run bale yet, so
+/// uninstall knows the user made it.
+pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
     let path = repo.join(".conductor").join("settings.toml");
     let meta = match fs::symlink_metadata(&path) {
         Ok(m) => Some(m),
@@ -122,6 +124,8 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
         .with_context(|| format!("scripts in {} is not a table", path.display()))?;
 
     let mut changed = false;
+    // Whether the file already ran bale; only a first install backs it up.
+    let mut any_bale = false;
     let mut notes = Vec::new();
     for kind in ["setup", "archive"] {
         let want = hook_command(exe, kind);
@@ -139,9 +143,11 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
                     })?;
                 let current = value.as_str().unwrap_or_default();
                 if current.contains(&want) {
+                    any_bale = true;
                     continue;
                 }
                 if let Some((user, bale)) = unchain(kind, current) {
+                    any_bale = true;
                     // bale's own command from another exe path: point it
                     // here, the user's script byte for byte as it was.
                     let repointed = match user {
@@ -160,6 +166,7 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
                 if bale_call(current, &["hook", "conductor", kind]).is_some()
                     || current.contains(&format!(" hook conductor {kind}"))
                 {
+                    any_bale = true;
                     // Wrapped by the user, or in a shape bale did not write:
                     // never chain a second bale call.
                     notes.push(Step::Note(format!(
@@ -200,7 +207,7 @@ pub fn install_plan(repo: &Path, exe: &Path) -> Result<Plan> {
             before,
             after,
             mode,
-            backup: None,
+            backup: (!any_bale).then(|| backup_path(backups, &path)),
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Conductor workspace of \
@@ -229,10 +236,15 @@ fn unchain<'v>(kind: &str, value: &'v str) -> Option<(Option<&'v str>, &'v str)>
 }
 
 /// Takes bale out of `<repo>/.conductor/settings.toml`'s `[scripts]` setup
-/// and archive: a chained value gets the user's script back, a value that
-/// was bale's alone goes, and so does a `[scripts]` table or file left empty.
-/// A value that runs bale in a shape install does not write is left alone.
-pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
+/// and archive: a chained value gets the user's script back, and a value
+/// that was bale's alone goes. A value that runs bale in a shape install
+/// does not write is left alone.
+///
+/// Install's backup in `backups` means the user made the file: it is then
+/// kept even when empty, and so is a `[scripts]` table the backup has.
+/// Without one, a `[scripts]` table left empty goes unless it holds
+/// comments, and so does a file left empty.
+pub fn uninstall_plan(repo: &Path, backups: &Path) -> Result<Plan> {
     let path = repo.join(".conductor").join("settings.toml");
     let none = || {
         Plan::new(vec![Step::Note(format!(
@@ -251,6 +263,8 @@ pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
     };
     let mut changed = false;
     let mut steps = Vec::new();
+    // Comments above the keys removed, which go with them.
+    let mut comments = String::new();
     for kind in ["setup", "archive"] {
         let Some(value) = scripts.get_mut(kind).and_then(|i| i.as_value_mut()) else {
             continue;
@@ -260,6 +274,14 @@ pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
         };
         match unchain(kind, current) {
             Some((None, _)) => {
+                if let Some(prefix) = scripts
+                    .key(kind)
+                    .and_then(|k| k.leaf_decor().prefix())
+                    .and_then(|p| p.as_str())
+                    .filter(|p| p.contains('#'))
+                {
+                    comments.push_str(prefix);
+                }
                 scripts.remove(kind);
                 changed = true;
             }
@@ -285,11 +307,40 @@ pub fn uninstall_plan(repo: &Path) -> Result<Plan> {
         }
         return Ok(Plan::new(steps));
     }
+    let backup = fs::read_to_string(backup_path(backups, &path)).ok();
     if scripts.is_empty() {
-        doc.remove("scripts");
+        let in_backup = backup
+            .as_deref()
+            .and_then(|b| b.parse::<DocumentMut>().ok())
+            .is_some_and(|b| b.contains_key("scripts"));
+        // `scripts = {}` inline has no header to keep comments under.
+        let mut header = false;
+        if let Some(table) = doc["scripts"].as_table_mut() {
+            header = [table.decor().prefix(), table.decor().suffix()]
+                .into_iter()
+                .flatten()
+                .any(|d| d.as_str().is_some_and(|d| d.contains('#')));
+            if !comments.is_empty() {
+                // An empty table keeps them under its header.
+                let suffix = table
+                    .decor()
+                    .suffix()
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let comments = comments.trim_end_matches(['\n', '\r']);
+                table
+                    .decor_mut()
+                    .set_suffix(format!("{suffix}\n{comments}"));
+                header = true;
+            }
+        }
+        if !in_backup && !header {
+            doc.remove("scripts");
+        }
     }
     let after = doc.to_string();
-    if after.trim().is_empty() {
+    if after.trim().is_empty() && backup.is_none() {
         steps.push(Step::Remove(path));
     } else {
         steps.push(Step::Settings {
