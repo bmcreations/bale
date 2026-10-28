@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Tests run against the same git config on every OS. The Windows
+      # runner's system config sets core.autocrlf=true, which turns the LF
+      # files tests write into files cold refuses. Tests that need autocrlf
+      # set it in the repo config.
+      GIT_CONFIG_NOSYSTEM: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ci"
+      - run: cargo test --workspace --locked --no-fail-fast

@@ -1,0 +1,18 @@
+[package]
+name = "bale-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bale"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+bale-core = { path = "../bale-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3.27.0"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
