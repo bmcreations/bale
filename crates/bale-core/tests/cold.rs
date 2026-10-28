@@ -9,7 +9,7 @@ use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use support::{git, Fixture};
+use support::{git, write_plist, Fixture};
 
 /// Commits a `.gitignore` on main, then adds a Gradle worktree `wt` with a
 /// modified tracked `f`, untracked `b.txt`, ignored `.env`, ignored `build/`
@@ -1397,14 +1397,9 @@ fn xcode_derived_data_worktree(fx: &Fixture) -> PathBuf {
     fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
     let dd = wt.join("build/dd");
     fs::create_dir_all(dd.join("Build")).unwrap();
-    let mut dict = plist::Dictionary::new();
-    dict.insert(
-        "WorkspacePath".into(),
-        plist::Value::String(wt.join("App.xcodeproj").to_string_lossy().into_owned()),
-    );
-    plist::Value::Dictionary(dict)
-        .to_file_xml(dd.join("info.plist"))
-        .unwrap();
+    write_plist(&dd, Some(&wt.join("App.xcodeproj")));
+    // An ignored file beside `dd`: it is not regenerable and must survive.
+    fs::write(wt.join("build/notes.log"), "keep me").unwrap();
     nested_repo(&dd.join("SourcePackages/checkouts/pkg"));
     wt
 }
@@ -1422,6 +1417,10 @@ fn cold_removes_derived_data_with_spm_checkouts() {
     assert_eq!(report.outcome, Outcome::Done(Level::Hot));
     assert!(wt.join("App.xcodeproj").is_dir());
     assert!(!wt.join("build/dd").exists());
+    assert_eq!(
+        fs::read_to_string(wt.join("build/notes.log")).unwrap(),
+        "keep me"
+    );
 }
 
 #[test]
@@ -1432,7 +1431,10 @@ fn cold_still_refuses_user_repo_beside_derived_data() {
     let id = register(&fx.home(), &wt).unwrap().id;
     let out = cold(&fx.home(), &id).unwrap();
     assert!(
-        matches!(&out, Outcome::Skipped(r) if r.contains("nested repository")),
+        matches!(
+            &out,
+            Outcome::Skipped(r) if r.contains("nested repository") && !r.contains("build/dd")
+        ),
         "{out:?}"
     );
     assert!(wt.join("vendor-ignored/lib/.git").is_dir());

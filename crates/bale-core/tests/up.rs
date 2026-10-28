@@ -6,7 +6,7 @@ use bale_core::ops::up::{register, up, up_report, Outcome, SkipCode, SkipReason}
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
-use support::Fixture;
+use support::{write_plist, Fixture};
 
 /// A `.gitignore` in `wt` that ignores Gradle's output dirs.
 fn ignore_build(wt: &Path) {
@@ -328,18 +328,6 @@ fn non_worktree_refused() {
     assert!(register(&fx.home(), &dir).is_err());
 }
 
-fn write_plist(dir: &Path, workspace_path: &Path) {
-    fs::create_dir_all(dir).unwrap();
-    let mut dict = plist::Dictionary::new();
-    dict.insert(
-        "WorkspacePath".into(),
-        plist::Value::String(workspace_path.to_string_lossy().into_owned()),
-    );
-    plist::Value::Dictionary(dict)
-        .to_file_xml(dir.join("info.plist"))
-        .unwrap();
-}
-
 #[test]
 fn derived_data_matching() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -348,11 +336,11 @@ fn derived_data_matching() {
     fs::create_dir_all(ws.join("App.xcworkspace")).unwrap();
     fs::create_dir_all(&other).unwrap();
     let dd = tmp.path().join("dd");
-    write_plist(&dd.join("A"), &ws.join("App.xcworkspace"));
-    write_plist(&dd.join("B"), &other);
+    write_plist(&dd.join("A"), Some(&ws.join("App.xcworkspace")));
+    write_plist(&dd.join("B"), Some(&other));
     fs::create_dir_all(dd.join("C")).unwrap();
     // A sibling whose name extends the workspace's must not match.
-    write_plist(&dd.join("D"), &tmp.path().join("ws2/App.xcworkspace"));
+    write_plist(&dd.join("D"), Some(&tmp.path().join("ws2/App.xcworkspace")));
     fs::create_dir_all(dd.join("E")).unwrap();
     fs::write(dd.join("E/info.plist"), "not a plist").unwrap();
 
@@ -594,7 +582,7 @@ fn xcode_worktree(fx: &Fixture) -> PathBuf {
     let wt = fx.add_worktree("wt", "feature");
     fs::write(wt.join(".gitignore"), "build/\n").unwrap();
     fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
-    write_plist(&wt.join("build/dd"), &wt.join("App.xcodeproj"));
+    write_plist(&wt.join("build/dd"), Some(&wt.join("App.xcodeproj")));
     fs::create_dir_all(wt.join("build/dd/Build/Products")).unwrap();
     fs::write(wt.join("build/dd/Build/Products/big.bin"), vec![0u8; 1024]).unwrap();
     fs::create_dir_all(wt.join("src")).unwrap();

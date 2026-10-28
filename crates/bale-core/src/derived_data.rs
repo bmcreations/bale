@@ -77,11 +77,16 @@ pub(crate) fn workspace_path(plist_path: &Path) -> Option<PathBuf> {
 
 /// True when `dir` is an Xcode DerivedData root: a regular `info.plist` with a
 /// parseable `WorkspacePath`, plus a `Build` subdirectory. The name is free.
+///
+/// `info.plist` and `Build` are looked up by joining the names, so on a
+/// case-insensitive filesystem (APFS by default) `Info.plist` and `build` also
+/// match. The `WorkspacePath` requirement and the keep rule, which spares any
+/// tracked or unignored file, still apply.
 pub(crate) fn is_derived_data_root(dir: &Path) -> bool {
     let plist = dir.join("info.plist");
-    let is_file = fs::symlink_metadata(&plist).is_ok_and(|m| m.file_type().is_file());
-    let has_build = fs::symlink_metadata(dir.join("Build")).is_ok_and(|m| m.file_type().is_dir());
-    is_file && has_build && workspace_path(&plist).is_some()
+    fs::symlink_metadata(&plist).is_ok_and(|m| m.file_type().is_file())
+        && fs::symlink_metadata(dir.join("Build")).is_ok_and(|m| m.file_type().is_dir())
+        && workspace_path(&plist).is_some()
 }
 
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.

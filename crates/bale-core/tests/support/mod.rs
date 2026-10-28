@@ -68,3 +68,30 @@ impl Fixture {
         Fixture::init(TempDir::new_in(base).expect("tempdir"))
     }
 }
+
+/// Writes `dir/info.plist` as Xcode DerivedData has it (XML), creating `dir`.
+/// `workspace_path` is its `WorkspacePath`; `None` leaves the key out.
+pub fn write_plist(dir: &Path, workspace_path: Option<&Path>) {
+    plist_value(dir, workspace_path)
+        .to_file_xml(dir.join("info.plist"))
+        .unwrap();
+}
+
+/// [`write_plist`] in the binary format.
+pub fn write_plist_binary(dir: &Path, workspace_path: Option<&Path>) {
+    plist_value(dir, workspace_path)
+        .to_file_binary(dir.join("info.plist"))
+        .unwrap();
+}
+
+fn plist_value(dir: &Path, workspace_path: Option<&Path>) -> plist::Value {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut dict = plist::Dictionary::new();
+    if let Some(p) = workspace_path {
+        dict.insert(
+            "WorkspacePath".into(),
+            plist::Value::String(p.to_string_lossy().into_owned()),
+        );
+    }
+    plist::Value::Dictionary(dict)
+}

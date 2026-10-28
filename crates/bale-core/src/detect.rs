@@ -60,9 +60,9 @@ pub fn detect(root: &Path) -> Vec<BuildSystem> {
 
 /// Lists regenerable directories under `root` for the given build systems plus
 /// `cfg.regenerable_extra`. Paths are absolute when `root` is. Symlinks are not
-/// followed; a matching symlink is returned as the link itself. On Xcode and SwiftPM trees an Xcode DerivedData root (any name) also
-/// matches. A match is never
-/// descended into, and `.git` is skipped.
+/// followed; a matching symlink is returned as the link itself. On Xcode and
+/// SwiftPM trees an Xcode DerivedData root (any name) also matches. A match is
+/// never descended into, and `.git` is skipped.
 pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
     if systems.is_empty() {
         return Vec::new();
