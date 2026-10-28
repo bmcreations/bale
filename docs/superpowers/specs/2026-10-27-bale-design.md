@@ -135,7 +135,9 @@ Integrations, in order of how fully they hand control to `bale`:
    - `WorktreeRemove` does not fire when a subagent's worktree is cleaned up.
 
    Remove maps to `bale cold`, not to deletion. Install the hook in settings rather than a plugin, because
-   plugin hooks do not run with `--worktree --tmux`.
+   plugin hooks do not run with `--worktree --tmux`. Because a broken hook would block worktree creation
+   in every repo, `bale install` adds it only when asked. If `bale new` fails inside the hook, the hook falls
+   back to a plain `git worktree add` and prints that path.
 3. **git `post-checkout`** fires on `git worktree add` with the arguments `<null-ref> <new-HEAD> 1`. It only
    registers the worktree with `bale` so the sweep can manage it. It does not run with `--no-checkout`, and
    a global `core.hooksPath` would override per-repo husky or lefthook hooks, so it must chain to those
@@ -174,6 +176,8 @@ against what was captured before it is used.
    This makes a crash leave either a full directory or a trash name that the next run finishes deleting.
 6. Remove the workspace's external build output too. That includes Xcode DerivedData folders under
    `~/Library/Developer/Xcode/DerivedData` whose `info.plist` `WorkspacePath` points into this workspace.
+   A folder with a missing or unreadable `WorkspacePath` is left alone. So is global DerivedData that matches
+   no registered workspace; cleaning those stays with `disk-jockey`.
 7. Write the registry record as `baled`.
 
 The regenerable set is a list per build system, not a guess.
@@ -214,6 +218,47 @@ A workspace is idle when nothing has its cwd or a file open inside it, and no so
 threshold. Defaults are 4 hours to `baled` and 7 days to `cold`, both configurable. Gradle expires local build
 cache entries that go unused (7 days by default), so a workspace baled longer than that resumes colder.
 
+A busy workspace is skipped and reported, never forced. Long-lived daemons do not usually block this. An
+`lsof` snapshot of the 29 worktrees on this machine, taken while Gradle daemons, a JetBrains IDE and several
+agent sessions were running, found open files in only one worktree (a `java` process with 9 handles) and a
+process cwd in two. The other 26 had nothing open. On macOS, Gradle's file-system watching uses FSEvents,
+which holds no file handles in the tree. *(Builder's call: if this turns out different on Linux or Windows,
+add an opt-in flag to stop a Gradle daemon whose only registered project is the workspace being baled.)*
+
+### Unattended sweeps never cold a dirty tree
+
+`bale sweep` moves a workspace to `cold` only if it has no uncommitted changes. Dirty trees stay `baled`,
+which keeps their changes on disk and still removes the build output, the bulk of the space. `bale cold` run
+by hand works on dirty trees. *(My call: auto-cold of dirty trees is the one path that could lose work, and
+the source it saves is about 1 GB per Android worktree.)*
+
+### Cold edge cases
+
+*(My calls, chosen to fail loudly rather than guess.)*
+
+- The wip commit holds tracked and untracked files. Ignored files go to `~/.bale/<id>/files/` instead.
+  Symlinks are saved as symlinks, because the existing `seed-worktree-env.sh` session hook links `.env`
+  into worktrees from the main checkout.
+- `open` checks out the commit in `refs/bale/<id>/head`, so the wip always applies cleanly. If the
+  workspace was on a branch and that branch still points to the same commit, it checks out the branch
+  instead. If the branch has moved, it stays detached at the saved commit and says so.
+- If the branch is checked out in another worktree, `open` stays detached at the saved commit and reports it.
+- `cold` refuses trees with submodules that have their own uncommitted changes, and trees using sparse
+  checkout. LFS pointer files need no special handling, because the checkout restores them.
+
+### Configuration
+
+*(My call.)* Per-repo settings live in an optional `.bale.toml` committed at the repo root. Machine settings
+live in `~/.bale/config.toml`. Repo settings override machine settings. Build systems are detected from
+marker files: `settings.gradle(.kts)`, `*.xcodeproj` or `*.xcworkspace`, and `Package.swift`. The tool is
+generic. The two app repos are the first targets and the acceptance test, not the only supported repos.
+
+### Git
+
+*(My call.)* `bale` runs the `git` binary rather than using a library, so behavior matches what agents see.
+Commands that hit `index.lock` or a ref lock held by an agent's git operation are retried with backoff,
+then reported. `bale` never deletes a lock file.
+
 ## Tier 2: the repo's warm base
 
 `bale base` creates, per repo, a full checkout of the default branch at a fixed path under `~/.bale/bases/`
@@ -222,13 +267,21 @@ call, creates the git worktree metadata for it, checks out the branch, and build
 
 What is known from the spike: the clone is near-instant, and the first build at the new path takes about 36 s
 and diverges by about 2 GB on Android. What is not known: the iOS numbers, and how much the base drifts as
-the default branch moves.
+the default branch moves. Checking out a feature branch in the clone rewrites only the files that differ from
+the default branch, so the extra divergence depends on the size of the feature. That was not measured.
+
+Tier 2 is enabled per build system, and only where a measured spike shows at least a 40% saving per hot
+workspace compared to a separate worktree. Android met that bar at about 55%. If iOS does not meet it, iOS
+workspaces use tier 1 only. *(My call on the threshold.)*
 
 Refreshing the base has a cost. A clone keeps the old base's blocks allocated until the clone itself is
 deleted or baled, so for a while two generations of the base are on disk. The design rebuilds the base on a
 schedule, at most daily, and reports how much space older generations still hold.
 
 ### Platforms
+
+Tier 1 is required on macOS, Linux and Windows in the first release, and is tested on all three in CI. Tier 2
+ships per platform as each backend is tested.
 
 | Platform | Tier 1 | Tier 2 copy-on-write |
 |---|---|---|
@@ -285,9 +338,6 @@ On this machine the regenerable total is 92.5 GB across 31 worktrees, plus 16 GB
 - **iOS hot cost under tier 2.** Not measured. Run the same spike on `code-ios-app` before building tier 2.
 - **T3's worktree creation** does not go through Claude Code hooks. Whether T3 exposes its own hook is
   unknown. Until it does, T3 worktrees are picked up by the sweep.
-- **Overlap with the existing `seed-worktree-env.sh` SessionStart hook.** A `WorktreeCreate` hook skips
-  `.worktreeinclude`, so `bale new` must copy the same files that hook seeds. Check what it does before
-  wiring the hook.
 - **Same-path restore was inferred, not run.** The spike showed no-change builds at the original path are
   up to date. A full `bale up`, then build cycle on a real worktree still needs to be timed.
 
