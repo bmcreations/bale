@@ -256,8 +256,7 @@ fn foreign_lock(row: &PlanRow) -> Result<bool> {
 /// Free bytes on the volume holding `path`; 0 when there is no path.
 fn free_space(path: Option<&Path>) -> Result<u64> {
     match path {
-        Some(p) => fs4::available_space(p)
-            .with_context(|| format!("reading free space on {}", p.display())),
+        Some(p) => crate::ops::disk::free_space(p),
         None => Ok(0),
     }
 }

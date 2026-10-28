@@ -348,6 +348,17 @@ fn finish(
         back_to_baled(registry, &mut record, root)?;
         return Ok(Outcome::Busy(holders));
     }
+    match no_room_to_check(root, &ex) {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            back_to_baled(registry, &mut record, root)?;
+            return Ok(Outcome::Skipped(reason));
+        }
+        Err(e) => {
+            back_to_baled(registry, &mut record, root)?;
+            return Err(e);
+        }
+    }
 
     let trash = trash_path(root)?;
     #[cfg(test)]
@@ -425,6 +436,50 @@ fn not_checkout(root: &Path, record: &Record) -> Option<String> {
                 record.path.display()
             )
         })
+}
+
+/// Room the restore check needs beyond its copy of the tree.
+const CHECK_MARGIN: u64 = 1 << 30;
+
+/// The skip reason when the volume holding `tree` lacks room for the
+/// restore check: its copy of the tree (estimated as the bytes of every
+/// file the save does not leave out) plus [`CHECK_MARGIN`].
+fn no_room_to_check(tree: &Path, ex: &Exclusions) -> Result<Option<String>> {
+    let mut size = 0u64;
+    let mut it = WalkDir::new(tree)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter();
+    while let Some(item) = it.next() {
+        // Unreadable entries are reported by the checks that read them.
+        let Ok(item) = item else { continue };
+        let Ok(rel) = item.path().strip_prefix(tree) else {
+            continue;
+        };
+        let skip = (item.depth() == 1 && item.file_name() == ".git")
+            || (item.depth() > 0 && disk::denied(rel, &ex.regen, &ex.deny));
+        if skip {
+            if item.file_type().is_dir() {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+        if item.file_type().is_file() {
+            size += item.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    let needed = size.saturating_add(CHECK_MARGIN);
+    let free = disk::free_space(tree)?;
+    if free >= needed {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "not enough free space to check it: needs {} (a copy of the tree plus {}), {} free on {}",
+        crate::human_bytes(needed),
+        crate::human_bytes(CHECK_MARGIN),
+        crate::human_bytes(free),
+        tree.display()
+    )))
 }
 
 /// The skip reason for a tree `open` would not give back as it is.
@@ -537,6 +592,9 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             let checked = exclusions(home, &trash).and_then(|ex| {
                 if let Some(reason) = case_variant_git(&trash, &ex) {
                     return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+                }
+                if let Some(reason) = no_room_to_check(&trash, &ex)? {
+                    return Ok(Some(Outcome::Skipped(reason)));
                 }
                 let wip = wip_sha.trim();
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
@@ -1451,6 +1509,20 @@ mod tests {
     fn set_seam(seam: &'static LocalKey<Seam>, f: impl Fn(&Path) + 'static) -> SeamGuard {
         seam.with(|h| *h.borrow_mut() = Some(Box::new(f)));
         SeamGuard(seam)
+    }
+
+    /// Fakes the free space `disk::free_space` reports until the guard drops.
+    struct FreeGuard;
+
+    impl Drop for FreeGuard {
+        fn drop(&mut self) {
+            disk::FAKE_FREE.with(|f| f.set(None));
+        }
+    }
+
+    fn fake_free(bytes: u64) -> FreeGuard {
+        disk::FAKE_FREE.with(|f| f.set(Some(bytes)));
+        FreeGuard
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -2551,6 +2623,67 @@ mod tests {
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_ne!(record.level, Level::Cooling);
+    }
+
+    /// The restore check writes a copy of the tree beside it. Without room
+    /// for that copy and a margin, cold stops before the rename.
+    #[test]
+    fn no_room_for_the_check_skips_before_the_rename() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let free = fake_free(1024);
+        let seam = set_seam(&BEFORE_RENAME, |_: &Path| panic!("reached the rename"));
+        let out = cold(&home, &id).unwrap();
+        drop((seam, free));
+
+        assert!(
+            matches!(&out, Outcome::Skipped(r) if r.contains("free space") && r.contains("1.0 KiB free")),
+            "{out:?}"
+        );
+        assert!(wt.join(".gitignore").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+    }
+
+    /// Recovery's check of an unmarked trash needs the same room; without
+    /// it the trash goes back to the path.
+    #[test]
+    fn no_room_for_the_check_in_recovery_moves_the_trash_back() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        let after = set_seam(&AFTER_RENAME, |_: &Path| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cold(&home, &id)));
+        drop(after);
+        assert!(crashed.is_err());
+        assert_eq!(trash_siblings(&wt).unwrap().len(), 1);
+
+        let free = fake_free(0);
+        let out = cold(&home, &id).unwrap();
+        drop(free);
+
+        assert!(
+            matches!(&out, Outcome::Skipped(r) if r.contains("free space") && r.contains("0 B free")),
+            "{out:?}"
+        );
+        assert!(wt.join(".gitignore").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
     }
 
     /// Recovery checks an unmarked trash with the same restore comparison.

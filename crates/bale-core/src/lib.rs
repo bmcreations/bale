@@ -11,6 +11,22 @@ pub mod registry;
 
 use std::path::PathBuf;
 
+/// Bytes in binary units with one decimal, e.g. `1.5 GiB`.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Root of bale's per-machine state (`$BALE_HOME`, default `~/.bale`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaleHome(pub PathBuf);

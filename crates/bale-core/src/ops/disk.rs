@@ -179,6 +179,21 @@ pub(crate) fn with_ancestors<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeS
     set
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Free bytes `free_space` reports on this thread instead of asking the OS.
+    pub(crate) static FAKE_FREE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Free bytes on the volume holding `path`.
+pub(crate) fn free_space(path: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(bytes) = FAKE_FREE.with(std::cell::Cell::get) {
+        return Ok(bytes);
+    }
+    fs4::available_space(path).with_context(|| format!("reading free space on {}", path.display()))
+}
+
 pub(crate) fn denied(rel: &Path, regen: &[PathBuf], deny: &[String]) -> bool {
     regen.iter().any(|r| rel.starts_with(r))
         || rel.components().any(|c| {
