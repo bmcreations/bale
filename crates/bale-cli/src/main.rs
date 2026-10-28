@@ -87,7 +87,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Entry points for Claude Code, git and Conductor hooks.
+    /// Entry points for Claude Code, Codex, Cursor, Conductor and git hooks.
     Hook {
         #[command(subcommand)]
         kind: HookKind,
