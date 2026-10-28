@@ -161,17 +161,9 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     if sparse.trim() == "true" {
         return Ok(Some("sparse checkout".into()));
     }
-    // A skip-worktree entry's edits are invisible to `add -A`.
-    let skipped: Vec<String> = ls_files_v(&g)?
-        .into_iter()
-        .filter(|(tag, _)| tag.eq_ignore_ascii_case(&'S'))
-        .map(|(_, p)| p)
-        .collect();
-    if !skipped.is_empty() {
-        return Ok(Some(format!(
-            "sparse: skip-worktree entries ({})",
-            skipped.join(", ")
-        )));
+    let hidden = hidden_entries(&g)?;
+    if !hidden.is_empty() {
+        return Ok(Some(hidden_reason(&hidden)));
     }
 
     let dirty = g.run(&[
@@ -213,6 +205,13 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         if fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir()) {
             embedded.push(sub);
             continue;
+        }
+        let hidden: Vec<String> = hidden_entries(&Git::at(&dir))?
+            .into_iter()
+            .map(|p| format!("{sub}/{p}"))
+            .collect();
+        if !hidden.is_empty() {
+            return Ok(Some(hidden_reason(&hidden)));
         }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
@@ -682,6 +681,13 @@ fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
                 status.join(", ")
             )));
         }
+        let hidden = hidden_entries(&g)?;
+        if !hidden.is_empty() {
+            return Ok(Some(format!(
+                "submodule {sub} has entries status can't see: {}",
+                hidden.join(", ")
+            )));
+        }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
         let scan = scan_ignored_with(&g, &dir, &submodule_deny(&sub_deny, &sub), &regen)?;
@@ -732,6 +738,24 @@ fn gitlinks(g: &Git) -> Result<Vec<String>> {
             meta.starts_with("160000 ").then(|| path.to_string())
         })
         .collect())
+}
+
+/// Index entries flagged assume-unchanged (lowercase tag) or skip-worktree
+/// (`S`): git's status skips their edits, and `add -A` skips a
+/// skip-worktree entry's.
+fn hidden_entries(g: &Git) -> Result<Vec<String>> {
+    Ok(ls_files_v(g)?
+        .into_iter()
+        .filter(|(tag, _)| tag.is_ascii_lowercase() || *tag == 'S')
+        .map(|(_, p)| p)
+        .collect())
+}
+
+fn hidden_reason(paths: &[String]) -> String {
+    format!(
+        "assume-unchanged or skip-worktree entries: {}",
+        paths.join(", ")
+    )
 }
 
 /// `(tag, path)` for each entry of `git ls-files -v`.
@@ -1631,6 +1655,69 @@ mod tests {
         });
         let out = cold(&home, &id).unwrap();
         assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert_eq!(
+            fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    /// An assume-unchanged entry's edits are invisible to `status`; cold
+    /// refuses the tree while one exists.
+    #[test]
+    fn assume_unchanged_at_root_is_refused() {
+        let (_tmp, _wt, home, id) = submodule_case(|wt| {
+            git(wt, &["update-index", "--assume-unchanged", ".gitignore"]);
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(
+            out,
+            Outcome::Skipped("assume-unchanged or skip-worktree entries: .gitignore".into())
+        );
+    }
+
+    #[test]
+    fn assume_unchanged_in_submodule_is_refused() {
+        let (_tmp, wt, home, id) = submodule_case(|wt| {
+            git(
+                &wt.join("lib"),
+                &["update-index", "--assume-unchanged", "a.txt"],
+            );
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(
+            out,
+            Outcome::Skipped("assume-unchanged or skip-worktree entries: lib/a.txt".into())
+        );
+        assert!(wt.join("lib/a.txt").is_file());
+    }
+
+    #[test]
+    fn skip_worktree_in_submodule_is_refused() {
+        let (_tmp, _wt, home, id) = submodule_case(|wt| {
+            git(
+                &wt.join("lib"),
+                &["update-index", "--skip-worktree", "a.txt"],
+            );
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(
+            out,
+            Outcome::Skipped("assume-unchanged or skip-worktree entries: lib/a.txt".into())
+        );
+    }
+
+    /// Set in the window, the flag would hide the edit from the re-check.
+    #[test]
+    fn late_assume_unchanged_edit_in_submodule_moves_the_tree_back() {
+        let (_tmp, wt, out) = cold_late(
+            |_| {},
+            |root| {
+                let lib = root.join("lib");
+                git(&lib, &["update-index", "--assume-unchanged", "a.txt"]);
+                fs::write(lib.join("a.txt"), "edited\n").unwrap();
+            },
+        );
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
         assert_eq!(
             fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
             "edited\n"
