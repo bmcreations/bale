@@ -355,11 +355,9 @@ fn finish(
         if verify_in(&trash, &wip, &dest, &ex, Place::Moved)?.is_some() {
             return Ok(Some(Outcome::Busy(Vec::new())));
         }
-        let snapshot = match restore_check(&trash, &wip, &dest, &ex.regen, &ex.deny)? {
+        let snapshot = match restore_check(&trash, &wip, &dest, &ex)? {
             Verdict::Same(snapshot) => snapshot,
-            Verdict::Differs(reason) => {
-                return Ok(Some(Outcome::Skipped(not_restorable(&reason))))
-            }
+            Verdict::Differs(reason) => return Ok(Some(Outcome::Skipped(not_restorable(&reason)))),
         };
         #[cfg(test)]
         tests::run_seam(&tests::AFTER_COMPARE, &trash);
@@ -487,7 +485,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
                     return Ok(Some(Outcome::Busy(Vec::new())));
                 }
-                Ok(match restore_check(&trash, wip, &dest, &ex.regen, &ex.deny)? {
+                Ok(match restore_check(&trash, wip, &dest, &ex)? {
                     Verdict::Same(snapshot) if snapshot.changed()?.is_none() => {
                         record_hashes(&dest, snapshot.hashes)?;
                         None
@@ -766,7 +764,7 @@ fn is_empty_or_missing(dir: &Path) -> Result<bool> {
 
 /// The git dir of the submodule checkout at `dir`: its `.git` dir, or the
 /// one its `.git` file names (relative to `dir`). `None` without a `.git`.
-fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
     let dot_git = dir.join(".git");
     let meta = match fs::symlink_metadata(&dot_git) {
         Ok(m) => m,
@@ -889,6 +887,7 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
             .map(PathBuf::from)
             .collect(),
         tracked: disk::with_ancestors(listed.split('\0')),
+        subs: std::collections::BTreeMap::new(),
     };
     let tree = record_tree(dir, &skip)?;
     write_manifest(
@@ -922,7 +921,7 @@ fn scan_ignored(dir: &Path, ex: &Exclusions) -> Result<IgnoredScan> {
 /// `deny` as it applies inside the submodule at `sub` (relative to the
 /// worktree root): bare names as they are; a slashed entry only when it lies
 /// under `sub/`, rebased onto the submodule root.
-fn submodule_deny(deny: &[String], sub: &str) -> Vec<String> {
+pub(crate) fn submodule_deny(deny: &[String], sub: &str) -> Vec<String> {
     let sub = sub.trim_end_matches('/');
     deny.iter()
         .filter_map(|d| {
@@ -942,7 +941,7 @@ fn submodule_deny(deny: &[String], sub: &str) -> Vec<String> {
 }
 
 /// Regenerable dirs under `dir` for the build systems detected there.
-fn regen_dirs(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn regen_dirs(dir: &Path) -> Vec<PathBuf> {
     regenerable_dirs(dir, &detect(dir), &no_extras())
 }
 

@@ -13,7 +13,8 @@ use walkdir::WalkDir;
 
 use crate::git::Git;
 use crate::ops::cold::{
-    copy_file, copy_symlink, create_private, hex, SavedFile, FILES, MANIFEST,
+    copy_file, copy_symlink, create_private, hex, regen_dirs, submodule_deny, submodule_git_dir,
+    Exclusions, SavedFile, FILES, MANIFEST,
 };
 use crate::ops::up::TRASH_PREFIX;
 
@@ -103,6 +104,10 @@ pub(crate) struct Skip {
     /// Every path git saves, and each dir above one. A denied path in here
     /// is walked anyway: git restores it, so it has to match.
     pub tracked: BTreeSet<PathBuf>,
+    /// Checked-out submodules the compare walks into, each with what is
+    /// left out inside it, relative to it (as `submodule_change` judges
+    /// it). Its `.git` is left out too.
+    pub subs: BTreeMap<PathBuf, Vec<String>>,
 }
 
 impl Skip {
@@ -114,8 +119,33 @@ impl Skip {
 
     /// Whether the walk leaves out `rel` and everything under it.
     fn skips(&self, rel: &Path, depth: usize, name: &std::ffi::OsStr) -> bool {
-        (depth == 1 && name == ".git") || (self.denied(rel) && !self.tracked.contains(rel))
+        // The root's `.git`, and each walked submodule's.
+        (name == ".git" && (depth == 1 || rel.parent().is_some_and(|p| self.subs.contains_key(p))))
+            || ((self.denied(rel) || self.sub_denied(rel)) && !self.tracked.contains(rel))
     }
+
+    /// Left out inside a submodule.
+    fn sub_denied(&self, rel: &Path) -> bool {
+        self.subs.iter().any(|(sub, deny)| {
+            rel.strip_prefix(sub)
+                .is_ok_and(|rest| !rest.as_os_str().is_empty() && denied(rest, &[], deny))
+        })
+    }
+
+    /// Inside a submodule, which open does not write.
+    fn in_sub(&self, rel: &Path) -> bool {
+        self.subs
+            .keys()
+            .any(|sub| rel != sub && rel.starts_with(sub))
+    }
+}
+
+/// A checked-out submodule as cold's check restores it: the commit the wip
+/// tree records for it, from its own git dir.
+struct SubCheckout {
+    rel: PathBuf,
+    commit: String,
+    git_dir: PathBuf,
 }
 
 /// `paths` (slash-separated, relative) and every dir above each.
@@ -376,7 +406,7 @@ impl Kind {
 pub(crate) enum Verdict {
     /// Open would give the tree back as it is. Holds what the walk saw, so
     /// the caller can tell whether anything changed since.
-    Same(Snapshot),
+    Same(Box<Snapshot>),
     /// Why open would not give it back.
     Differs(String),
 }
@@ -461,28 +491,69 @@ pub(crate) fn restore_check(
     tree: &Path,
     wip: &str,
     dest: &Path,
-    regen: &[PathBuf],
-    deny: &[String],
+    ex: &Exclusions,
 ) -> Result<Verdict> {
     let manifest = read_manifest(dest)?;
     let g = Git::at(tree);
     let git_dir = g.run(&["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(git_dir.trim_end_matches(['\n', '\r']));
     let listing = g.run(&["ls-tree", "-r", "-z", wip])?;
-    let listed: Vec<(&str, &str)> = listing
-        .split('\0')
-        .filter_map(|e| e.split_once('\t'))
-        .collect();
-    let gitlinks = listed
-        .iter()
-        .filter(|(meta, _)| meta.starts_with("160000 "))
-        .map(|(_, path)| PathBuf::from(path))
-        .collect();
+    let mut paths: Vec<String> = Vec::new();
+    let mut gitlinks = BTreeSet::new();
+    let mut pending = Vec::new();
+    let mut list = |prefix: &str, listing: &str, pending: &mut Vec<(String, String)>| {
+        for (meta, path) in listing.split('\0').filter_map(|e| e.split_once('\t')) {
+            let path = format!("{prefix}{path}");
+            if meta.starts_with("160000 ") {
+                let commit = meta.rsplit(' ').next().unwrap_or_default().to_string();
+                gitlinks.insert(PathBuf::from(&path));
+                pending.push((path.clone(), commit));
+            }
+            paths.push(path);
+        }
+    };
+    list("", &listing, &mut pending);
+    // Each checked-out submodule (nested ones too) is restored and compared
+    // like the tree; open leaves it to `git submodule update`, which checks
+    // out the same commit through the submodule's own config.
+    let sub_deny: Vec<String> = ex.deny.iter().chain(&ex.regen_extra).cloned().collect();
+    let mut subs = BTreeMap::new();
+    let mut checkouts = Vec::new();
+    let mut root_regen: Option<Vec<PathBuf>> = None;
+    while let Some((sub, commit)) = pending.pop() {
+        let dir = tree.join(&sub);
+        let Some(git_dir) = submodule_git_dir(&dir)? else {
+            continue;
+        };
+        // Its `core.worktree` names the old path once the tree is moved.
+        let sg = Git::at(&dir)
+            .env("GIT_DIR", git_dir.as_os_str())
+            .env("GIT_WORK_TREE", dir.as_os_str());
+        let listing = sg.run(&["ls-tree", "-r", "-z", &commit])?;
+        list(&format!("{sub}/"), &listing, &mut pending);
+        let mut deny = submodule_deny(&sub_deny, &sub);
+        // As `submodule_change`: the submodule's own regenerable dirs and
+        // the root's that fall inside it.
+        let root_regen = root_regen.get_or_insert_with(|| regen_dirs(tree));
+        let inside = root_regen.iter().filter(|r| r.starts_with(&dir)).cloned();
+        for r in regen_dirs(&dir).into_iter().chain(inside) {
+            if let Ok(rest) = r.strip_prefix(&dir) {
+                deny.push(format!("{}/", rest.to_string_lossy().replace('\\', "/")));
+            }
+        }
+        subs.insert(PathBuf::from(&sub), deny);
+        checkouts.push(SubCheckout {
+            rel: PathBuf::from(&sub),
+            commit,
+            git_dir,
+        });
+    }
     let skip = Skip {
-        regen: regen.to_vec(),
-        deny: deny.to_vec(),
+        regen: ex.regen.clone(),
+        deny: ex.deny.clone(),
         gitlinks,
-        tracked: with_ancestors(listed.iter().map(|(_, path)| *path)),
+        tracked: with_ancestors(paths.iter().map(String::as_str)),
+        subs,
     };
 
     // Beside the tree, so it is on the same filesystem (case folding, exec
@@ -496,7 +567,17 @@ pub(crate) fn restore_check(
         .with_context(|| format!("creating a check dir in {}", parent.display()))?;
     let work = tmp.path().join("tree");
     fs::create_dir(&work).with_context(|| format!("creating {}", work.display()))?;
-    let verdict = check_in(tree, wip, dest, &manifest, &git_dir, tmp.path(), &work, skip);
+    let verdict = check_in(
+        tree,
+        wip,
+        dest,
+        &manifest,
+        &git_dir,
+        tmp.path(),
+        &work,
+        skip,
+        &checkouts,
+    );
     loosen(&work);
     verdict
 }
@@ -513,6 +594,7 @@ fn check_in(
     tmp: &Path,
     work: &Path,
     skip: Skip,
+    subs: &[SubCheckout],
 ) -> Result<Verdict> {
     // A private index: the tree's own git dir is shared with the real one.
     let g = Git::at(work)
@@ -521,6 +603,16 @@ fn check_in(
         .env("GIT_INDEX_FILE", tmp.join("index").as_os_str());
     checkout_wip(&g, wip)?;
     apply_manifest(work, manifest, &dest.join(FILES))?;
+    // Outer submodules first: a nested one's dir comes from its parent.
+    for (i, sub) in subs.iter().enumerate() {
+        let dir = work.join(&sub.rel);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let sg = Git::at(&dir)
+            .env("GIT_DIR", sub.git_dir.as_os_str())
+            .env("GIT_WORK_TREE", dir.as_os_str())
+            .env("GIT_INDEX_FILE", tmp.join(format!("index-{i}")).as_os_str());
+        checkout_wip(&sg, &sub.commit)?;
+    }
     let root_meta = fs::symlink_metadata(tree)?;
     let root = stamp(&root_meta);
     let seen = entries(tree, &skip)?;
@@ -538,13 +630,13 @@ fn check_in(
     if let Some(reason) = compare(tree, work, &skip, &seen, &mut hashes)? {
         return Ok(Verdict::Differs(reason));
     }
-    Ok(Verdict::Same(Snapshot {
+    Ok(Verdict::Same(Box::new(Snapshot {
         tree: tree.to_path_buf(),
         skip,
         seen,
         root,
         hashes,
-    }))
+    })))
 }
 
 /// Every entry under `root` the walk keeps, by exact name, with its stat.
@@ -570,7 +662,7 @@ fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, (Kind, Stamp)>>
             }
             continue;
         }
-        if kind == Kind::Dir && skip.gitlinks.contains(&rel) {
+        if kind == Kind::Dir && skip.gitlinks.contains(&rel) && !skip.subs.contains_key(&rel) {
             it.skip_current_dir();
         }
         let meta = item
@@ -653,6 +745,7 @@ fn compare(
                     }
                 }
                 match (ma.len() == mb.len()).then(|| same_bytes(&a, &b)) {
+                    Some(Ok(Some(_))) if skip.in_sub(rel) => {}
                     Some(Ok(Some(sha256))) => hashes.push(SavedHash {
                         rel: (*rel).clone(),
                         sha256,

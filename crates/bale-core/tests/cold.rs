@@ -574,6 +574,38 @@ fn cold_refuses_submodule_with_ignored_files() {
     );
 }
 
+/// A file in a submodule whose bytes a clean filter in the submodule's own
+/// config strips: status calls it clean, but checkout would write the
+/// stripped bytes back.
+#[cfg(unix)]
+#[test]
+fn cold_refuses_submodule_file_checkout_would_change() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    fs::write(sub.repo.join("notes.txt"), "a\n").unwrap();
+    git(&sub.repo, &["add", "notes.txt"]);
+    git(&sub.repo, &["commit", "-m", "notes"]);
+    let wt = worktree_with_submodule(&fx, &sub);
+    let lib = wt.join("lib");
+    git(&lib, &["config", "filter.strip.clean", "sed 's/ *$//'"]);
+    let attrs = git(&lib, &["rev-parse", "--git-path", "info/attributes"]);
+    let attrs = lib.join(attrs.trim());
+    fs::create_dir_all(attrs.parent().unwrap()).unwrap();
+    fs::write(&attrs, "notes.txt filter=strip\n").unwrap();
+    fs::write(lib.join("notes.txt"), "a  \n").unwrap();
+    // Staged: the index takes the new size, and the cleaned blob is HEAD's.
+    git(&lib, &["add", "notes.txt"]);
+    assert_eq!(git(&lib, &["status", "--porcelain"]), "");
+
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib/notes.txt")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(lib.join("notes.txt")).unwrap(), "a  \n");
+}
+
 #[test]
 fn cold_refuses_submodule_with_git_dir() {
     let fx = Fixture::new();
