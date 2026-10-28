@@ -58,6 +58,19 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
         );
     }
     let admin = git::admin_dir(&root)?;
+    // A linked checkout's admin dir always sits under <common>/worktrees/. A
+    // gitfile pointing anywhere else (the main git dir, say) is not this
+    // worktree, whatever `git worktree list` still says about the path.
+    let worktrees_dir =
+        fs::canonicalize(common.join("worktrees")).unwrap_or(common.join("worktrees"));
+    let admin_canon = fs::canonicalize(&admin).unwrap_or_else(|_| admin.clone());
+    if admin_canon.parent() != Some(worktrees_dir.as_path()) {
+        bail!(
+            "{} uses git dir {}, which is not a linked worktree's; move it away",
+            root.display(),
+            admin.display()
+        );
+    }
     let id = workspace_id(&root);
     let registry = Registry::open(home.clone());
 

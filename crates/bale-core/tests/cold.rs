@@ -1315,3 +1315,26 @@ fn resolve_keeps_admin_dir_when_the_folder_is_not_the_checkout() {
     assert!(!wip_resolves(&fx, &before.id));
     assert_eq!(level(&fx, &before.id), Level::Hot);
 }
+
+/// A stray whose `.git` file points at the main repo's git dir is not a
+/// linked checkout either: its admin dir would be the common dir.
+#[test]
+fn resolve_refuses_a_gitfile_pointing_at_the_main_repo() {
+    let fx = Fixture::new();
+    let wt = fx.repo.join(".claude/worktrees/w");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+    let before = register(&fx.home(), &wt).unwrap();
+    replace_with_stray(&wt);
+    let main_git = fs::canonicalize(fx.repo.join(".git")).unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", main_git.display())).unwrap();
+
+    assert!(resolve(&fx.home(), wt.to_str().unwrap()).is_err());
+    let after = Registry::open(fx.home()).get(&before.id).unwrap().unwrap();
+    assert_eq!(after.admin_dir, before.admin_dir);
+    let out = cold(&fx.home(), &before.id).unwrap();
+    assert!(matches!(&out, Outcome::Skipped(_)), "{out:?}");
+    assert!(!wip_resolves(&fx, &before.id));
+}

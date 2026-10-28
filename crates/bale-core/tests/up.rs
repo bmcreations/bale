@@ -513,3 +513,71 @@ fn up_leaves_a_folder_that_is_not_the_checkout() {
     );
     assert_eq!(level(&fx, &id), Level::Hot);
 }
+
+/// Commits `f` in a fresh repo at `dir` (already initialized).
+fn first_commit(dir: &Path) {
+    for (k, v) in [
+        ("user.name", "Bale Test"),
+        ("user.email", "bale@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        support::git(dir, &["config", k, v]);
+    }
+    fs::write(dir.join("f"), "one\n").unwrap();
+    support::git(dir, &["add", "f"]);
+    support::git(dir, &["commit", "-m", "init"]);
+}
+
+#[test]
+fn registers_a_worktree_of_a_separate_git_dir_repo() {
+    let fx = Fixture::new();
+    let base = fx.repo.parent().unwrap();
+    let repo = base.join("sep");
+    let sep = base.join("sep.git");
+    support::git(
+        base,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            sep.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    first_commit(&repo);
+    let wt = base.join("sep-wt");
+    support::git(&repo, &["worktree", "add", "-b", "w", wt.to_str().unwrap()]);
+
+    let rec = register(&fx.home(), &wt).unwrap();
+    assert_eq!(rec.level, Level::Hot);
+}
+
+#[test]
+fn registers_a_worktree_of_a_submodule() {
+    let fx = Fixture::new();
+    let base = fx.repo.parent().unwrap();
+    let sup = base.join("super");
+    fs::create_dir_all(&sup).unwrap();
+    support::git(&sup, &["init", "-b", "main"]);
+    first_commit(&sup);
+    support::git(
+        &sup,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            fx.repo.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    let wt = base.join("sub-wt");
+    support::git(
+        &sup.join("sub"),
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+
+    let rec = register(&fx.home(), &wt).unwrap();
+    assert_eq!(rec.level, Level::Hot);
+}
