@@ -56,7 +56,8 @@ fn bales_gradle_worktree() {
     assert!(!wt.join("app/build").exists());
     assert!(wt.join("src/Main.kt").exists());
     assert!(trash_left(&wt).is_empty());
-    assert_eq!(linked_lock(&fx).as_deref(), Some("baled by bale"));
+    // The checkout is still there, so git needs no lock to keep its entry.
+    assert_eq!(linked_lock(&fx), None);
     assert_eq!(level(&fx, &rec.id), Level::Baled);
 }
 

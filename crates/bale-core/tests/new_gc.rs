@@ -5,7 +5,7 @@ use bale_core::lock::WorkspaceLock;
 use bale_core::ops::cold::cold;
 use bale_core::ops::gc::{gc, GcReport};
 use bale_core::ops::new::new_workspace;
-use bale_core::ops::up::{register, Outcome};
+use bale_core::ops::up::{register, up, Outcome};
 use bale_core::registry::{Level, Record, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -483,4 +483,45 @@ fn gc_reports_a_corrupt_record_and_continues() {
     assert_eq!(report.removed, vec![id]);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].0, "bad");
+}
+
+#[test]
+fn gc_collects_a_baled_tree_the_user_removed_with_git() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "wt");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    assert_eq!(up(&fx.home(), &id).unwrap(), Outcome::Done(Level::Baled));
+    plant_saved_state(&fx, &id);
+    // Unlocked at Baled, so a plain `git worktree remove` works.
+    git(&fx.repo, &["worktree", "remove", wt.to_str().unwrap()]);
+
+    let report = gc(&fx.home(), false).unwrap();
+    assert_eq!(report.removed, vec![id.clone()], "{report:?}");
+    assert!(registry(&fx).get(&id).unwrap().is_none());
+    assert_eq!(bale_refs(&fx, &id), "");
+    assert!(!fx.home().saved_dir(&id).exists());
+}
+
+/// Earlier builds locked a tree at `up`: gone but still bale-locked, git
+/// keeps listing it, so gc keeps the record (as it always has).
+#[test]
+fn gc_keeps_a_gone_baled_tree_with_bales_old_lock() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "wt");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    assert_eq!(up(&fx.home(), &id).unwrap(), Outcome::Done(Level::Baled));
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            LOCK_REASON,
+            wt.to_str().unwrap(),
+        ],
+    );
+    fs::remove_dir_all(&wt).unwrap();
+    git(&fx.repo, &["worktree", "prune"]);
+    assert_eq!(gc(&fx.home(), false).unwrap(), GcReport::default());
+    assert!(registry(&fx).get(&id).unwrap().is_some());
 }

@@ -146,15 +146,13 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
             if !holders.is_empty() {
                 return Ok(Outcome::Busy(holders));
             }
-            git::lock_worktree(&root, &root)?;
             record.level = Level::Baling;
             registry.put(&record)?;
 
             if let Err(failure) = move_to_trash(home, &root) {
-                let unlocked = git::unlock_worktree_if_ours(&root, &root);
                 record.level = Level::Hot;
                 registry.put(&record)?;
-                return rename_failure(failure, unlocked);
+                return rename_failure(failure);
             }
         }
     }
@@ -184,14 +182,10 @@ pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
 /// Turns a failed move into the outcome. Dirs stranded in trash are an error
 /// naming each one, so the user can move them back; otherwise a permission or
 /// sharing error means busy. The rename error stays the root cause.
-fn rename_failure(failure: MoveFailure, unlocked: Result<bool>) -> Result<Outcome> {
+fn rename_failure(failure: MoveFailure) -> Result<Outcome> {
     let MoveFailure { cause, stranded } = failure;
     let busy = is_busy_error(&cause);
-    let mut err = anyhow::Error::from(cause).context("moving build output aside");
-    let unlock_failed = unlocked.is_err();
-    if let Err(u) = unlocked {
-        err = err.context(format!("unlocking the worktree also failed: {u:#}"));
-    }
+    let err = anyhow::Error::from(cause).context("moving build output aside");
     if !stranded.is_empty() {
         let list: Vec<String> = stranded
             .iter()
@@ -202,7 +196,7 @@ fn rename_failure(failure: MoveFailure, unlocked: Result<bool>) -> Result<Outcom
             list.join(", ")
         )));
     }
-    if busy && !unlock_failed {
+    if busy {
         return Ok(Outcome::Busy(Vec::new()));
     }
     Err(err)
@@ -428,7 +422,7 @@ mod tests {
         let trash = trash_in(tmp.path());
         assert_eq!(failure.stranded, vec![(trash[0].clone(), dirs[0].clone())]);
 
-        let err = rename_failure(failure, Ok(true)).unwrap_err();
+        let err = rename_failure(failure).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains(&trash[0].display().to_string()), "{msg}");
         assert!(msg.contains(&dirs[0].display().to_string()), "{msg}");
@@ -446,26 +440,7 @@ mod tests {
             cause: io::Error::from(io::ErrorKind::PermissionDenied),
             stranded: Vec::new(),
         };
-        assert_eq!(
-            rename_failure(failure, Ok(true)).unwrap(),
-            Outcome::Busy(Vec::new())
-        );
-    }
-
-    #[test]
-    fn unlock_failure_keeps_rename_error_as_cause() {
-        let failure = MoveFailure {
-            cause: io::Error::from(io::ErrorKind::PermissionDenied),
-            stranded: Vec::new(),
-        };
-        let err = rename_failure(failure, Err(anyhow::anyhow!("git exploded"))).unwrap_err();
-        assert!(format!("{err:#}").contains("git exploded"));
-        assert_eq!(
-            err.root_cause()
-                .downcast_ref::<io::Error>()
-                .map(|e| e.kind()),
-            Some(io::ErrorKind::PermissionDenied)
-        );
+        assert_eq!(rename_failure(failure).unwrap(), Outcome::Busy(Vec::new()));
     }
 
     #[test]

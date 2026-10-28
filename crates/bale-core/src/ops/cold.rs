@@ -1,5 +1,6 @@
 //! `bale cold`: save a worktree's uncommitted work and ignored files, verify
-//! the saved state, then delete the checkout while git's entry stays locked.
+//! the saved state, then lock git's entry and delete the checkout. The lock
+//! keeps `git worktree prune` from erasing the entry while the dir is gone.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -263,26 +264,22 @@ fn finish(
     let holders = match prepared {
         Ok(h) => h,
         Err(e) => {
-            record.level = Level::Baled;
-            registry.put(&record)?;
+            back_to_baled(registry, &mut record, root)?;
             return Err(e);
         }
     };
     if !holders.is_empty() {
-        record.level = Level::Baled;
-        registry.put(&record)?;
+        back_to_baled(registry, &mut record, root)?;
         return Ok(Outcome::Busy(holders));
     }
 
     let trash = trash_path(root)?;
     if let Err(e) = write_trash_marker(&home.saved_dir(&id), root, &id, &trash) {
-        record.level = Level::Baled;
-        registry.put(&record)?;
+        back_to_baled(registry, &mut record, root)?;
         return Err(e);
     }
     if let Err(e) = fs::rename(root, &trash) {
-        record.level = Level::Baled;
-        registry.put(&record)?;
+        back_to_baled(registry, &mut record, root)?;
         if is_busy_error(&e) {
             return Ok(Outcome::Busy(Vec::new()));
         }
@@ -295,6 +292,18 @@ fn finish(
     Ok(Outcome::Done(Level::Cold))
 }
 
+/// Puts a record whose checkout is still at `root` back to `Baled`. The
+/// checkout exists, so git needs no lock to keep its entry: bale's own lock
+/// is released (a lock with any other reason stays). Releasing it is best
+/// effort: a Baled tree that keeps bale's lock works as before, and the
+/// caller's own error matters more.
+fn back_to_baled(registry: &Registry, record: &mut Record, root: &Path) -> Result<()> {
+    record.level = Level::Baled;
+    registry.put(record)?;
+    let _ = git::unlock_worktree_if_ours(root, root);
+    Ok(())
+}
+
 /// Resumes a `Cooling` record. A present checkout is saved again from
 /// scratch; a missing one is only finished off (trash removed, `Cold`) when
 /// the wip ref and the manifest both exist.
@@ -304,8 +313,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
         let root =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
         if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
-            record.level = Level::Baled;
-            registry.put(&record)?;
+            back_to_baled(registry, &mut record, &root)?;
             return Ok(Outcome::Skipped(reason));
         }
         git::lock_worktree(&root, &root)?;

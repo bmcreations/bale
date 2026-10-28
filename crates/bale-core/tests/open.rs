@@ -241,12 +241,37 @@ fn hot_open_is_a_no_op() {
 }
 
 #[test]
-fn baled_opens_hot_and_unlocks() {
+fn baled_opens_hot() {
     let fx = Fixture::new();
     let wt = dirty_worktree(&fx);
     let id = register(&fx.home(), &wt).unwrap().id;
     assert_eq!(up(&fx.home(), &id).unwrap(), Outcome::Done(Level::Baled));
-    assert_eq!(linked(&fx).locked.as_deref(), Some("baled by bale"));
+    assert_eq!(linked(&fx).locked, None);
+
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert_eq!(level(&fx, &id), Level::Hot);
+    assert_eq!(linked(&fx).locked, None);
+    assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
+}
+
+/// Earlier builds locked a tree at `up`; open still releases that lock.
+#[test]
+fn baled_with_bales_old_lock_opens_hot_and_unlocks() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    assert_eq!(up(&fx.home(), &id).unwrap(), Outcome::Done(Level::Baled));
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
 
     let report = open(&fx.home(), &id).unwrap();
     assert_eq!(report.outcome, Outcome::Done(Level::Hot));

@@ -445,6 +445,8 @@ fn busy_tree_is_not_removed() {
     assert!(matches!(&out, Outcome::Busy(h) if !h.is_empty()), "{out:?}");
     assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
     assert_ne!(level(&fx, &id), Level::Cold);
+    // Left Baled, and Baled trees carry no git lock.
+    assert_eq!(linked(&fx).locked, None);
 }
 
 /// `git init` + one commit at `dir`.
@@ -875,4 +877,24 @@ fn cold_if_clean_colds_clean_tree() {
     let out = cold_if_clean(&fx.home(), &id).unwrap();
     assert_eq!(out, Outcome::Done(Level::Cold));
     assert!(!wt.exists());
+}
+
+/// A cold that fails after taking the git lock puts the tree back to Baled
+/// without bale's lock.
+#[cfg(unix)]
+#[test]
+fn failed_save_returns_to_baled_unlocked() {
+    if running_as_root() {
+        return;
+    }
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    chmod(&wt.join(".env"), 0o000);
+    let out = cold(&fx.home(), &id);
+    chmod(&wt.join(".env"), 0o600);
+    assert!(out.is_err(), "{out:?}");
+    assert_eq!(level(&fx, &id), Level::Baled);
+    assert_eq!(linked(&fx).locked, None);
+    assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), "SECRET=1\n");
 }
