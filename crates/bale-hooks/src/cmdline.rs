@@ -106,28 +106,54 @@ pub(crate) fn cmd_guarded(quoted: &str, args: &str) -> String {
     format!("if exist {quoted} {quoted} {args}")
 }
 
-/// How `cmd` runs bale with `args`, counting the forms [`sh_guarded`] and
-/// [`cmd_guarded`] write as [`BaleCall::Plain`] when the guard and the call
-/// name the same bale exe.
-pub(crate) fn own_call(cmd: &str, args: &[&str]) -> Option<BaleCall> {
-    let call = bale_call(cmd, args)?;
-    if call == BaleCall::Plain {
-        return Some(call);
-    }
+/// Whether `word` is an absolute path on any OS bale supports: `/…`,
+/// `C:\…` or `C:/…`, or a UNC `\\…` path. Judged by text, not by the host,
+/// so a file written on one OS reads the same on another.
+fn is_absolute(word: &str) -> bool {
+    let b = word.as_bytes();
+    word.starts_with('/')
+        || word.starts_with(r"\\")
+        || (b.len() > 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'\\' | b'/'))
+}
+
+/// The exe path when `cmd` is bale's own entry running `args`, from any exe
+/// path: the bare call earlier installs wrote, or the form [`sh_guarded`] or
+/// [`cmd_guarded`] writes, quoted exactly as bale quotes it. bale only ever
+/// writes an absolute exe path, so an entry naming bale by a relative path
+/// or bare name, or guarded in a shape bale does not write, is the user's
+/// and gives `None`.
+pub(crate) fn own_exe(cmd: &str, args: &[&str]) -> Option<String> {
     let w = words(cmd)?;
-    let w: Vec<&str> = w.iter().map(String::as_str).collect();
-    let tail = |rest: &[&str]| rest.iter().copied().eq(args.iter().copied());
-    let guarded = match w.as_slice() {
-        ["if", "[", "-x", guard, "]", ";", "then", exe, rest @ ..] => {
-            matches!(rest.split_last(), Some((&"fi", body))
-                if matches!(body.split_last(), Some((&";", a)) if tail(a)))
-                && guard == exe
-                && is_bale(exe)
-        }
-        ["if", "exist", guard, exe, rest @ ..] => tail(rest) && guard == exe && is_bale(exe),
-        _ => false,
+    let at = match (w.first().map(String::as_str), w.get(1).map(String::as_str)) {
+        (Some("if"), Some("[")) => 7,
+        (Some("if"), Some("exist")) => 3,
+        _ => 0,
     };
-    Some(if guarded { BaleCall::Plain } else { call })
+    let exe = w.get(at)?;
+    if !is_absolute(exe) || !is_bale(exe) {
+        return None;
+    }
+    let joined = args.join(" ");
+    let own = if at == 0 {
+        w[1..].iter().map(String::as_str).eq(args.iter().copied())
+    } else {
+        cmd == sh_guarded(&crate::claude::sh_quote(exe), &joined)
+            || cmd == cmd_guarded(&crate::install::windows_quote(exe), &joined)
+    };
+    own.then(|| exe.clone())
+}
+
+/// How `cmd` runs bale with `args`: [`BaleCall::Plain`] only for bale's own
+/// entry (see [`own_exe`]), [`BaleCall::Wrapped`] for any other command that
+/// runs bale with `args`.
+pub(crate) fn own_call(cmd: &str, args: &[&str]) -> Option<BaleCall> {
+    if own_exe(cmd, args).is_some() {
+        return Some(BaleCall::Plain);
+    }
+    bale_call(cmd, args).map(|_| BaleCall::Wrapped)
 }
 
 #[cfg(test)]
@@ -178,6 +204,42 @@ mod tests {
             "'open",
         ] {
             assert_eq!(bale_call(not, &args), None, "{not}");
+        }
+    }
+
+    /// Only an absolute exe, in the exact text bale writes, is bale's own;
+    /// a bare name, a relative path or a guard bale did not write is the
+    /// user's.
+    #[test]
+    fn own_exe_needs_an_absolute_path_in_bales_own_form() {
+        let args = ["hook", "cursor", "setup"];
+        for (cmd, exe) in [
+            ("'/opt/bale' hook cursor setup", "/opt/bale"),
+            (r#""C:\b\bale.exe" hook cursor setup"#, r"C:\b\bale.exe"),
+            (
+                "if [ -x '/opt/it'\\''s/bale' ]; then '/opt/it'\\''s/bale' hook cursor setup; fi",
+                "/opt/it's/bale",
+            ),
+            (
+                r#"if exist "C:\b\bale.exe" "C:\b\bale.exe" hook cursor setup"#,
+                r"C:\b\bale.exe",
+            ),
+        ] {
+            assert_eq!(own_exe(cmd, &args).as_deref(), Some(exe), "{cmd}");
+            assert_eq!(own_call(cmd, &args), Some(BaleCall::Plain), "{cmd}");
+        }
+        for cmd in [
+            "bale hook cursor setup",
+            "./bin/bale hook cursor setup",
+            "'bin/bale.exe' hook cursor setup",
+            // Guarded by the user: unquoted, or a relative path.
+            "if [ -x /usr/local/bin/bale ]; then /usr/local/bin/bale hook cursor setup; fi",
+            "if [ -x 'bale' ]; then 'bale' hook cursor setup; fi",
+            "if [ -x '/a/bale' ]; then '/b/bale' hook cursor setup; fi",
+            "if exist bale.exe bale.exe hook cursor setup",
+        ] {
+            assert_eq!(own_exe(cmd, &args), None, "{cmd}");
+            assert_eq!(own_call(cmd, &args), Some(BaleCall::Wrapped), "{cmd}");
         }
     }
 }

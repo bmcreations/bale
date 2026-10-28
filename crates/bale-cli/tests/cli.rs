@@ -2194,6 +2194,39 @@ fn install_cursor_repoints_and_guards_bales_entry() {
     }
 }
 
+/// bale only ever writes an absolute exe path, so an entry that names bale
+/// by a bare name or relative path, or guards it in a shape bale does not
+/// write, is the user's: install and uninstall both leave it, with a note.
+#[test]
+fn cursor_leaves_entries_bale_did_not_write() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for entry in [
+        "bale hook cursor setup",
+        "if [ -x /usr/local/bin/bale ]; then /usr/local/bin/bale hook cursor setup; fi",
+    ] {
+        let text = serde_json::json!({"setup-worktree": ["npm i", entry]}).to_string();
+        fs::write(&path, &text).unwrap();
+        let out = install(&env, "cursor", true);
+        assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text, "{entry}");
+
+        let out = uninstall(&env, "cursor", true);
+        assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text, "{entry}");
+    }
+
+    // Alone in a file bale did not back up: the file stays.
+    let text = serde_json::json!({"setup-worktree": [
+        "if [ -x /usr/local/bin/bale ]; then /usr/local/bin/bale hook cursor setup; fi"
+    ]})
+    .to_string();
+    fs::write(&path, &text).unwrap();
+    uninstall(&env, "cursor", true);
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+}
+
 #[test]
 fn install_cursor_refuses_script_path_value() {
     let env = Env::new();
@@ -2334,6 +2367,29 @@ fn install_conductor_repoints_bales_own_chained_command() {
              archive = \"if [ -x '{exe}' ]; then '{exe}' hook conductor archive; fi\"\n"
         )
     );
+}
+
+/// A script naming bale without an absolute path is the user's: install
+/// and uninstall leave it, with a note.
+#[test]
+fn conductor_leaves_a_path_relative_bale_script() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text = "[scripts]\nsetup = \"npm i\"\narchive = \"bale hook conductor archive\"\n";
+    fs::write(&path, text).unwrap();
+    let out = install(&env, "conductor", true);
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains("archive = \"bale hook conductor archive\"\n"),
+        "{}",
+        fs::read_to_string(&path).unwrap()
+    );
+    let out = uninstall(&env, "conductor", true);
+    assert!(stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
 }
 
 /// An install from before the guard, at this exe's path, gets the guarded
