@@ -92,6 +92,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "fs4",
+ "libc",
  "plist",
  "serde",
  "serde_json",

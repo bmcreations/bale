@@ -532,6 +532,44 @@ fn save_ignored_refuses_nested_repo() {
     assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
 }
 
+/// Sets extended attribute `name` on `path`; false if the filesystem
+/// refuses user attributes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn set_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let p = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let n = CString::new(name).unwrap();
+    let v = value.as_ptr().cast();
+    // SAFETY: both strings are NUL-terminated and `v` is valid for its length.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), v, value.len(), 0, 0) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), v, value.len(), 0) };
+    rc == 0
+}
+
+/// An extended attribute the user set (Finder tags, say) is not saved, so
+/// cold refuses and names the file.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn cold_refuses_file_with_extended_attribute() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join("notes.txt"), "n\n").unwrap();
+    if !set_xattr(&wt.join("notes.txt"), "user.bale-test", b"x") {
+        eprintln!("skipped: the filesystem refuses user xattrs");
+        return;
+    }
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("notes.txt") && r.contains("user.bale-test")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("notes.txt")).unwrap(), "n\n");
+}
+
 /// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`,
 /// `build/` and `cache/`.
 fn worktree_with_submodule(fx: &Fixture, sub: &Fixture) -> PathBuf {

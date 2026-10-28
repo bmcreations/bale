@@ -702,6 +702,12 @@ fn compare(
     }
     for (rel, kind) in &have {
         let (a, b) = (tree.join(rel), restored.join(rel));
+        if let Some(name) = user_xattrs(&a)?.into_iter().next() {
+            return Ok(Some(format!(
+                "{} has extended attribute {name}, which can't be saved",
+                rel.display()
+            )));
+        }
         let other = want[*rel];
         if *kind != other {
             return Ok(Some(format!(
@@ -795,4 +801,76 @@ fn read_full(f: &mut fs::File, buf: &mut [u8]) -> Result<usize> {
         }
     }
     Ok(n)
+}
+
+/// Extended attributes the OS sets on its own, which nothing restores and
+/// no one misses: Gatekeeper's provenance and quarantine marks, the
+/// last-opened date, the TCC sandbox list (macOS), and SELinux labels
+/// (Linux, set again by policy). Anything else, Finder tags and colours
+/// included, is the user's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const OS_XATTRS: &[&str] = &[
+    "com.apple.provenance",
+    "com.apple.quarantine",
+    "com.apple.lastuseddate#PS",
+    "com.apple.macl",
+    "security.selinux",
+];
+
+/// The extended attributes on `path` (not following a symlink) other than
+/// [`OS_XATTRS`]. None where the filesystem has no xattrs.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn user_xattrs(path: &Path) -> Result<Vec<String>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("{} has a NUL in its path", path.display()))?;
+    let list = |buf: &mut [u8]| -> isize {
+        let (ptr, len) = if buf.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (buf.as_mut_ptr().cast(), buf.len())
+        };
+        // SAFETY: `c` is NUL-terminated and `ptr` is null or valid for `len`.
+        #[cfg(target_os = "macos")]
+        let n = unsafe { libc::listxattr(c.as_ptr(), ptr, len, libc::XATTR_NOFOLLOW) };
+        #[cfg(target_os = "linux")]
+        let n = unsafe { libc::llistxattr(c.as_ptr(), ptr, len) };
+        n
+    };
+    loop {
+        let size = list(&mut []);
+        if size < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOTSUP) {
+                return Ok(Vec::new());
+            }
+            return Err(e).with_context(|| format!("listing xattrs of {}", path.display()));
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; size as usize];
+        let n = list(&mut buf);
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            // Grew since the size call.
+            if e.raw_os_error() == Some(libc::ERANGE) {
+                continue;
+            }
+            return Err(e).with_context(|| format!("listing xattrs of {}", path.display()));
+        }
+        buf.truncate(n as usize);
+        return Ok(buf
+            .split(|b| *b == 0)
+            .filter(|n| !n.is_empty())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .filter(|n| !OS_XATTRS.contains(&n.as_str()))
+            .collect());
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn user_xattrs(_path: &Path) -> Result<Vec<String>> {
+    Ok(Vec::new())
 }
