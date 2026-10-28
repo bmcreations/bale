@@ -77,6 +77,9 @@ pub(crate) struct Skip {
     /// Submodule checkouts: open leaves each an empty dir, and their
     /// content is checked against the submodule's own git dir.
     pub gitlinks: BTreeSet<PathBuf>,
+    /// Every path git saves, and each dir above one. A denied path in here
+    /// is walked anyway: git restores it, so it has to match.
+    pub tracked: BTreeSet<PathBuf>,
 }
 
 impl Skip {
@@ -88,8 +91,25 @@ impl Skip {
 
     /// Whether the walk leaves out `rel` and everything under it.
     fn skips(&self, rel: &Path, depth: usize, name: &std::ffi::OsStr) -> bool {
-        (depth == 1 && name == ".git") || self.denied(rel)
+        (depth == 1 && name == ".git") || (self.denied(rel) && !self.tracked.contains(rel))
     }
+}
+
+/// `paths` (slash-separated, relative) and every dir above each.
+pub(crate) fn with_ancestors<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeSet<PathBuf> {
+    let mut set = BTreeSet::new();
+    for p in paths.filter(|p| !p.is_empty()) {
+        let mut cur = PathBuf::from(p);
+        loop {
+            if !set.insert(cur.clone()) {
+                break;
+            }
+            if !cur.pop() || cur.as_os_str().is_empty() {
+                break;
+            }
+        }
+    }
+    set
 }
 
 pub(crate) fn denied(rel: &Path, regen: &[PathBuf], deny: &[String]) -> bool {
@@ -272,18 +292,21 @@ pub(crate) fn restore_mismatch(
     let g = Git::at(tree);
     let git_dir = g.run(&["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(git_dir.trim_end_matches(['\n', '\r']));
-    let gitlinks = g.run(&["ls-tree", "-r", "-z", wip])?;
-    let gitlinks = gitlinks
+    let listing = g.run(&["ls-tree", "-r", "-z", wip])?;
+    let entries: Vec<(&str, &str)> = listing
         .split('\0')
-        .filter_map(|e| {
-            let (meta, path) = e.split_once('\t')?;
-            meta.starts_with("160000 ").then(|| PathBuf::from(path))
-        })
+        .filter_map(|e| e.split_once('\t'))
+        .collect();
+    let gitlinks = entries
+        .iter()
+        .filter(|(meta, _)| meta.starts_with("160000 "))
+        .map(|(_, path)| PathBuf::from(path))
         .collect();
     let skip = Skip {
         regen: regen.to_vec(),
         deny: deny.to_vec(),
         gitlinks,
+        tracked: with_ancestors(entries.iter().map(|(_, path)| *path)),
     };
 
     // Beside the tree, so it is on the same filesystem (case folding, exec

@@ -848,6 +848,15 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
         });
     }
 
+    // What `add -A` puts in the wip: the index plus untracked files that
+    // are not ignored.
+    let listed = Git::at(dir).run(&[
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ])?;
     let skip = Skip {
         regen: ex.regen.clone(),
         deny: ex.deny.clone(),
@@ -855,6 +864,7 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
             .into_iter()
             .map(PathBuf::from)
             .collect(),
+        tracked: disk::with_ancestors(listed.split('\0')),
     };
     let (modes, dirs) = record_tree(dir, &skip)?;
     write_manifest(

@@ -307,3 +307,28 @@ fn exclude_line_removed_while_cold_still_opens() {
     assert_eq!(report.outcome, Outcome::Done(Level::Hot));
     assert_eq!(fs::read_to_string(wt.join("local.cfg")).unwrap(), "mine\n");
 }
+
+/// A file git tracks in the wip under a dir the walks deny (`node_modules`)
+/// is still checked: here a clean filter strips its trailing spaces.
+#[test]
+fn tracked_file_in_node_modules_under_lossy_filter_is_refused() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |r| {
+            git(r, &["config", "filter.strip.clean", "sed 's/ *$//'"]);
+            git(r, &["config", "filter.strip.smudge", "cat"]);
+            fs::write(r.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+            commit_all(r);
+        },
+        |wt| {
+            fs::create_dir_all(wt.join("node_modules")).unwrap();
+            fs::write(wt.join("node_modules/n.txt"), "a   \n").unwrap();
+        },
+    );
+    assert_refused(&fx, &wt, &id, "node_modules/n.txt");
+    assert_eq!(
+        fs::read_to_string(wt.join("node_modules/n.txt")).unwrap(),
+        "a   \n"
+    );
+}
