@@ -252,18 +252,28 @@ struct MoveFailure {
 }
 
 /// The regenerable dirs under `root` that `up` may remove, and those it must
-/// keep because git tracks a file in them or sees an untracked file there
-/// that is not ignored. Both sorted; trash dirs are left out.
+/// keep: git tracks a file in them, sees an untracked file there that is not
+/// ignored, or they sit in a submodule or nested repo (any dir from below
+/// `root` down to the candidate has a `.git` entry), whose files the root's
+/// git can't see. Both sorted; trash dirs are left out.
 pub(crate) fn bale_able(home: &BaleHome, root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut dirs = regenerable(home, root)?;
+    bale_able_from(root, regenerable(home, root)?)
+}
+
+/// `bale_able` over regenerable dirs the caller already listed.
+pub(crate) fn bale_able_from(
+    root: &Path,
+    mut dirs: Vec<PathBuf>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     dirs.retain(|d| !in_trash(root, d));
     dirs.sort();
     let rels: Vec<PathBuf> = dirs
         .iter()
         .map(|d| d.strip_prefix(root).unwrap_or(d).to_path_buf())
         .collect();
-    let mut real = vec![false; dirs.len()];
-    for (chunk, start) in rels.chunks(100).zip((0..).step_by(100)) {
+    let mut real: Vec<bool> = rels.iter().map(|rel| in_nested_repo(root, rel)).collect();
+    let asked: Vec<usize> = (0..rels.len()).filter(|&i| !real[i]).collect();
+    for chunk in asked.chunks(100) {
         let mut args: Vec<String> = [
             "--no-optional-locks",
             "ls-files",
@@ -278,16 +288,15 @@ pub(crate) fn bale_able(home: &BaleHome, root: &Path) -> Result<(Vec<PathBuf>, V
         args.extend(
             chunk
                 .iter()
-                .map(|rel| format!(":(literal){}", slashed(rel))),
+                .map(|&i| format!(":(literal){}", slashed(&rels[i]))),
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = git::Git::at(root).run(&args)?;
         for listed in out.split('\0').filter(|p| !p.is_empty()) {
             let listed = Path::new(listed);
-            for (i, rel) in chunk.iter().enumerate() {
-                if listed.starts_with(rel) {
-                    real[start + i] = true;
-                }
+            // Candidates never nest, so a path lies under at most one.
+            if let Some(&i) = chunk.iter().find(|&&i| listed.starts_with(&rels[i])) {
+                real[i] = true;
             }
         }
     }
@@ -296,6 +305,16 @@ pub(crate) fn bale_able(home: &BaleHome, root: &Path) -> Result<(Vec<PathBuf>, V
         trash.into_iter().map(|(d, _)| d).collect(),
         kept.into_iter().map(|(d, _)| d).collect(),
     ))
+}
+
+/// Whether a dir between `root` (exclusive) and `root/rel` (inclusive) has a
+/// `.git` entry of any kind.
+fn in_nested_repo(root: &Path, rel: &Path) -> bool {
+    let mut dir = root.to_path_buf();
+    rel.components().any(|c| {
+        dir.push(c);
+        fs::symlink_metadata(dir.join(".git")).is_ok()
+    })
 }
 
 /// `rel` with `/` between components, as git pathspecs want.

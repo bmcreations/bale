@@ -382,3 +382,40 @@ fn build_dir_with_only_ignored_files_goes() {
     assert!(report.kept.is_empty(), "{:?}", report.kept);
     assert!(!wt.join("build").exists());
 }
+
+/// Root's ls-files can't see inside a submodule, so a regenerable-named dir
+/// there is kept rather than judged from the outside.
+#[test]
+fn build_dir_inside_a_submodule_is_kept() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    fs::create_dir_all(sub.repo.join("build")).unwrap();
+    fs::write(sub.repo.join("build/k.txt"), "k\n").unwrap();
+    support::git(&sub.repo, &["add", "build/k.txt"]);
+    support::git(&sub.repo, &["commit", "-qm", "k"]);
+    let wt = gradle_worktree(&fx);
+    support::git(
+        &wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub.repo.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    support::git(&wt, &["commit", "-qm", "sub"]);
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let report = up_report(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Baled));
+    let kept = fs::canonicalize(wt.join("lib/build")).unwrap();
+    assert_eq!(report.kept, vec![kept]);
+    assert_eq!(
+        fs::read_to_string(wt.join("lib/build/k.txt")).unwrap(),
+        "k\n"
+    );
+    assert!(!wt.join("app/build").exists());
+}

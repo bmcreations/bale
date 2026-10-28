@@ -189,7 +189,8 @@ fn main() -> ExitCode {
 }
 
 /// Why `up` left a regenerable-named dir in place.
-const KEPT_WHY: &str = "holds files git tracks or does not ignore";
+const KEPT_WHY: &str =
+    "holds files git tracks or does not ignore, or is in a submodule or nested repo";
 
 /// Prints the outcome; exit 0 done, 3 busy, 4 skipped.
 fn report(id: &str, outcome: Outcome) -> ExitCode {

@@ -11,7 +11,7 @@ use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
-use crate::ops::up::{bale_able, up_report, Outcome};
+use crate::ops::up::{bale_able_from, up_report, Outcome};
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
 
@@ -92,7 +92,7 @@ fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String
             Ok(r) if !r.kept.is_empty() => {
                 let kept: Vec<String> = r.kept.iter().map(|d| d.display().to_string()).collect();
                 format!(
-                    "{}; kept (holds files git tracks or does not ignore): {}",
+                    "{}; kept (holds files git tracks or does not ignore, or is in a submodule or nested repo): {}",
                     outcome_text(Ok(r.outcome)),
                     kept.join(", ")
                 )
@@ -144,7 +144,7 @@ fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
     // on a tree whose only regenerable-named dirs hold real content.
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
-        && !bale_able(home, &root)?.0.is_empty();
+        && !bale_able_from(&root, regen)?.0.is_empty();
     Ok(decide(record.level, idle_for, dirty, has_regen, &cfg))
 }
 
