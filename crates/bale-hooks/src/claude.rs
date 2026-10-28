@@ -1,6 +1,7 @@
 //! Claude Code's WorktreeCreate and WorktreeRemove hooks
 //! (`bale hook claude create|remove`), and their install into
-//! `~/.claude/settings.json`.
+//! `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that
+//! is set).
 //!
 //! Claude Code contract, from https://code.claude.com/docs/en/hooks (read
 //! 2026-10-28, sections "WorktreeCreate" and "WorktreeRemove"):
@@ -379,19 +380,31 @@ fn sh_unquote(s: &str) -> Option<String> {
     }
 }
 
+/// Claude Code's user settings.json, as `(root, tail)`: the file is
+/// `root/tail`, and its backup is keyed by both. That is
+/// `(<home>, .claude/settings.json)` by default, and the parent of
+/// `CLAUDE_CONFIG_DIR` and `<its name>/settings.json` when that is set.
+fn settings_location(home: &Path) -> (PathBuf, PathBuf) {
+    let dir = crate::claude_home(home);
+    match (dir.parent(), dir.file_name()) {
+        (Some(root), Some(name)) => (root.to_path_buf(), Path::new(name).join("settings.json")),
+        _ => (dir, PathBuf::from("settings.json")),
+    }
+}
+
 /// One settings.json hook group running `bale hook claude <kind>`.
 fn hook_group(exe: &Path, kind: &str) -> Value {
     json!({ "hooks": [{ "type": "command", "command": hook_command(exe, kind) }] })
 }
 
 /// Adds bale's WorktreeCreate and WorktreeRemove entries to
-/// `<home>/.claude/settings.json`, keeping every other hook. bale's remove
+/// Claude Code's user settings.json (see [`settings_location`]), keeping every other hook. bale's remove
 /// entry goes before any user WorktreeRemove hook. A user WorktreeCreate hook
 /// is refused: Claude Code would run both, and two hooks creating the same
 /// worktree conflict.
 pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
-    let tail = Path::new(".claude").join("settings.json");
-    let path = home.join(&tail);
+    let (base, tail) = settings_location(home);
+    let path = base.join(&tail);
     let meta = match fs::symlink_metadata(&path) {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -509,7 +522,7 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                 .to_path_buf(),
         ),
         Step::Settings {
-            backup: (!any_ours).then(|| backup_path(backups, &backup_key(home, &tail))),
+            backup: (!any_ours).then(|| backup_path(backups, &backup_key(&base, &tail))),
             path: path.clone(),
             before: before.clone(),
             after,
@@ -524,12 +537,13 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
 }
 
 /// Removes bale's own WorktreeCreate and WorktreeRemove entries from
-/// `<home>/.claude/settings.json`, as install recognises them; a command the
+/// Claude Code's user settings.json, as install recognises them; a command the
 /// user wrapped around bale stays. Groups, events and `hooks` emptied by the
 /// removal go too, and the file when bale created it and nothing is left,
 /// as `json_uninstall_steps` decides.
 pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
-    let path = home.join(".claude").join("settings.json");
+    let (base, tail) = settings_location(home);
+    let path = base.join(&tail);
     let Some((before, mode)) = read_config(&path)? else {
         return Ok(Plan::new(vec![Step::Note(format!(
             "{}: no Claude Code hooks to remove",
@@ -592,7 +606,7 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
         return Ok(Plan::new(steps));
     }
     emptied_events.push(vec!["hooks"]);
-    let key = backup_key(home, &Path::new(".claude").join("settings.json"));
+    let key = backup_key(&base, &tail);
     steps.extend(json_uninstall_steps(
         backups,
         &key,

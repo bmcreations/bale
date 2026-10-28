@@ -42,7 +42,7 @@ pub fn describe(record: &Record, home_dir: &Path) -> Option<String> {
 
 /// Claude Code's config dir: `CLAUDE_CONFIG_DIR` when set, else
 /// `<home_dir>/.claude`.
-fn claude_home(home_dir: &Path) -> PathBuf {
+pub(crate) fn claude_home(home_dir: &Path) -> PathBuf {
     match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => home_dir.join(".claude"),

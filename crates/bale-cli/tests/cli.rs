@@ -2359,6 +2359,37 @@ fn hooks_list_is_deduplicated() {
     );
 }
 
+/// With CLAUDE_CONFIG_DIR set, install and uninstall use the settings.json
+/// there, as Claude Code does, and leave `~/.claude` alone.
+#[test]
+fn claude_hooks_follow_claude_config_dir() {
+    let env = Env::new();
+    // Not created yet: install makes it, uninstall finds the same backup.
+    let config = env.tmp.path().join("claude config");
+    let path = config.join("settings.json");
+    let vars = [("CLAUDE_CONFIG_DIR", config.as_path())];
+    let run = |cmd: &str| {
+        let out = env.bale_env(&env.repo, &[cmd, "--hooks", "claude"], &vars);
+        assert!(out.status.success(), "{cmd}: {}", stderr(&out));
+        out
+    };
+    run("install");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains(" hook claude remove"), "{text}");
+    assert!(!settings_path(&env).exists());
+    let out = run("uninstall");
+    assert!(!path.exists(), "{}", stdout(&out));
+
+    // A file the user made comes back byte for byte.
+    let original = "{\"theme\": \"dark\"}\n";
+    fs::write(&path, original).unwrap();
+    run("install");
+    assert_ne!(fs::read_to_string(&path).unwrap(), original);
+    run("uninstall");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert!(!settings_path(&env).exists());
+}
+
 /// `bale uninstall --hooks <tool> [--repo <repo>]`.
 fn uninstall(env: &Env, tool: &str, repo: bool) -> Output {
     let mut args = vec!["uninstall", "--hooks", tool];
