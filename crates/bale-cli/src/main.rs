@@ -158,6 +158,11 @@ enum HookKind {
         #[command(subcommand)]
         event: ConductorHook,
     },
+    /// Cursor's worktree setup script.
+    Cursor {
+        #[command(subcommand)]
+        event: CursorHook,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +179,12 @@ enum ConductorHook {
     Setup,
     /// archive: colds $CONDUCTOR_WORKSPACE_PATH (or the cwd).
     Archive,
+}
+
+#[derive(Subcommand)]
+enum CursorHook {
+    /// setup: registers the cwd; always exits 0.
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -268,6 +279,9 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             HookKind::Conductor {
                 event: ConductorHook::Archive,
             } => Ok(bale_hooks::conductor::archive(&home)),
+            HookKind::Cursor {
+                event: CursorHook::Setup,
+            } => Ok(bale_hooks::cursor::setup(&home)),
         },
         Command::Install {
             hooks,

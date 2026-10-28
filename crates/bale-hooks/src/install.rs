@@ -248,7 +248,7 @@ fn shell_words_for(args: &[String], windows: bool) -> String {
 }
 
 /// `a` double-quoted the way `CommandLineToArgvW` reads it back.
-fn windows_quote(a: &str) -> String {
+pub(crate) fn windows_quote(a: &str) -> String {
     let mut out = String::from('"');
     let mut slashes = 0;
     for c in a.chars() {

@@ -1957,3 +1957,121 @@ fn remove_hook_ops_carry_the_remove_intent() {
     let missing = colds.iter().find(|v| v["outcome"] == "missing").unwrap();
     assert_eq!(missing["path"], wt.to_string_lossy().as_ref());
 }
+
+fn cursor_worktrees(env: &Env) -> PathBuf {
+    env.repo.join(".cursor").join("worktrees.json")
+}
+
+#[test]
+fn cursor_setup_adopts_cwd() {
+    let env = Env::new();
+    let wt = env.add_worktree("cursor-ws");
+    let out = env.bale(&wt, &["hook", "cursor", "setup"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.is_registered(&wt));
+    let rec = json_record(&env, &wt);
+    assert_eq!(
+        rec["origin"],
+        serde_json::json!({"tool": "cursor", "session": ""})
+    );
+}
+
+#[test]
+fn cursor_setup_outside_worktree_exits_0() {
+    let env = Env::new();
+    let outside = env.tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let out = env.bale(&outside, &["hook", "cursor", "setup"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("bale"), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+}
+
+#[test]
+fn install_cursor_creates_file() {
+    let env = Env::new();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "cursor", "--repo", repo],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value =
+        serde_json::from_str(&fs::read_to_string(cursor_worktrees(&env)).unwrap()).unwrap();
+    let cmds = v["setup-worktree"].as_array().unwrap();
+    assert_eq!(cmds.len(), 1, "{v}");
+    assert!(
+        cmds[0].as_str().unwrap().ends_with(" hook cursor setup"),
+        "{v}"
+    );
+}
+
+#[test]
+fn install_cursor_appends_to_existing_array() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r#"{"zeta":1,"setup-worktree":["npm install"],"alpha":2}"#,
+    )
+    .unwrap();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "cursor", "--repo", repo],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = fs::read_to_string(&path).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let cmds = v["setup-worktree"].as_array().unwrap();
+    assert_eq!(cmds.len(), 2, "{text}");
+    assert_eq!(cmds[0], "npm install");
+    assert!(
+        cmds[1].as_str().unwrap().ends_with(" hook cursor setup"),
+        "{text}"
+    );
+    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["zeta", "setup-worktree", "alpha"]);
+    assert!(path.with_file_name("worktrees.json.bak-bale").exists());
+}
+
+#[test]
+fn install_cursor_refuses_script_path_value() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = r#"{"setup-worktree":".cursor/setup.sh"}"#;
+    fs::write(&path, original).unwrap();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "cursor", "--repo", repo],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("setup-worktree"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn install_cursor_twice_is_noop() {
+    let env = Env::new();
+    let path = cursor_worktrees(&env);
+    let repo = env.repo.to_str().unwrap();
+    let args = ["install", "--hooks", "cursor", "--repo", repo];
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let first = fs::read_to_string(&path).unwrap();
+
+    let out = env.bale(&env.repo, &args, None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), first);
+}
