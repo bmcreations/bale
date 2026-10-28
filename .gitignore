@@ -1,1 +1,24 @@
+# Rust build output
 /target
+**/*.rs.bk
+*.pdb
+
+# Plan execution scratch and session notes
+.superpowers/
+.claude/state/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Local environment
+.env
+.env.*
