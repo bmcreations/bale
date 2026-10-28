@@ -1,6 +1,6 @@
 mod install;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -515,6 +515,7 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
         "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  PATH",
         "ID", "LEVEL", "ACTIVE", "BRANCH", "SESSION"
     );
+    let home_dir = install::home_dir().ok();
     for r in records {
         let level = format!("{}{}", if r.pinned { "*" } else { "" }, r.level.name());
         println!(
@@ -523,7 +524,7 @@ fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
             level,
             ago(r.last_activity),
             r.branch.as_deref().unwrap_or("(detached)"),
-            truncate(&session_label(&r), SESSION_WIDTH),
+            truncate(&session_label(&r, home_dir.as_deref()), SESSION_WIDTH),
             r.path.display()
         );
     }
@@ -535,12 +536,18 @@ const SESSION_WIDTH: usize = 50;
 
 /// What `bale ls` names a tree's session: its title when known, else the
 /// newest commit subject, else `-`.
-fn session_label(r: &Record) -> String {
-    r.origin
-        .as_ref()
-        .and_then(|o| o.title.clone())
+fn session_label(r: &Record, home_dir: Option<&Path>) -> String {
+    title(r, home_dir)
         .or_else(|| scope_of(r).and_then(|(s, _)| s.subjects.into_iter().next()))
         .unwrap_or_else(|| "-".into())
+}
+
+/// The tree's session title, from its origin or its tool.
+fn title(r: &Record, home_dir: Option<&Path>) -> Option<String> {
+    match home_dir {
+        Some(home) => bale_hooks::describe(r, home),
+        None => r.origin.as_ref().and_then(|o| o.title.clone()),
+    }
 }
 
 /// `text` cut to at most `max` chars, ending in `…` when cut.
@@ -583,10 +590,8 @@ fn lookup(home: &BaleHome, target: &str) -> Result<Record> {
 
 fn cmd_show(home: &BaleHome, target: &str) -> Result<()> {
     let r = lookup(home, target)?;
-    print!(
-        "{}",
-        show_text(&r, r.origin.as_ref().and_then(|o| o.title.clone()))
-    );
+    let home_dir = install::home_dir().ok();
+    print!("{}", show_text(&r, title(&r, home_dir.as_deref())));
     Ok(())
 }
 

@@ -25,8 +25,10 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
+use bale_core::ops::meta::set_origin;
 use bale_core::ops::new::{new_workspace, workspace_path};
 use bale_core::ops::up::register;
+use bale_core::registry::Origin;
 use bale_core::BaleHome;
 use serde_json::{json, Map, Value};
 
@@ -85,6 +87,7 @@ pub fn create(home: &BaleHome) -> Result<ExitCode> {
             path
         }
     };
+    record_session(home, &payload, &path);
     println!("{}", display_path(&path));
     Ok(ExitCode::SUCCESS)
 }
@@ -158,6 +161,118 @@ fn git_fallback(cwd: &Path, name: &str, branch: &str) -> Result<PathBuf> {
         g.run(&["worktree", "add", "-b", branch, "--", &p])?;
     }
     Ok(bale_core::paths::canonicalize(&path).unwrap_or(path))
+}
+
+/// Records the Claude Code session that asked for the worktree at `path`.
+/// Failure is a warning on stderr; the hook still succeeds.
+fn record_session(home: &BaleHome, payload: &Value, path: &Path) {
+    let Ok(session) = field(payload, "session_id") else {
+        eprintln!("bale: hook payload has no session_id; session not recorded");
+        return;
+    };
+    let origin = Origin {
+        tool: Tool::Claude.name().to_string(),
+        session: session.to_string(),
+        title: None,
+    };
+    if let Err(e) = set_origin(home, &path.to_string_lossy(), origin) {
+        eprintln!("bale: session not recorded: {e:#}");
+    }
+}
+
+/// Claude Code's project dir name for a session started in `tree`: its
+/// absolute path with every char outside `[A-Za-z0-9]` replaced by `-`.
+pub fn encode_project_path(tree: &Path) -> String {
+    tree.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Bytes read per step from the end of a transcript.
+const CHUNK: usize = 256 * 1024;
+
+/// `(session id, title)` of the Claude Code session that ran in `tree`:
+/// `session`'s transcript under `<claude_home>/projects/<encoded tree>/`
+/// when present, else the newest transcript there. The title is the last
+/// `custom-title` line's `customTitle`. `None` when there is no transcript
+/// or it has no title.
+pub fn session_title(
+    claude_home: &Path,
+    tree: &Path,
+    session: Option<&str>,
+) -> Option<(String, String)> {
+    let dir = claude_home.join("projects").join(encode_project_path(tree));
+    let named = session
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(|s| dir.join(format!("{s}.jsonl")))
+        .filter(|p| p.is_file());
+    let path = named.or_else(|| newest_transcript(&dir))?;
+    let id = path.file_stem()?.to_string_lossy().into_owned();
+    Some((id, last_title(&path)?))
+}
+
+/// The `*.jsonl` file in `dir` with the latest mtime.
+fn newest_transcript(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl") && p.is_file())
+        .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, p)| p)
+}
+
+/// The `customTitle` of the last `custom-title` line in the transcript at
+/// `path`, read backwards in [`CHUNK`]-sized steps so a long transcript
+/// costs only its tail when the title was set late.
+fn last_title(path: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let mut end = file.metadata().ok()?.len();
+    // Bytes after the last newline seen so far: the start of a line whose
+    // beginning lies in an earlier chunk.
+    let mut carry: Vec<u8> = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK as u64);
+        let mut buf = vec![0; (end - start) as usize];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        buf.extend_from_slice(&carry);
+        let mut lines: Vec<&[u8]> = buf.split(|&b| b == b'\n').collect();
+        // The first piece may continue in the previous chunk, unless this
+        // chunk starts the file.
+        let first = if start > 0 { lines.remove(0) } else { &[][..] };
+        for line in lines.iter().rev() {
+            if let Some(title) = title_in(line) {
+                return Some(title);
+            }
+        }
+        carry = first.to_vec();
+        end = start;
+    }
+    None
+}
+
+/// The title a transcript line sets, if it is a `custom-title` line.
+fn title_in(line: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"custom-title";
+    if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(line).ok()?;
+    if v["type"] != "custom-title" {
+        return None;
+    }
+    v["customTitle"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// WorktreeRemove: colds the worktree (saving any uncommitted work), so
@@ -417,5 +532,134 @@ mod tests {
             hook_command(Path::new("/opt/bale"), "remove"),
             "'/opt/bale' hook claude remove"
         );
+    }
+
+    /// The real path and project dir name the brief verified.
+    #[test]
+    fn encode_project_path_matches_claude_code() {
+        assert_eq!(
+            encode_project_path(Path::new(
+                "/Users/bmc/dev/bmcreations/code/code-ios-app/.claude/worktrees/sweet-greider-a23df3"
+            )),
+            "-Users-bmc-dev-bmcreations-code-code-ios-app--claude-worktrees-sweet-greider-a23df3"
+        );
+        assert_eq!(encode_project_path(Path::new("/a b/é_x")), "-a-b---x");
+    }
+
+    fn title_line(title: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"type": "custom-title", "customTitle": title, "sessionId": "s"})
+        )
+    }
+
+    /// `<claude_home>/projects/<encoded tree>`, created, with the tree.
+    fn project(claude_home: &Path) -> (PathBuf, PathBuf) {
+        let tree = PathBuf::from("/work/repo/.claude/worktrees/sweet-greider-a23df3");
+        let dir = claude_home
+            .join("projects")
+            .join(encode_project_path(&tree));
+        fs::create_dir_all(&dir).unwrap();
+        (tree, dir)
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn title_is_the_last_custom_title_line() {
+        let home = tempfile::tempdir().unwrap();
+        let (tree, dir) = project(home.path());
+        let text = [
+            r#"{"type":"user","message":"hi"}"#.to_string() + "\n",
+            title_line("First name"),
+            r#"{"type":"assistant","message":"mentions custom-title"}"#.to_string() + "\n",
+            title_line("Polls iOS remaining work"),
+            // Unparseable and wrong-type lines after it are ignored.
+            "{\"type\":\"custom-title\",\"customTitle\": broken\n".to_string(),
+            r#"{"type":"user","message":"\"type\":\"custom-title\""}"#.to_string() + "\n",
+        ]
+        .concat();
+        fs::write(dir.join("c00bee35.jsonl"), text).unwrap();
+        assert_eq!(
+            session_title(home.path(), &tree, Some("c00bee35")),
+            Some(("c00bee35".into(), "Polls iOS remaining work".into()))
+        );
+    }
+
+    #[test]
+    fn named_session_wins_and_newest_transcript_is_the_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let (tree, dir) = project(home.path());
+        for (sid, title, mtime) in [("old", "Old work", 1_000), ("new", "New work", 2_000)] {
+            let path = dir.join(format!("{sid}.jsonl"));
+            fs::write(&path, title_line(title)).unwrap();
+            set_mtime(&path, mtime);
+        }
+        assert_eq!(
+            session_title(home.path(), &tree, None),
+            Some(("new".into(), "New work".into()))
+        );
+        assert_eq!(
+            session_title(home.path(), &tree, Some("old")),
+            Some(("old".into(), "Old work".into()))
+        );
+        // A session with no transcript here falls back to the newest.
+        assert_eq!(
+            session_title(home.path(), &tree, Some("gone")),
+            Some(("new".into(), "New work".into()))
+        );
+    }
+
+    #[test]
+    fn title_early_in_a_large_transcript_is_found() {
+        let home = tempfile::tempdir().unwrap();
+        let (tree, dir) = project(home.path());
+        let filler = format!("{}\n", json!({"type": "user", "message": "x".repeat(1000)}));
+        let text = [title_line("Early title"), filler.repeat(1200)].concat();
+        assert!(text.len() > 3 * CHUNK);
+        fs::write(dir.join("s.jsonl"), text).unwrap();
+        assert_eq!(
+            session_title(home.path(), &tree, Some("s")).map(|t| t.1),
+            Some("Early title".into())
+        );
+    }
+
+    /// A title line split across two 256 KiB chunks is still read whole.
+    #[test]
+    fn title_straddling_a_chunk_boundary_is_found() {
+        let home = tempfile::tempdir().unwrap();
+        let (tree, dir) = project(home.path());
+        let title = title_line("Straddling title");
+        let tail = r#"{"type":"user"}"#.to_string() + "\n";
+        // The boundary falls 10 bytes into the title line.
+        let tail_len = CHUNK - (title.len() - 10);
+        let tail = tail.repeat(tail_len / tail.len() + 1)[..tail_len - 1].to_string() + "\n";
+        let head = format!("{}\n", json!({"type": "user", "message": "y".repeat(5000)}));
+        let text = [head, title.clone(), tail].concat();
+        let start = text.find(&title).unwrap();
+        assert!(start < text.len() - CHUNK && text.len() - CHUNK < start + title.len());
+        fs::write(dir.join("s.jsonl"), text).unwrap();
+        assert_eq!(
+            session_title(home.path(), &tree, None).map(|t| t.1),
+            Some("Straddling title".into())
+        );
+    }
+
+    #[test]
+    fn no_project_dir_or_no_title_is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let tree = Path::new("/work/repo/wt");
+        assert_eq!(session_title(home.path(), tree, None), None);
+        let (tree, dir) = project(home.path());
+        fs::write(dir.join("s.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(session_title(home.path(), &tree, Some("s")), None);
     }
 }

@@ -59,7 +59,8 @@ impl Env {
             .env_remove("GIT_COMMON_DIR")
             .env_remove("CONDUCTOR_WORKSPACE_PATH")
             .env_remove("CONDUCTOR_ROOT_PATH")
-            .env_remove("CONDUCTOR_WORKSPACE_NAME");
+            .env_remove("CONDUCTOR_WORKSPACE_NAME")
+            .env_remove("CLAUDE_CONFIG_DIR");
     }
 
     /// `bale` with extra environment variables, set after isolation.
@@ -1701,4 +1702,76 @@ fn show_refuses_an_unregistered_tree_without_registering_it() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("not registered"), "{}", stderr(&out));
     assert!(!env.is_registered(&wt));
+}
+
+/// The id `bale ls --json` gives the tree at `wt`.
+fn json_record(env: &Env, wt: &Path) -> Value {
+    let out = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .find(|r| canon(Path::new(r["path"].as_str().unwrap())) == canon(wt))
+        .unwrap_or_else(|| panic!("{wt:?} not in {v}"))
+        .clone()
+}
+
+/// Writes a Claude Code transcript for `tree` under `claude_home`.
+fn transcript(claude_home: &Path, tree: &Path, session: &str, title: &str) {
+    let dir = claude_home
+        .join("projects")
+        .join(bale_hooks::claude::encode_project_path(&canon(tree)));
+    fs::create_dir_all(&dir).unwrap();
+    let line =
+        serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": session});
+    fs::write(
+        dir.join(format!("{session}.jsonl")),
+        format!("{{\"type\":\"user\"}}\n{line}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn create_hook_records_the_claude_session() {
+    let env = Env::new();
+    let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
+    let out = env.bale(&env.repo, &["hook", "claude", "create"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = single_path(&out);
+    let rec = json_record(&env, &path);
+    assert_eq!(
+        rec["origin"],
+        serde_json::json!({"tool": "claude", "session": "abc123"})
+    );
+
+    // The title comes from the session's transcript once Claude Code names it.
+    transcript(
+        &env.home().join(".claude"),
+        &path,
+        "abc123",
+        "Polls iOS remaining work",
+    );
+    let row = ls_row(&env, &path);
+    assert!(row.contains("Polls iOS remaining work"), "{row}");
+    let out = env.bale(&env.repo, &["show", path.to_str().unwrap()], None);
+    let text = stdout(&out);
+    assert!(text.contains("origin:   claude session abc123"), "{text}");
+    assert!(
+        text.contains("title:    Polls iOS remaining work"),
+        "{text}"
+    );
+}
+
+#[test]
+fn ls_finds_a_title_for_a_tree_without_origin_and_honors_claude_config_dir() {
+    let env = Env::new();
+    let wt = unpushed_worktree(&env);
+    env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    let config = env.tmp.path().join("claude config");
+    transcript(&config, &wt, "s1", "Named elsewhere");
+    // Not under $HOME/.claude, so only CLAUDE_CONFIG_DIR finds it.
+    let row = ls_row(&env, &wt);
+    assert!(row.contains("add the session column"), "{row}");
+    let out = env.bale_env(&env.repo, &["ls"], &[("CLAUDE_CONFIG_DIR", &config)]);
+    assert!(stdout(&out).contains("Named elsewhere"), "{}", stdout(&out));
 }

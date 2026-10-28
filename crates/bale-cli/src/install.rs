@@ -56,7 +56,7 @@ fn is_unstable_location(exe: &Path) -> bool {
 
 /// The home dir, from `HOME` or `USERPROFILE` (the latter first on Windows),
 /// so tests can redirect it.
-fn home_dir() -> Result<PathBuf> {
+pub(crate) fn home_dir() -> Result<PathBuf> {
     let order = if cfg!(windows) {
         ["USERPROFILE", "HOME"]
     } else {

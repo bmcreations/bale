@@ -2,7 +2,7 @@
 //! input, finds its caller pids and calls core.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
@@ -10,6 +10,7 @@ use anyhow::{bail, Result};
 use bale_core::busy::Holder;
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::up::{resolve, Outcome};
+use bale_core::registry::Record;
 use bale_core::BaleHome;
 
 pub mod claude;
@@ -19,6 +20,31 @@ pub mod install;
 pub mod proc;
 
 use install::Plan;
+
+/// The session title an adapter knows for the tree, if any: the one stored
+/// in its origin, else the one its tool shows. A record with no origin may
+/// still be a Claude Code session started in the tree, so Claude Code's
+/// transcripts for its path are checked. `home_dir` is the user's home.
+pub fn describe(record: &Record, home_dir: &Path) -> Option<String> {
+    let claude = || claude_home(home_dir);
+    match &record.origin {
+        Some(o) if o.title.is_some() => o.title.clone(),
+        Some(o) if o.tool == Tool::Claude.name() => {
+            claude::session_title(&claude(), &record.path, Some(&o.session)).map(|(_, t)| t)
+        }
+        Some(_) => None,
+        None => claude::session_title(&claude(), &record.path, None).map(|(_, t)| t),
+    }
+}
+
+/// Claude Code's config dir: `CLAUDE_CONFIG_DIR` when set, else
+/// `<home_dir>/.claude`.
+fn claude_home(home_dir: &Path) -> PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home_dir.join(".claude"),
+    }
+}
 
 /// A tool bale hooks into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
