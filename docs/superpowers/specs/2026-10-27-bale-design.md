@@ -78,9 +78,22 @@ Two things follow. A build tree is only cheap to keep while it stays at the path
 clone at a new path still costs about 2 GB instead of 4.6 GB, because source and native outputs stay shared.
 
 The spike used `:apps:flipcash:app:assembleDebug --offline --no-daemon` on `code-android-app-polls`.
-iOS was not measured. Absolute paths are present throughout its build output (`info.plist`, SwiftPM
-`workspace-state.json`, module caches, compile file lists), and the shared DerivedData folder name is a hash
-of the project path, so expect iOS to diverge at least as much.
+The iOS spike was measured on 2026-10-27. It cloned `code-ios-app-hotswap` (about 12 GB: 6.2 GB DerivedData
+in `.build/dd` and 5.8 GB of packages in `.build/ds`) and ran its own command,
+`xcodebuild build -scheme Flipcash -configuration Debug -destination generic/platform=iOS -derivedDataPath .build/dd`.
+
+| Build | Time | Rewritten | Free space change |
+|---|---|---|---|
+| Clone of a warm tree at a new path, module cache kept | 70 s | 256 MB | build failed |
+| Same, with `ModuleCache.noindex` deleted after cloning | 149 s | 3.6 GB (all 3,109 Swift files recompiled) | −3.6 GB |
+| Same tree again, no changes, fixed path | 27 s | 135 MB, no compile steps | −23 MB |
+
+- Clang's module cache records its absolute path, and a moved cache makes the build fail with
+  `missing required module 'SwiftShims'`. Any clone to a new path must delete `ModuleCache.noindex` first.
+- With the cache deleted, the new path recompiles everything. That gives no speed gain, but the packages and
+  the rest of the build stay shared. A hot iOS workspace costs about 3.6 GB, compared with about 12 GB as a
+  separate worktree.
+- At a fixed path, iOS stays warm, as Android does.
 
 ### Two tiers
 
@@ -282,13 +295,14 @@ and builds it. `bale new <name>` clones it into the new workspace's path with th
 call, creates the git worktree metadata for it, checks out the branch, and builds.
 
 What is known from the spike: the clone is near-instant, and the first build at the new path takes about 36 s
-and diverges by about 2 GB on Android. What is not known: the iOS numbers, and how much the base drifts as
-the default branch moves. Checking out a feature branch in the clone rewrites only the files that differ from
+and diverges by about 2 GB on Android. On iOS it diverges by about 3.6 GB, and the clone must have
+`ModuleCache.noindex` deleted or the build fails. What is not known: how much the base drifts as the default
+branch moves. Checking out a feature branch in the clone rewrites only the files that differ from
 the default branch, so the extra divergence depends on the size of the feature. That was not measured.
 
 Tier 2 is enabled per build system, and only where a measured spike shows at least a 40% saving per hot
-workspace compared to a separate worktree. Android met that bar at about 55%. If iOS does not meet it, iOS
-workspaces use tier 1 only. *(My call on the threshold.)*
+workspace compared to a separate worktree. Android met that bar at about 55%. iOS met it at about 70%, but
+only for disk: the first build at a new path is a full recompile. *(My call on the threshold.)*
 
 Refreshing the base has a cost. A clone keeps the old base's blocks allocated until the clone itself is
 deleted or baled, so for a while two generations of the base are on disk. The design rebuilds the base on a
@@ -376,7 +390,6 @@ How the module works:
 
 ## Open questions
 
-- **iOS hot cost under tier 2.** Not measured. Run the same spike on `code-ios-app` before building tier 2.
 - **T3's worktree creation** does not go through Claude Code hooks. Whether T3 exposes its own hook is
   unknown. Until it does, T3 worktrees are picked up by the sweep.
 - **Same-path restore was inferred, not run.** The spike showed no-change builds at the original path are
@@ -386,9 +399,10 @@ How the module works:
 
 - **Hot workspaces still cost disk.** With tier 1 alone, every hot Android workspace costs a full build,
   1.5 to 7.9 GB on this machine. Twelve hot workspaces could exceed the 78 GB currently free even with every
-  idle one baled. Tier 2 brings an Android workspace to about 2 GB, so 12 hot ones are about 24 GB. If iOS
-  does not qualify for tier 2, a mixed day of hot iOS workspaces at 4 to 12 GB each could still fail the
-  acceptance run. Linux on ext4 and Windows on NTFS have no tier 2 at all.
+  idle one baled. Tier 2 brings an Android workspace to about 2 GB and an iOS workspace to about 3.6 GB.
+  Twelve hot workspaces are then 24 to 43 GB, which fits the 20 GB floor on this machine but with little
+  margin on an iOS-heavy day. Each new iOS workspace also pays a full compile, about 2.5 minutes here.
+  Linux on ext4 and Windows on NTFS have no tier 2 at all.
 - **Delete races.** A Gradle daemon or IDE can recreate `build/` while it is being deleted. The idle check
   reduces this. It does not remove it.
 - **Build-cache expiry.** Resumes after more than about 7 days are colder than "warm".
