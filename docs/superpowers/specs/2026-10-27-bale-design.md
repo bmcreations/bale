@@ -204,7 +204,9 @@ against what was captured before it is used.
    This makes a crash leave either a full directory or a trash name that the next run finishes deleting.
    A directory with a regenerable name that holds files git tracks, or untracked files that are not
    ignored, is kept and reported: it is source, not build output. A regenerable-named entry that is itself
-   untracked and not ignored, including a symlink, is kept the same way.
+   untracked and not ignored, including a symlink, is kept the same way. So is a regenerable-named directory
+   inside a submodule or a nested repository (any directory between the workspace root and it has a `.git`
+   entry): the workspace's git can't see what it holds.
 6. Remove the workspace's external build output too. That includes Xcode DerivedData folders under
    `~/Library/Developer/Xcode/DerivedData` whose `info.plist` `WorkspacePath` points into this workspace.
    A folder with a missing or unreadable `WorkspacePath` is left alone. So is global DerivedData that matches
@@ -237,8 +239,10 @@ Everything in `bale up`, then:
    `refs/bale/<id>/head` pointing to the commit it sits on. Do not put them on the user's branch. Several of
    these worktrees use a detached HEAD, and commits that nothing references are eventually garbage collected.
 3. Save ignored files that are not regenerable to `~/.bale/<id>/files/`. Selection uses a denylist: every
-   ignored file except the regenerable directories, `node_modules`, and similar entries from a configurable
-   list. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
+   ignored file except those inside the regenerable directories `up` actually removes, `node_modules`, and
+   similar entries from a configurable list. An ignored file inside a regenerable-named directory that `up`
+   keeps is saved. Inside a submodule, ignored files under a regenerable name count as regenerable and are not
+   saved. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
    shared store.
 4. Verify the saved state by hashing it against the tree.
 5. Rename the checkout directory to a trash name and verify the moved tree again. A process that opened the
