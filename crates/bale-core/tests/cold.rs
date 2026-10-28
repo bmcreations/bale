@@ -2,7 +2,7 @@ mod support;
 
 use bale_core::git::worktrees;
 use bale_core::ops::cold::{cold, cold_if_clean, exclusions, save_ignored, save_wip};
-use bale_core::ops::up::{register, Outcome};
+use bale_core::ops::up::{register, resolve, Outcome};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1286,4 +1286,32 @@ fn cold_refuses_a_folder_outside_any_repo() {
     let fx = Fixture::new();
     let wt = fx.add_worktree("wt", "feature");
     assert_cold_refuses_stray(&fx, &wt);
+}
+
+/// Re-registering a stray folder at a registered path must not repoint the
+/// record at the enclosing repo, or every checkout check would pass.
+#[test]
+fn resolve_keeps_admin_dir_when_the_folder_is_not_the_checkout() {
+    let fx = Fixture::new();
+    let wt = fx.repo.join(".claude/worktrees/w");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-b", "w", wt.to_str().unwrap()],
+    );
+    let before = register(&fx.home(), &wt).unwrap();
+    replace_with_stray(&wt);
+
+    let err = resolve(&fx.home(), wt.to_str().unwrap()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&wt.display().to_string()),
+        "{err:#}"
+    );
+    assert!(register(&fx.home(), &wt).is_err());
+    let after = Registry::open(fx.home()).get(&before.id).unwrap().unwrap();
+    assert_eq!(after.admin_dir, before.admin_dir);
+
+    let out = cold(&fx.home(), &before.id).unwrap();
+    assert!(matches!(&out, Outcome::Skipped(_)), "{out:?}");
+    assert!(!wip_resolves(&fx, &before.id));
+    assert_eq!(level(&fx, &before.id), Level::Hot);
 }
