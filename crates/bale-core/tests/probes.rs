@@ -41,6 +41,13 @@ fn sleep_in(dir: &Path) -> Child {
 
 #[cfg(unix)]
 #[test]
+fn busy_holders_missing_root_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(busy_holders(&tmp.path().join("missing")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn open_file_is_a_holder() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("wt");

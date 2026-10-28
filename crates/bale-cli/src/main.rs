@@ -179,7 +179,9 @@ fn cmd_migrate(home: &BaleHome, repos: &[PathBuf], do_apply: bool) -> Result<Exi
     for (path, err) in &report.errors {
         eprintln!("bale: {}: {err}", path.display());
     }
-    Ok(if report.errors.is_empty() {
+    // A tree that could not be probed was not baled; don't report a clean run.
+    let probe_errors = rows.iter().any(|r| r.action.starts_with("report (error: "));
+    Ok(if report.errors.is_empty() && !probe_errors {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
