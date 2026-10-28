@@ -63,16 +63,22 @@ pub fn claude_worktree_create(home: &BaleHome) -> Result<ExitCode> {
     let name = field(&payload, "name")?;
     let cwd = PathBuf::from(field(&payload, "cwd")?);
     let branch = format!("worktree-{name}");
+    // Paths that exist now belong to someone else; only one that appears
+    // during this call can be the worktree bale itself made.
+    let fresh: Vec<PathBuf> = [
+        workspace_path(home, &cwd, name).ok(),
+        fallback_path(&cwd, name).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| fs::symlink_metadata(p).is_err())
+    .collect();
     let path = match new_workspace(home, &cwd, name, Some(&branch)) {
         Ok(record) => record.path,
         Err(e) => {
             eprintln!("bale: {e:#}");
-            let candidates = [
-                workspace_path(home, &cwd, name).ok(),
-                fallback_path(&cwd, name).ok(),
-            ];
-            let path = match existing_worktree(&cwd, candidates.iter().flatten()) {
-                // bale (or an earlier fallback) already made it; never add a second one.
+            let path = match existing_worktree(&cwd, fresh.iter()) {
+                // bale made it before failing; never add a second one.
                 Some(path) => path,
                 None => {
                     eprintln!("bale: falling back to git worktree add");
@@ -90,6 +96,7 @@ pub fn claude_worktree_create(home: &BaleHome) -> Result<ExitCode> {
 }
 
 /// The first of `candidates` that is a linked worktree of `cwd`'s repo.
+/// Callers pass only paths that did not exist before this hook ran.
 fn existing_worktree<'a>(
     cwd: &Path,
     candidates: impl Iterator<Item = &'a PathBuf>,
@@ -105,9 +112,13 @@ fn existing_worktree<'a>(
         .find(|c| listed.contains(c))
 }
 
-/// `<main checkout>/.claude/worktrees/<name>`, the main checkout being the
-/// parent of the common git dir, so a cwd in a linked worktree still roots
-/// at the main checkout as Claude Code does.
+/// `<main checkout>/.claude/worktrees/<name>`. From the main checkout that is
+/// its `--show-toplevel`, which is right for a submodule or a
+/// `--separate-git-dir` repo too. From a linked worktree it is the first
+/// `git worktree list` entry, so the fallback still roots at the main
+/// checkout as Claude Code does. (For a submodule or `--separate-git-dir`
+/// repo git lists the git dir there, and keeps no other record of the main
+/// working tree.)
 fn fallback_path(cwd: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty()
         || name.starts_with('-')
@@ -117,11 +128,17 @@ fn fallback_path(cwd: &Path, name: &str) -> Result<PathBuf> {
     {
         bail!("worktree name {name:?} must be a single directory name");
     }
-    let common = git::common_dir(cwd)?;
-    let main = common
-        .parent()
-        .with_context(|| format!("{} has no parent", common.display()))?;
-    let main = fs::canonicalize(main).context("resolving the main checkout")?;
+    let main = if git::admin_dir(cwd)? == git::common_dir(cwd)? {
+        let top = Git::at(cwd).run(&["rev-parse", "--show-toplevel"])?;
+        PathBuf::from(top.trim_end_matches(['\n', '\r']))
+    } else {
+        git::worktrees(cwd)?
+            .into_iter()
+            .find(|w| w.is_main)
+            .with_context(|| format!("{} lists no worktrees", cwd.display()))?
+            .path
+    };
+    let main = fs::canonicalize(&main).context("resolving the main checkout")?;
     Ok(main.join(".claude").join("worktrees").join(name))
 }
 
@@ -150,10 +167,13 @@ fn git_fallback(cwd: &Path, name: &str, branch: &str) -> Result<PathBuf> {
 }
 
 /// The pids whose hold on the tree comes from running this hook: this
-/// process, its parent shell, and the nearest ancestor that is Claude Code,
-/// or the grandparent when no ancestor looks like Claude Code. Nothing above
-/// that (such as the user's shell that started Claude Code) is included.
-/// `info` gives a pid's parent pid and process name or exe.
+/// process and its parent. When the parent is a shell (Claude Code runs
+/// `sh -c`, which only stays around for a compound command), also the
+/// nearest ancestor that is Claude Code, or else the grandparent. When the
+/// parent is not a shell, `sh -c` exec'd bale and the parent is Claude Code
+/// itself (named `node` for an npm install), so the walk stops there.
+/// Nothing above that (such as the user's shell that started Claude Code)
+/// is included. `info` gives a pid's parent pid and process name or exe.
 pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)>) -> Vec<u32> {
     const SEARCH_DEPTH: usize = 8;
     let mut pids = vec![own];
@@ -167,7 +187,7 @@ pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)
     let Some((grandparent, parent_name)) = info(parent) else {
         return pids;
     };
-    if is_claude(&parent_name) || grandparent <= 1 {
+    if !is_shell(&parent_name) || grandparent <= 1 {
         return pids;
     }
     let mut cur = grandparent;
@@ -184,6 +204,19 @@ pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)
     }
     pids.push(grandparent);
     pids
+}
+
+/// `sh`, `bash`, `dash`, `zsh` or `fish`, by basename; a login shell's
+/// leading `-` is ignored.
+fn is_shell(name: &str) -> bool {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(name);
+    matches!(
+        base.trim_start_matches('-'),
+        "sh" | "bash" | "dash" | "zsh" | "fish"
+    )
 }
 
 fn is_claude(name: &str) -> bool {
@@ -318,6 +351,26 @@ mod tests {
             (10, 1, "zsh"),
             (20, 10, "node"),
             (30, 20, "sh"),
+            (40, 30, "bale"),
+        ]);
+        assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);
+    }
+
+    #[test]
+    fn non_shell_parent_ends_the_chain() {
+        // zsh(10) -> node(20) -> bale(40): `sh -c` exec'd bale, so the
+        // grandparent is the user's shell and stays a holder.
+        let info = table(&[(10, 1, "-zsh"), (20, 10, "node"), (40, 20, "bale")]);
+        assert_eq!(invoking_pids(40, info), vec![40, 20]);
+    }
+
+    #[test]
+    fn login_shell_parent_takes_the_grandparent() {
+        // node(20) -> -bash(30) -> bale(40)
+        let info = table(&[
+            (10, 1, "zsh"),
+            (20, 10, "node"),
+            (30, 20, "-bash"),
             (40, 30, "bale"),
         ]);
         assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);

@@ -519,6 +519,7 @@ fn print_only_shows_schedule_and_changes_nothing() {
         assert!(text.contains("BALE_HOME"), "{text}");
         assert!(text.contains(env.bale_home().to_str().unwrap()), "{text}");
         assert!(text.contains("PATH"), "{text}");
+        assert!(text.contains("captured"), "{text}");
     }
     if cfg!(target_os = "macos") {
         assert!(text.contains("<key>EnvironmentVariables</key>"), "{text}");
@@ -721,7 +722,15 @@ fn claude_hooks_install_refuses_symlinked_settings() {
     std::os::unix::fs::symlink(&real, &path).unwrap();
     let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("symlink"), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("symlink"), "{err}");
+    // The refusal shows the entries to add by hand.
+    assert!(
+        err.contains("WorktreeCreate") && err.contains("WorktreeRemove"),
+        "{err}"
+    );
+    assert!(err.contains("hook claude-worktree-remove"), "{err}");
+    assert!(err.contains(env!("CARGO_BIN_EXE_bale")), "{err}");
     assert!(fs::symlink_metadata(&path)
         .unwrap()
         .file_type()
@@ -780,4 +789,148 @@ fn git_hook_notes_global_hooks_path() {
     let all = format!("{}{}", stdout(&out), stderr(&out));
     assert!(all.contains("global git config"), "{all}");
     assert!(shared.join("post-checkout").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_hook_blocks_on_holder_above_non_shell_parent() {
+    // holder sh (cwd in wt) -> perl, like Claude Code as `node` -> `sh -c`
+    // with one command, which execs bale. The holder is the user's shell
+    // in this layout and must still block the remove.
+    use std::io::Write;
+    use std::process::Stdio;
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let input = payload("worktree_remove.json", &[("worktree_path", &wt)]);
+    let script = r#"cd "$WT" || exit 9
+perl -e 'system(@ARGV); exit($? >> 8)' sh -c "'$BALE' hook claude-worktree-remove"
+exit $?
+"#;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(script)
+        .env("WT", &wt)
+        .env("BALE", env!("CARGO_BIN_EXE_bale"))
+        .current_dir(&env.repo);
+    env.isolate(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = stderr(&out);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("busy"), "{err}");
+    assert!(wt.join("f").is_file());
+}
+
+#[test]
+fn create_hook_does_not_adopt_a_preexisting_worktree() {
+    let env = Env::new();
+    // The user's own worktree already sits where `bale new` would go.
+    let theirs = env
+        .tmp
+        .path()
+        .join("my repo é-worktrees")
+        .join("feature-auth");
+    env.git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "user-work",
+            theirs.to_str().unwrap(),
+        ],
+    );
+    fs::write(theirs.join("f"), "user edits\n").unwrap();
+    let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
+    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = single_path(&out);
+    assert_eq!(
+        canon(&path),
+        canon(&env.repo)
+            .join(".claude")
+            .join("worktrees")
+            .join("feature-auth")
+    );
+    assert!(!env.is_registered(&theirs));
+    assert_eq!(
+        fs::read_to_string(theirs.join("f")).unwrap(),
+        "user edits\n"
+    );
+    let branch = env.git(&theirs, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(branch.trim(), "user-work");
+    let list = env.git(&env.repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(list.matches("worktree ").count(), 3, "{list}");
+}
+
+#[test]
+fn create_hook_fallback_roots_at_main_checkout_with_separate_git_dir() {
+    let env = Env::new();
+    let main = env.tmp.path().join("sep");
+    let gitdir = env.tmp.path().join("store").join("sep.git");
+    fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+    env.git(
+        env.tmp.path(),
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            gitdir.to_str().unwrap(),
+            main.to_str().unwrap(),
+        ],
+    );
+    env.git(&main, &["config", "user.name", "Bale Test"]);
+    env.git(&main, &["config", "user.email", "bale@example.com"]);
+    env.git(&main, &["config", "commit.gpgsign", "false"]);
+    fs::write(main.join("f"), "one\n").unwrap();
+    env.git(&main, &["add", "f"]);
+    env.git(&main, &["commit", "-q", "-m", "init"]);
+    // Occupy bale's target so the fallback runs: bale-core roots it at the
+    // git dir today (`git worktree list` names it as the main entry), and
+    // at the working tree once that is fixed.
+    for root in ["store/sep.git-worktrees", "sep-worktrees"] {
+        fs::create_dir_all(env.tmp.path().join(root).join("feature-auth")).unwrap();
+    }
+    let input = payload("worktree_create.json", &[("cwd", &main)]);
+    let out = env.bale(&main, &["hook", "claude-worktree-create"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = single_path(&out);
+    assert_eq!(
+        canon(&path),
+        canon(&main)
+            .join(".claude")
+            .join("worktrees")
+            .join("feature-auth")
+    );
+}
+
+#[test]
+fn claude_hooks_install_leaves_wrapped_bale_entries() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let wrapped = r#"{"hooks":{
+      "WorktreeCreate":[{"hooks":[{"type":"command","command":"env BALE_HOME=/x '/old/bale' hook claude-worktree-create"}]}],
+      "WorktreeRemove":[{"hooks":[{"type":"command","command":"nice '/old/bale' hook claude-worktree-remove"}]}]}}"#;
+    fs::write(&path, wrapped).unwrap();
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&path).unwrap(), wrapped);
+    let text = stdout(&out);
+    assert!(text.contains("left unchanged"), "{text}");
+    assert!(text.contains("nice '/old/bale'"), "{text}");
 }
