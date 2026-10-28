@@ -301,8 +301,16 @@ the source it saves is about 1 GB per Android worktree.)*
   workspace was on a branch and that branch still points to the same commit, it checks out the branch
   instead. If the branch has moved, it stays detached at the saved commit and says so.
 - If the branch is checked out in another worktree, `open` stays detached at the saved commit and reports it.
-- `cold` refuses trees with submodules that have their own uncommitted changes, and trees using sparse
-  checkout. LFS pointer files need no special handling, because the checkout restores them.
+- `cold` skips a tree, before saving anything, when any of these hold: a submodule (nested ones too) has
+  uncommitted changes or untracked files, ignored files that are not regenerable, or its own `.git`
+  directory; a submodule directory that is not checked out holds files; the tree uses sparse checkout; or
+  an index entry at the root or in a submodule is flagged assume-unchanged or skip-worktree, since `git
+  status` skips edits to those. LFS pointer files need no special handling, because the checkout restores
+  them.
+- Every git command bale runs passes `-c status.showUntrackedFiles=all -c core.fsmonitor=false -c
+  core.untrackedCache=false -c diff.ignoreSubmodules=none`, so the user's or repo's config cannot make a
+  tree look unchanged when files exist. `-c` does not override `submodule.<name>.ignore` in `.gitmodules`,
+  so each `git status` also passes `--untracked-files=all` and `--ignore-submodules`.
 
 ### Recovering an interrupted `cold`
 
