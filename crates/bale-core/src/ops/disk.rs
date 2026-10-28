@@ -330,6 +330,10 @@ pub(crate) fn checkout_wip(g: &Git, wip: &str) -> Result<()> {
 /// check dir that copied a read-only dir mode can be removed.
 /// The name prefix of workspace `id`'s check dirs; `tempfile` adds six
 /// random alphanumerics.
+/// Random characters after the check dir prefix, set on the builder so the
+/// cleanup's match can't drift from what tempfile generates.
+const CHECK_SUFFIX_LEN: usize = 6;
+
 fn check_prefix(id: &str) -> String {
     format!(".bale-check-{id}-")
 }
@@ -354,7 +358,7 @@ pub(crate) fn remove_stale_checks(tree: &Path, id: &str) -> Result<()> {
         let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
             continue;
         };
-        if rest.len() != 6 || !rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        if rest.len() != CHECK_SUFFIX_LEN || !rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
             continue;
         }
         let path = entry.path();
@@ -603,6 +607,7 @@ pub(crate) fn restore_check(
         .with_context(|| format!("{} has no parent directory", tree.display()))?;
     let tmp = tempfile::Builder::new()
         .prefix(&check_prefix(id))
+        .rand_bytes(CHECK_SUFFIX_LEN)
         .tempdir_in(parent)
         .with_context(|| format!("creating a check dir in {}", parent.display()))?;
     let work = tmp.path().join("tree");
