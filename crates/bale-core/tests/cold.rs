@@ -419,3 +419,188 @@ fn busy_tree_is_not_removed() {
     assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
     assert_ne!(level(&fx, &id), Level::Cold);
 }
+
+/// `git init` + one commit at `dir`.
+fn nested_repo(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    fs::write(dir.join("n"), "history\n").unwrap();
+    git(dir, &["add", "n"]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "n",
+        ],
+    );
+}
+
+#[test]
+fn cold_refuses_repo_nested_below_untracked_dir() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::create_dir_all(wt.join("tools")).unwrap();
+    fs::write(wt.join("tools/readme"), "r\n").unwrap();
+    nested_repo(&wt.join("tools/nested"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("tools/nested")),
+        "{out:?}"
+    );
+    assert!(wt.join("tools/nested/.git").is_dir());
+    assert_eq!(level(&fx, &id), Level::Hot);
+}
+
+#[test]
+fn cold_refuses_repo_inside_ignored_dir() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), ".worktrees/\n").unwrap();
+    nested_repo(&wt.join(".worktrees/x"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains(".worktrees/x")),
+        "{out:?}"
+    );
+    assert!(wt.join(".worktrees/x/.git").is_dir());
+}
+
+#[test]
+fn save_ignored_refuses_nested_repo() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "vendor/\n").unwrap();
+    nested_repo(&wt.join("vendor/lib"));
+    let err = save_ignored(&wt, &fx.home().saved_dir("x"), &[]).unwrap_err();
+    assert!(format!("{err:#}").contains("vendor/lib"), "{err:#}");
+}
+
+/// A worktree with submodule `lib` from a repo whose `.gitignore` has `.env`.
+fn worktree_with_submodule(fx: &Fixture, sub: &Fixture) -> PathBuf {
+    fs::write(sub.repo.join(".gitignore"), ".env\n").unwrap();
+    git(&sub.repo, &["add", ".gitignore"]);
+    git(&sub.repo, &["commit", "-m", "ignore"]);
+    let wt = fx.add_worktree("wt", "feature");
+    git(
+        &wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.repo.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&wt, &["commit", "-m", "sub"]);
+    wt
+}
+
+#[test]
+fn cold_refuses_submodule_with_ignored_files() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = worktree_with_submodule(&fx, &sub);
+    fs::write(wt.join("lib/.env"), "SECRET=1\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib")),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("lib/.env")).unwrap(),
+        "SECRET=1\n"
+    );
+}
+
+#[test]
+fn cold_refuses_submodule_with_git_dir() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(&wt, &["clone", "-q", sub.repo.to_str().unwrap(), "lib"]);
+    git(
+        &wt,
+        &["submodule", "add", sub.repo.to_str().unwrap(), "lib"],
+    );
+    git(&wt, &["commit", "-m", "sub"]);
+    assert!(wt.join("lib/.git").is_dir());
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib")),
+        "{out:?}"
+    );
+    assert!(wt.join("lib/.git").is_dir());
+}
+
+#[test]
+fn untracked_dir_of_only_ignored_files_is_saved_once() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), ".env\n").unwrap();
+    fs::create_dir_all(wt.join("newdir")).unwrap();
+    fs::write(wt.join("newdir/.env"), "S=1\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
+    let saved = fx.home().saved_dir(&id).join("files/newdir/.env");
+    assert_eq!(fs::read_to_string(saved).unwrap(), "S=1\n");
+}
+
+#[test]
+fn recovery_refuses_dirty_submodule() {
+    let fx = Fixture::new();
+    let sub = Fixture::new();
+    let wt = worktree_with_submodule(&fx, &sub);
+    fs::write(wt.join("lib/f"), "dirty\n").unwrap();
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_level(&fx, &id, Level::Cooling);
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains("lib")),
+        "{out:?}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("lib/f")).unwrap(), "dirty\n");
+    assert_eq!(level(&fx, &id), Level::Baled);
+}
+
+#[test]
+fn recovery_keeps_trash_that_fails_verify() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "baled by bale",
+            wt.to_str().unwrap(),
+        ],
+    );
+    save_wip(&wt, &id).unwrap();
+    save_ignored(&wt, &fx.home().saved_dir(&id), &[]).unwrap();
+    // Edited after the save, e.g. a stale wip ref from an earlier cycle.
+    fs::write(wt.join("f"), "newer\n").unwrap();
+    let trash = wt.with_file_name(".bale-trash-wt-123");
+    fs::rename(&wt, &trash).unwrap();
+    set_level(&fx, &id, Level::Cooling);
+
+    let err = cold(&fx.home(), &id).unwrap_err();
+    assert!(format!("{err:#}").contains("changed"), "{err:#}");
+    assert_eq!(fs::read_to_string(trash.join("f")).unwrap(), "newer\n");
+    assert_eq!(level(&fx, &id), Level::Cooling);
+}

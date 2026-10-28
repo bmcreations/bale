@@ -51,7 +51,7 @@ pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
 
     let root = fs::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
-    if let Some(reason) = refusal(&root)? {
+    if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
         return Ok(Outcome::Skipped(reason));
     }
     match up_locked(home, id)? {
@@ -69,9 +69,17 @@ pub fn cold(home: &BaleHome, id: &str) -> Result<Outcome> {
     finish(home, &registry, record, &root)
 }
 
+/// Config `ignored_denylist` plus `regenerable` names for the tree at `root`.
+fn deny_list(home: &BaleHome, root: &Path) -> Result<Vec<String>> {
+    let cfg = load_config(home, Some(root))?;
+    let mut deny = cfg.ignored_denylist_extra;
+    deny.extend(cfg.regenerable_extra);
+    Ok(deny)
+}
+
 /// Why this tree must not go cold, if it must not. The main checkout is an
 /// error; everything else is a skip reason.
-fn refusal(root: &Path) -> Result<Option<String>> {
+fn refusal(root: &Path, deny: &[String]) -> Result<Option<String>> {
     let info = git::worktrees(root)?
         .into_iter()
         .find(|w| fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
@@ -120,8 +128,40 @@ fn refusal(root: &Path) -> Result<Option<String>> {
         return Ok(Some(format!("dirty submodule: {}", dirty.join(", "))));
     }
 
-    // `add -A` would record an untracked nested repo as a bare gitlink and
-    // lose its contents.
+    // Nothing in a submodule's checkout is saved except what its own commits
+    // hold, so its ignored files or an embedded git dir would be lost.
+    let ignored = g.run(&[
+        "submodule",
+        "--quiet",
+        "foreach",
+        "--recursive",
+        r#"test -z "$(git ls-files --others --ignored --exclude-standard --directory)" || echo "$displaypath""#,
+    ])?;
+    let ignored: Vec<&str> = ignored.lines().filter(|l| !l.is_empty()).collect();
+    if !ignored.is_empty() {
+        return Ok(Some(format!(
+            "submodule with ignored files: {}",
+            ignored.join(", ")
+        )));
+    }
+    let embedded = g.run(&[
+        "submodule",
+        "--quiet",
+        "foreach",
+        "--recursive",
+        r#"test -d .git && echo "$displaypath" || true"#,
+    ])?;
+    let embedded: Vec<&str> = embedded.lines().filter(|l| !l.is_empty()).collect();
+    if !embedded.is_empty() {
+        return Ok(Some(format!(
+            "submodule with its own .git dir: {}",
+            embedded.join(", ")
+        )));
+    }
+
+    // `add -A` records a nested repo in an untracked dir as a bare gitlink,
+    // and copying one out of an ignored dir flattens it; either way its
+    // history would be deleted.
     let untracked = g.run(&[
         "ls-files",
         "-z",
@@ -129,15 +169,27 @@ fn refusal(root: &Path) -> Result<Option<String>> {
         "--exclude-standard",
         "--directory",
     ])?;
-    let nested: Vec<&str> = untracked
-        .split('\0')
-        .filter(|e| e.ends_with('/') && root.join(e).join(".git").exists())
-        .collect();
+    let mut nested = Vec::new();
+    for entry in untracked.split('\0').filter(|e| e.ends_with('/')) {
+        let mut it = WalkDir::new(root.join(entry))
+            .follow_links(false)
+            .follow_root_links(false)
+            .into_iter();
+        while let Some(item) = it.next() {
+            let Ok(item) = item else { continue };
+            if item.depth() > 0 && item.file_name() == ".git" {
+                if let Ok(rel) = item.path().strip_prefix(root) {
+                    nested.push(rel.parent().unwrap_or(rel).to_path_buf());
+                }
+                if item.file_type().is_dir() {
+                    it.skip_current_dir();
+                }
+            }
+        }
+    }
+    nested.extend(scan_ignored(root, deny)?.nested);
     if !nested.is_empty() {
-        return Ok(Some(format!(
-            "untracked nested repository: {}",
-            nested.join(", ")
-        )));
+        return Ok(Some(format!("nested repository: {}", join_paths(&nested))));
     }
     Ok(None)
 }
@@ -154,11 +206,9 @@ fn finish(
     let prepared = (|| -> Result<Vec<Holder>> {
         let dest = home.saved_dir(&id);
         save_wip(root, &id)?;
-        let cfg = load_config(home, Some(root))?;
-        let mut deny = cfg.ignored_denylist_extra.clone();
-        deny.extend(cfg.regenerable_extra.iter().cloned());
+        let deny = deny_list(home, root)?;
         save_ignored(root, &dest, &deny)?;
-        verify(root, &id, &dest)?;
+        verify(root, &id, &dest, &deny)?;
         busy_holders(root)
     })();
     let holders = match prepared {
@@ -199,6 +249,11 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
     if fs::symlink_metadata(&path).is_ok() {
         let root =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
+        if let Some(reason) = refusal(&root, &deny_list(home, &root)?)? {
+            record.level = Level::Baled;
+            registry.put(&record)?;
+            return Ok(Outcome::Skipped(reason));
+        }
         git::lock_worktree(&root, &root)?;
         return finish(home, registry, record, &root);
     }
@@ -225,7 +280,13 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             manifest.display()
         );
     }
+    let dest = home.saved_dir(&record.id);
     for trash in trash_siblings(&path)? {
+        // The trash is still a working checkout: prove the saved state covers
+        // it (and is not stale) before deleting it.
+        let deny = deny_list(home, &trash)?;
+        verify(&trash, &record.id, &dest, &deny)
+            .with_context(|| format!("keeping {}", trash.display()))?;
         remove_entry(&trash).with_context(|| format!("removing {}", trash.display()))?;
     }
     record.level = Level::Cold;
@@ -249,9 +310,11 @@ fn trash_siblings(path: &Path) -> Result<Vec<PathBuf>> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(Vec::new());
     };
+    let parent =
+        fs::canonicalize(parent).with_context(|| format!("resolving {}", parent.display()))?;
     let prefix = format!("{TRASH_PREFIX}{}-", name.to_string_lossy());
     let mut found = Vec::new();
-    for entry in fs::read_dir(parent).with_context(|| format!("reading {}", parent.display()))? {
+    for entry in fs::read_dir(&parent).with_context(|| format!("reading {}", parent.display()))? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
@@ -341,6 +404,60 @@ fn ls_files_v(g: &Git) -> Result<Vec<(char, String)>> {
 /// path component, one with `/` matches a path prefix. Symlinks are saved as
 /// symlinks and never followed. `dest` is cleared first.
 pub fn save_ignored(dir: &Path, dest: &Path, deny: &[String]) -> Result<Vec<SavedFile>> {
+    let scan = scan_ignored(dir, deny)?;
+    if !scan.nested.is_empty() {
+        bail!(
+            "nested repository among ignored files: {}",
+            join_paths(&scan.nested)
+        );
+    }
+
+    match fs::remove_dir_all(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clearing {}", dest.display())),
+    }
+    let files = dest.join(FILES);
+    make_dirs(&files)?;
+
+    let mut saved = Vec::new();
+    for (rel, is_link) in scan.entries {
+        let from = dir.join(&rel);
+        let to = files.join(&rel);
+        if is_link {
+            saved.push(copy_symlink(&from, &to, rel)?);
+            continue;
+        }
+        if let Some(parent) = to.parent() {
+            make_dirs(parent)?;
+        }
+        let sha256 = copy_file(&from, &to)?;
+        saved.push(SavedFile {
+            rel,
+            sha256,
+            symlink_target: None,
+        });
+    }
+
+    let manifest = dest.join(MANIFEST);
+    let tmp = dest.join(format!("{MANIFEST}.tmp"));
+    let mut f = create_private(&tmp)?;
+    f.write_all(&serde_json::to_vec_pretty(&saved)?)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, &manifest).with_context(|| format!("writing {}", manifest.display()))?;
+    Ok(saved)
+}
+
+/// What `save_ignored` would save: `(rel, is_symlink)` for every ignored
+/// file and symlink outside the denylist, plus every nested repository
+/// (a dir holding a `.git` entry) it met on the way.
+struct IgnoredScan {
+    entries: Vec<(PathBuf, bool)>,
+    nested: Vec<PathBuf>,
+}
+
+fn scan_ignored(dir: &Path, deny: &[String]) -> Result<IgnoredScan> {
     let regen: Vec<PathBuf> = regenerable_dirs(dir, &detect(dir), &no_extras())
         .into_iter()
         .filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf))
@@ -362,14 +479,6 @@ pub fn save_ignored(dir: &Path, dest: &Path, deny: &[String]) -> Result<Vec<Save
                 .any(|d| rel.starts_with(d.trim_end_matches('/')))
     };
 
-    match fs::remove_dir_all(dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("clearing {}", dest.display())),
-    }
-    let files = dest.join(FILES);
-    make_dirs(&files)?;
-
     let listed = Git::at(dir).run(&[
         "ls-files",
         "-z",
@@ -378,65 +487,72 @@ pub fn save_ignored(dir: &Path, dest: &Path, deny: &[String]) -> Result<Vec<Save
         "--exclude-standard",
         "--directory",
     ])?;
-    let mut saved = Vec::new();
-    for entry in listed.split('\0').filter(|e| !e.is_empty()) {
-        let rel = PathBuf::from(entry.trim_end_matches('/'));
-        if denied(&rel) {
-            continue;
+    let mut tops: Vec<PathBuf> = listed
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .map(|e| PathBuf::from(e.trim_end_matches('/')))
+        .filter(|rel| !denied(rel))
+        .collect();
+    tops.sort();
+    tops.dedup();
+    // git can list a dir and also a file inside it; the walk of the dir
+    // covers the file.
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for rel in tops {
+        if !kept.iter().any(|k| rel.starts_with(k)) {
+            kept.push(rel);
         }
-        let from = dir.join(&rel);
-        let meta =
-            fs::symlink_metadata(&from).with_context(|| format!("reading {}", from.display()))?;
-        if meta.file_type().is_symlink() {
-            saved.push(copy_symlink(&from, &files.join(&rel), rel)?);
-            continue;
-        }
+    }
+
+    let mut scan = IgnoredScan {
+        entries: Vec::new(),
+        nested: Vec::new(),
+    };
+    for top in kept {
+        let from = dir.join(&top);
         let mut it = WalkDir::new(&from)
             .follow_links(false)
             .follow_root_links(false)
             .sort_by_file_name()
             .into_iter();
         while let Some(item) = it.next() {
-            let item = item.with_context(|| format!("walking {}", dir.join(&rel).display()))?;
+            let item = item.with_context(|| format!("walking {}", from.display()))?;
             let rel = item
                 .path()
                 .strip_prefix(dir)
                 .context("walk left the worktree")?
                 .to_path_buf();
             let ft = item.file_type();
+            if item.file_name() == ".git" {
+                scan.nested
+                    .push(rel.parent().map(Path::to_path_buf).unwrap_or_default());
+                if ft.is_dir() {
+                    it.skip_current_dir();
+                }
+                continue;
+            }
             if denied(&rel) {
                 if ft.is_dir() {
                     it.skip_current_dir();
                 }
                 continue;
             }
-            let to = files.join(&rel);
-            if ft.is_dir() {
-                make_dirs(&to)?;
-            } else if ft.is_symlink() {
-                saved.push(copy_symlink(item.path(), &to, rel)?);
+            if ft.is_symlink() {
+                scan.entries.push((rel, true));
             } else if ft.is_file() {
-                if let Some(parent) = to.parent() {
-                    make_dirs(parent)?;
-                }
-                let sha256 = copy_file(item.path(), &to)?;
-                saved.push(SavedFile {
-                    rel,
-                    sha256,
-                    symlink_target: None,
-                });
+                scan.entries.push((rel, false));
             }
         }
     }
+    Ok(scan)
+}
 
-    let manifest = dest.join(MANIFEST);
-    let tmp = dest.join(format!("{MANIFEST}.tmp"));
-    let mut f = create_private(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(&saved)?)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, &manifest).with_context(|| format!("writing {}", manifest.display()))?;
-    Ok(saved)
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A config with no extra regenerable names; callers pass those via `deny`.
@@ -543,12 +659,29 @@ fn sha_file(path: &Path) -> Result<String> {
 /// Checks the saved state before anything is deleted: each manifest entry
 /// matches both the source and the copy, and the working tree still builds
 /// exactly the wip commit's tree.
-fn verify(root: &Path, id: &str, dest: &Path) -> Result<()> {
+fn verify(root: &Path, id: &str, dest: &Path, deny: &[String]) -> Result<()> {
     let manifest = dest.join(MANIFEST);
     let text =
         fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
     let saved: Vec<SavedFile> =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
+    let mut want: Vec<PathBuf> = scan_ignored(root, deny)?
+        .entries
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
+    let mut have: Vec<PathBuf> = saved.iter().map(|f| f.rel.clone()).collect();
+    want.sort();
+    have.sort();
+    if want != have {
+        let missing: Vec<PathBuf> = want.iter().filter(|w| !have.contains(w)).cloned().collect();
+        let extra: Vec<PathBuf> = have.iter().filter(|h| !want.contains(h)).cloned().collect();
+        bail!(
+            "ignored files changed while saving: unsaved [{}], gone [{}]",
+            join_paths(&missing),
+            join_paths(&extra)
+        );
+    }
     for f in &saved {
         let src = root.join(&f.rel);
         let copy = dest.join(FILES).join(&f.rel);
@@ -629,10 +762,21 @@ mod tests {
         let dest = tmp.path().join("dest");
         save_wip(&root, "x").unwrap();
         save_ignored(&root, &dest, &[]).unwrap();
-        verify(&root, "x", &dest).unwrap();
+        verify(&root, "x", &dest, &[]).unwrap();
         fs::write(root.join(".env"), "A=2\n").unwrap();
-        let err = verify(&root, "x", &dest).unwrap_err();
+        let err = verify(&root, "x", &dest, &[]).unwrap_err();
         assert!(format!("{err:#}").contains(".env"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_catches_new_ignored_file() {
+        let (tmp, root) = repo();
+        let dest = tmp.path().join("dest");
+        save_wip(&root, "x").unwrap();
+        save_ignored(&root, &dest, &[]).unwrap();
+        fs::write(root.join(".env"), "late\n").unwrap();
+        let err = verify(&root, "x", &dest, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("unsaved [.env]"), "{err:#}");
     }
 
     #[test]
@@ -642,7 +786,7 @@ mod tests {
         save_wip(&root, "x").unwrap();
         save_ignored(&root, &dest, &[]).unwrap();
         fs::write(root.join("late.txt"), "late\n").unwrap();
-        let err = verify(&root, "x", &dest).unwrap_err();
+        let err = verify(&root, "x", &dest, &[]).unwrap_err();
         assert!(
             format!("{err:#}").contains("changed while saving"),
             "{err:#}"
@@ -660,7 +804,9 @@ mod tests {
         ] {
             fs::create_dir_all(tmp.path().join(n)).unwrap();
         }
+        // Found under the canonical parent (macOS temp dirs sit behind /var -> /private/var).
         let found = trash_siblings(&tmp.path().join("a")).unwrap();
-        assert_eq!(found, vec![tmp.path().join(".bale-trash-a-1")]);
+        let parent = fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(found, vec![parent.join(".bale-trash-a-1")]);
     }
 }

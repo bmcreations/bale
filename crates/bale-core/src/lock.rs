@@ -5,11 +5,19 @@ use fs4::fs_std::FileExt;
 
 use crate::BaleHome;
 
-/// Exclusive per-workspace lock on `locks/<id>.lock`. The OS releases it when
-/// the file closes on drop.
+/// Exclusive per-workspace lock on `locks/<id>.lock`, released on drop.
 #[derive(Debug)]
 pub struct WorkspaceLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for WorkspaceLock {
+    // Unlock explicitly instead of relying on close: a child process forked
+    // by another thread can hold a copy of the fd until it execs, and the
+    // lock lives as long as any copy does.
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl WorkspaceLock {
@@ -25,7 +33,7 @@ impl WorkspaceLock {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock_exclusive() {
-            Ok(true) => Ok(Some(WorkspaceLock { _file: file })),
+            Ok(true) => Ok(Some(WorkspaceLock { file })),
             Ok(false) => Ok(None),
             Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
         }
