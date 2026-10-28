@@ -21,7 +21,8 @@ use crate::ops::disk::{
     self, read_manifest, record_tree, restore_check, write_manifest, Manifest, Skip, Verdict,
 };
 use crate::ops::up::{
-    bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, OPENING, TRASH_PREFIX,
+    bale_able_from, is_busy_error, remove_entry, up_locked, Outcome, SkipCode, SkipReason, OPENING,
+    TRASH_PREFIX,
 };
 use crate::registry::{Level, Record, Registry};
 use crate::BaleHome;
@@ -82,15 +83,15 @@ fn cold_untraced(
     ignore: &[u32],
 ) -> Result<Outcome> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(Outcome::Skipped("locked".into()));
+        return Ok(skip(SkipCode::Locked, "locked"));
     };
     let registry = Registry::open(home.clone());
     let Some(record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
     };
     match record.level {
-        Level::Cold => return Ok(Outcome::Skipped("cold".into())),
-        Level::Opening => return Ok(Outcome::Skipped(OPENING.into())),
+        Level::Cold => return Ok(skip(SkipCode::Cold, "cold")),
+        Level::Opening => return Ok(skip(SkipCode::Opening, OPENING)),
         Level::Cooling => return recover(home, &registry, record, ignore),
         Level::Hot | Level::Baling | Level::Baled => {}
     }
@@ -101,7 +102,7 @@ fn cold_untraced(
         return Ok(Outcome::Skipped(reason));
     }
     if require_clean && git::is_dirty(&root).unwrap_or(true) {
-        return Ok(Outcome::Skipped("dirty".into()));
+        return Ok(skip(SkipCode::Dirty, "dirty"));
     }
     if let Some(reason) = refusal(&root, &exclusions(home, &root)?)? {
         return Ok(Outcome::Skipped(reason));
@@ -162,7 +163,7 @@ pub fn exclusions(home: &BaleHome, dir: &Path) -> Result<Exclusions> {
 
 /// Why this tree must not go cold, if it must not. The main checkout is an
 /// error; everything else is a skip reason.
-fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
+fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<SkipReason>> {
     let info = git::worktrees(root)?
         .into_iter()
         .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
@@ -174,10 +175,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         );
     }
     if let Some(reason) = info.foreign_lock() {
-        return Ok(Some(reason));
+        return Ok(Some(SkipReason::new(SkipCode::WorktreeLocked, reason)));
     }
     if let Some(reason) = case_variant_git(root, ex) {
-        return Ok(Some(reason));
+        return Ok(Some(SkipReason::new(SkipCode::NotRestorable, reason)));
     }
 
     let g = Git::at(root);
@@ -190,11 +191,17 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         "core.sparseCheckout",
     ])?;
     if sparse.trim() == "true" {
-        return Ok(Some("sparse checkout".into()));
+        return Ok(Some(SkipReason::new(
+            SkipCode::SparseCheckout,
+            "sparse checkout",
+        )));
     }
     let hidden = hidden_entries(&g)?;
     if !hidden.is_empty() {
-        return Ok(Some(hidden_reason(&hidden)));
+        return Ok(Some(SkipReason::new(
+            SkipCode::HiddenEntries,
+            hidden_reason(&hidden),
+        )));
     }
 
     let dirty = g.run(&[
@@ -208,7 +215,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     ])?;
     let dirty: Vec<&str> = dirty.lines().filter(|l| !l.is_empty()).collect();
     if !dirty.is_empty() {
-        return Ok(Some(format!("dirty submodule: {}", dirty.join(", "))));
+        return Ok(Some(SkipReason::new(
+            SkipCode::Submodule,
+            format!("dirty submodule: {}", dirty.join(", ")),
+        )));
     }
 
     let moved = moved_gitlinks(&g.run(&[
@@ -220,7 +230,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         "HEAD",
     ])?);
     if !moved.is_empty() {
-        return Ok(Some(moved_gitlink_reason(&moved)));
+        return Ok(Some(SkipReason::new(
+            SkipCode::Submodule,
+            moved_gitlink_reason(&moved),
+        )));
     }
 
     // Nothing in a submodule's checkout is saved except what its own commits
@@ -246,8 +259,9 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     for path in gitlink_paths {
         let dir = root.join(&path);
         if submodule_git_dir(&dir)?.is_none() && !is_empty_or_missing(&dir)? {
-            return Ok(Some(format!(
-                "submodule {path} is not checked out but has files"
+            return Ok(Some(SkipReason::new(
+                SkipCode::Submodule,
+                format!("submodule {path} is not checked out but has files"),
             )));
         }
     }
@@ -272,7 +286,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
             .map(|p| format!("{sub}/{p}"))
             .collect();
         if !hidden.is_empty() {
-            return Ok(Some(hidden_reason(&hidden)));
+            return Ok(Some(SkipReason::new(
+                SkipCode::HiddenEntries,
+                hidden_reason(&hidden),
+            )));
         }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
@@ -287,15 +304,15 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         }
     }
     if !embedded.is_empty() {
-        return Ok(Some(format!(
-            "submodule with its own .git dir: {}",
-            embedded.join(", ")
+        return Ok(Some(SkipReason::new(
+            SkipCode::Submodule,
+            format!("submodule with its own .git dir: {}", embedded.join(", ")),
         )));
     }
     if !ignored.is_empty() {
-        return Ok(Some(format!(
-            "submodule with ignored files: {}",
-            ignored.join(", ")
+        return Ok(Some(SkipReason::new(
+            SkipCode::Submodule,
+            format!("submodule with ignored files: {}", ignored.join(", ")),
         )));
     }
 
@@ -322,7 +339,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
                 Err(e) => {
                     let path = e.path().unwrap_or(&root.join(entry)).to_path_buf();
                     let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                    return Ok(Some(format!("unreadable: {}", rel.display())));
+                    return Ok(Some(SkipReason::new(
+                        SkipCode::Unreadable,
+                        format!("unreadable: {}", rel.display()),
+                    )));
                 }
             };
             if item.depth() > 0 && item.file_name() == ".git" {
@@ -337,7 +357,10 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     }
     nested.extend(scan_ignored(root, ex)?.nested);
     if !nested.is_empty() {
-        return Ok(Some(format!("nested repository: {}", join_paths(&nested))));
+        return Ok(Some(SkipReason::new(
+            SkipCode::NestedRepo,
+            format!("nested repository: {}", join_paths(&nested)),
+        )));
     }
     Ok(None)
 }
@@ -403,7 +426,10 @@ fn finish(
     let checked = (|| -> Result<Option<Outcome>> {
         // Git fails on such a path on some platforms and skips it on others.
         if let Some(reason) = case_variant_git(&trash, &ex) {
-            return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+            return Ok(Some(Outcome::Skipped(not_restorable(&SkipReason::new(
+                SkipCode::NotRestorable,
+                reason,
+            )))));
         }
         let wip = wip_commit(&trash, &id)?;
         // The same exclusions as the save: the trash is checked against
@@ -450,14 +476,14 @@ fn finish(
 /// The skip reason for a folder at the record's path that is not the
 /// worktree's own checkout. Nothing may be saved from it, or run there: git
 /// in a folder with no `.git` works on whatever repo encloses it.
-fn not_checkout(root: &Path, record: &Record) -> Option<String> {
+fn not_checkout(root: &Path, record: &Record) -> Option<SkipReason> {
     disk::ensure_checkout(root, &record.admin_dir)
         .err()
         .map(|e| {
-            format!(
+            SkipReason::new(SkipCode::IdentityMismatch, format!(
                 "{} is not this worktree's checkout ({e:#}); leaving it and the saved state as they are",
                 record.path.display()
-            )
+            ))
         })
 }
 
@@ -467,7 +493,7 @@ const CHECK_MARGIN: u64 = 1 << 30;
 /// The skip reason when the volume holding `tree` lacks room for the
 /// restore check: its copy of the tree (estimated as the bytes of every
 /// file the save does not leave out) plus [`CHECK_MARGIN`].
-fn no_room_to_check(tree: &Path, ex: &Exclusions) -> Result<Option<String>> {
+fn no_room_to_check(tree: &Path, ex: &Exclusions) -> Result<Option<SkipReason>> {
     let mut size = 0u64;
     let mut it = WalkDir::new(tree)
         .follow_links(false)
@@ -496,18 +522,33 @@ fn no_room_to_check(tree: &Path, ex: &Exclusions) -> Result<Option<String>> {
     if free >= needed {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "not enough free space to check it: needs {} (a copy of the tree plus {}), {} free on {}",
-        crate::human_bytes(needed),
-        crate::human_bytes(CHECK_MARGIN),
-        crate::human_bytes(free),
-        tree.display()
+    Ok(Some(SkipReason::new(
+        SkipCode::FreeSpace,
+        format!(
+            "not enough free space to check it: needs {} (a copy of the tree plus {}), {} free on {}",
+            crate::human_bytes(needed),
+            crate::human_bytes(CHECK_MARGIN),
+            crate::human_bytes(free),
+            tree.display()
+        ),
     )))
 }
 
-/// The skip reason for a tree `open` would not give back as it is.
-fn not_restorable(reason: &str) -> String {
-    format!("open would not restore it as it is: {reason}")
+/// The skip reason for a tree `open` would not give back as it is. Keeps a
+/// more specific code (an attribute, a submodule) when the check found one.
+fn not_restorable(reason: &SkipReason) -> SkipReason {
+    let code = match reason.code {
+        SkipCode::DirtyXattr | SkipCode::Submodule => reason.code,
+        _ => SkipCode::NotRestorable,
+    };
+    SkipReason::new(
+        code,
+        format!("open would not restore it as it is: {}", reason.text),
+    )
+}
+
+fn skip(code: SkipCode, text: &str) -> Outcome {
+    Outcome::Skipped(SkipReason::new(code, text))
 }
 
 /// Renames the moved-aside checkout back to `root` and sets `Baled`. A failed
@@ -552,12 +593,15 @@ fn recover(
         let trash = trash_siblings(&path)?;
         if !trash.is_empty() {
             let names: Vec<String> = trash.iter().map(|t| t.display().to_string()).collect();
-            return Ok(Outcome::Skipped(format!(
-                "{} was recreated after the checkout was moved to {}; move {} away and run \
-                 `bale cold` again to finish",
-                path.display(),
-                names.join(", "),
-                path.display()
+            return Ok(Outcome::Skipped(SkipReason::new(
+                SkipCode::IdentityMismatch,
+                format!(
+                    "{} was recreated after the checkout was moved to {}; move {} away and run \
+                     `bale cold` again to finish",
+                    path.display(),
+                    names.join(", "),
+                    path.display()
+                ),
             )));
         }
         let root = crate::paths::canonicalize(&path)
@@ -619,7 +663,10 @@ fn recover(
             // path as a `Baled` tree; nothing is deleted.
             let checked = exclusions(home, &trash).and_then(|ex| {
                 if let Some(reason) = case_variant_git(&trash, &ex) {
-                    return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+                    return Ok(Some(Outcome::Skipped(not_restorable(&SkipReason::new(
+                        SkipCode::NotRestorable,
+                        reason,
+                    )))));
                 }
                 if let Some(reason) = no_room_to_check(&trash, &ex)? {
                     return Ok(Some(Outcome::Skipped(reason)));
@@ -1916,7 +1963,10 @@ mod tests {
         let (_tmp, wt, home, id) = nested_case(ignore_deep);
         commit_in_deep(&wt);
         let out = cold(&home, &id).unwrap();
-        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert_eq!(
+            out,
+            Outcome::Skipped(SkipReason::new(SkipCode::Submodule, "dirty submodule: lib"))
+        );
     }
 
     /// Pins `--ignore-submodules=dirty` in `submodule_change`.
@@ -2024,7 +2074,10 @@ mod tests {
             fs::write(wt.join("lib/pre.txt"), "pre\n").unwrap();
         });
         let out = cold(&home, &id).unwrap();
-        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert_eq!(
+            out,
+            Outcome::Skipped(SkipReason::new(SkipCode::Submodule, "dirty submodule: lib"))
+        );
         assert!(wt.join("lib/pre.txt").is_file());
     }
 
@@ -2102,7 +2155,10 @@ mod tests {
             fs::write(wt.join("lib/a.txt"), "edited\n").unwrap();
         });
         let out = cold(&home, &id).unwrap();
-        assert_eq!(out, Outcome::Skipped("dirty submodule: lib".into()));
+        assert_eq!(
+            out,
+            Outcome::Skipped(SkipReason::new(SkipCode::Submodule, "dirty submodule: lib"))
+        );
         assert_eq!(
             fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
             "edited\n"
@@ -2119,7 +2175,10 @@ mod tests {
         let out = cold(&home, &id).unwrap();
         assert_eq!(
             out,
-            Outcome::Skipped("assume-unchanged or skip-worktree entries: .gitignore".into())
+            Outcome::Skipped(SkipReason::new(
+                SkipCode::HiddenEntries,
+                "assume-unchanged or skip-worktree entries: .gitignore"
+            ))
         );
     }
 
@@ -2134,7 +2193,10 @@ mod tests {
         let out = cold(&home, &id).unwrap();
         assert_eq!(
             out,
-            Outcome::Skipped("assume-unchanged or skip-worktree entries: lib/a.txt".into())
+            Outcome::Skipped(SkipReason::new(
+                SkipCode::HiddenEntries,
+                "assume-unchanged or skip-worktree entries: lib/a.txt"
+            ))
         );
         assert!(wt.join("lib/a.txt").is_file());
     }
@@ -2150,7 +2212,10 @@ mod tests {
         let out = cold(&home, &id).unwrap();
         assert_eq!(
             out,
-            Outcome::Skipped("assume-unchanged or skip-worktree entries: lib/a.txt".into())
+            Outcome::Skipped(SkipReason::new(
+                SkipCode::HiddenEntries,
+                "assume-unchanged or skip-worktree entries: lib/a.txt"
+            ))
         );
     }
 
@@ -2183,7 +2248,10 @@ mod tests {
         let out = cold(&home, &id).unwrap();
         assert_eq!(
             out,
-            Outcome::Skipped("submodule lib is not checked out but has files".into())
+            Outcome::Skipped(SkipReason::new(
+                SkipCode::Submodule,
+                "submodule lib is not checked out but has files"
+            ))
         );
         assert!(wt.join("lib/x.txt").is_file());
         let wip = Git::at(tmp.path().join("r")).run(&[

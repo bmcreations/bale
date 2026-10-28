@@ -4,7 +4,7 @@ use bale_core::git::worktrees;
 #[cfg(unix)]
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::cold::{cold, cold_if_clean, exclusions, save_ignored, save_wip};
-use bale_core::ops::up::{register, resolve, Outcome};
+use bale_core::ops::up::{register, resolve, Outcome, SkipCode, SkipReason};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -148,7 +148,7 @@ fn user_locked_tree_is_skipped_untouched() {
     );
     assert_eq!(
         cold(&fx.home(), &id).unwrap(),
-        Outcome::Skipped("locked: mine".into())
+        Outcome::Skipped(SkipReason::new(SkipCode::WorktreeLocked, "locked: mine"))
     );
     assert!(wt.join("build/out.bin").exists());
     assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
@@ -1207,7 +1207,10 @@ fn cold_if_clean_skips_dirty_tree_untouched() {
     let id = register(&fx.home(), &wt).unwrap().id;
 
     let out = cold_if_clean(&fx.home(), &id).unwrap();
-    assert_eq!(out, Outcome::Skipped("dirty".into()));
+    assert_eq!(
+        out,
+        Outcome::Skipped(SkipReason::new(SkipCode::Dirty, "dirty"))
+    );
     assert_eq!(level(&fx, &id), Level::Hot);
     assert!(wt.join("build/out.bin").exists());
     assert_eq!(git(&fx.repo, &["for-each-ref", "refs/bale/"]), "");

@@ -16,7 +16,7 @@ use crate::ops::cold::{
     copy_file, copy_symlink, create_private, hex, moved_gitlink_reason, moved_gitlinks, regen_dirs,
     submodule_deny, submodule_git_dir, Exclusions, SavedFile, FILES, MANIFEST,
 };
-use crate::ops::up::TRASH_PREFIX;
+use crate::ops::up::{SkipCode, SkipReason, TRASH_PREFIX};
 use crate::registry::canonical_or_ancestor;
 
 /// `dest/manifest.json`.
@@ -513,7 +513,7 @@ pub(crate) enum Verdict {
     /// the caller can tell whether anything changed since.
     Same(Box<Snapshot>),
     /// Why open would not give it back.
-    Differs(String),
+    Differs(SkipReason),
 }
 
 /// The tree as the compare walked it: every kept entry's stat signature.
@@ -615,7 +615,10 @@ pub(crate) fn restore_check(
         wip,
     ])?);
     if !moved.is_empty() {
-        return Ok(Verdict::Differs(moved_gitlink_reason(&moved)));
+        return Ok(Verdict::Differs(SkipReason::new(
+            SkipCode::Submodule,
+            moved_gitlink_reason(&moved),
+        )));
     }
     let listing = g.run(&["ls-tree", "-r", "-z", wip])?;
     let mut paths: Vec<String> = Vec::new();
@@ -739,8 +742,9 @@ fn check_in(
     let seen = entries(tree, &skip)?;
     // The walk starts below the root, so its attributes are checked here.
     if let Some(what) = unsaved_attr(tree)? {
-        return Ok(Verdict::Differs(format!(
-            "the tree's root has {what}, which can't be saved"
+        return Ok(Verdict::Differs(SkipReason::new(
+            SkipCode::DirtyXattr,
+            format!("the tree's root has {what}, which can't be saved"),
         )));
     }
     if let (Some(x), Some(y)) = (
@@ -748,9 +752,9 @@ fn check_in(
         file_mode(&fs::symlink_metadata(work)?),
     ) {
         if x != y {
-            return Ok(Verdict::Differs(format!(
+            return Ok(Verdict::Differs(not_same(format!(
                 "the tree's root would be restored with mode {y:o}, not {x:o}"
-            )));
+            ))));
         }
     }
     let (mut hashes, mut links) = (Vec::new(), Vec::new());
@@ -801,6 +805,11 @@ fn entries(root: &Path, skip: &Skip) -> Result<BTreeMap<PathBuf, (Kind, Stamp)>>
     Ok(found)
 }
 
+/// A difference between the tree and what open would restore.
+fn not_same(text: String) -> SkipReason {
+    SkipReason::new(SkipCode::NotRestorable, text)
+}
+
 fn compare(
     tree: &Path,
     restored: &Path,
@@ -808,54 +817,57 @@ fn compare(
     seen: &BTreeMap<PathBuf, (Kind, Stamp)>,
     hashes: &mut Vec<SavedHash>,
     links: &mut Vec<SavedLink>,
-) -> Result<Option<String>> {
+) -> Result<Option<SkipReason>> {
     let have: BTreeMap<&PathBuf, Kind> = seen.iter().map(|(r, (k, _))| (r, *k)).collect();
     let want: BTreeMap<PathBuf, Kind> = entries(restored, skip)?
         .into_iter()
         .map(|(r, (k, _))| (r, k))
         .collect();
     if let Some((rel, _)) = have.iter().find(|(_, k)| **k == Kind::Other) {
-        return Ok(Some(format!(
+        return Ok(Some(not_same(format!(
             "{}: a fifo, socket or device can't be saved",
             rel.display()
-        )));
+        ))));
     }
     if let Some(rel) = have.keys().find(|r| !want.contains_key(**r)) {
-        return Ok(Some(format!("{} would not be restored", rel.display())));
+        return Ok(Some(not_same(format!(
+            "{} would not be restored",
+            rel.display()
+        ))));
     }
     if let Some(rel) = want.keys().find(|r| !have.contains_key(r)) {
-        return Ok(Some(format!(
+        return Ok(Some(not_same(format!(
             "{} would be restored but is not in the tree",
             rel.display()
-        )));
+        ))));
     }
     for (rel, kind) in &have {
         let (a, b) = (tree.join(rel), restored.join(rel));
         if let Some(what) = unsaved_attr(&a)? {
-            return Ok(Some(format!(
-                "{} has {what}, which can't be saved",
-                rel.display()
+            return Ok(Some(SkipReason::new(
+                SkipCode::DirtyXattr,
+                format!("{} has {what}, which can't be saved", rel.display()),
             )));
         }
         let other = want[*rel];
         if *kind != other {
-            return Ok(Some(format!(
+            return Ok(Some(not_same(format!(
                 "{} would be restored as a {}, not a {}",
                 rel.display(),
                 other.name(),
                 kind.name()
-            )));
+            ))));
         }
         match kind {
             Kind::Symlink => {
                 let (ta, tb) = (fs::read_link(&a)?, fs::read_link(&b)?);
                 if ta != tb {
-                    return Ok(Some(format!(
+                    return Ok(Some(not_same(format!(
                         "{} would point at {}, not {}",
                         rel.display(),
                         tb.display(),
                         ta.display()
-                    )));
+                    ))));
                 }
                 if !skip.in_sub(rel) {
                     links.push(SavedLink {
@@ -868,10 +880,10 @@ fn compare(
                 let (ma, mb) = (fs::symlink_metadata(&a)?, fs::symlink_metadata(&b)?);
                 if let (Some(x), Some(y)) = (file_mode(&ma), file_mode(&mb)) {
                     if x != y {
-                        return Ok(Some(format!(
+                        return Ok(Some(not_same(format!(
                             "{} would be restored with mode {y:o}, not {x:o}",
                             rel.display()
-                        )));
+                        ))));
                     }
                 }
             }
@@ -879,10 +891,10 @@ fn compare(
                 let (ma, mb) = (fs::symlink_metadata(&a)?, fs::symlink_metadata(&b)?);
                 if let (Some(x), Some(y)) = (file_mode(&ma), file_mode(&mb)) {
                     if x != y {
-                        return Ok(Some(format!(
+                        return Ok(Some(not_same(format!(
                             "{} would be restored with mode {y:o}, not {x:o}",
                             rel.display()
-                        )));
+                        ))));
                     }
                 }
                 match (ma.len() == mb.len()).then(|| same_bytes(&a, &b)) {
@@ -893,10 +905,10 @@ fn compare(
                     }),
                     Some(Err(e)) => return Err(e),
                     None | Some(Ok(None)) => {
-                        return Ok(Some(format!(
+                        return Ok(Some(not_same(format!(
                             "{} would be restored with different bytes",
                             rel.display()
-                        )))
+                        ))))
                     }
                 }
             }

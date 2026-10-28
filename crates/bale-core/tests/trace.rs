@@ -2,7 +2,8 @@ mod support;
 
 use bale_core::ops::cold::cold;
 use bale_core::ops::sweep::sweep;
-use bale_core::ops::up::{register, Outcome};
+use bale_core::ops::up::{register, up, Outcome};
+use bale_core::registry::Registry;
 use bale_core::BaleHome;
 use serde_json::Value;
 use std::fs;
@@ -69,7 +70,13 @@ fn sweep_writes_one_sweep_line_and_one_tree_line_per_tree() {
     assert_eq!(vols.len(), 1, "{s}");
     assert!(vols[0]["free_bytes"].as_u64().unwrap() > 0, "{s}");
     assert!(vols[0]["total_bytes"].as_u64().unwrap() >= vols[0]["free_bytes"].as_u64().unwrap());
-    assert!(vols[0]["mount_or_root"].is_string(), "{s}");
+    let key = vols[0]["key"].as_str().unwrap();
+    if cfg!(unix) {
+        assert!(key.starts_with("dev:"), "{s}");
+    }
+    let sample = PathBuf::from(vols[0]["sample_path"].as_str().unwrap());
+    let canon = |p: &PathBuf| fs::canonicalize(p).unwrap();
+    assert!(sample == canon(&a) || sample == canon(&b), "{s}");
 
     let trees = of_kind(&all, "tree");
     assert_eq!(trees.len(), 2, "{all:#?}");
@@ -293,4 +300,137 @@ fn sweep_succeeds_when_the_trace_cannot_be_written() {
     let rows = sweep(&home, false).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].2, "nothing to do");
+}
+
+/// The `op` lines of `op`.
+fn ops<'a>(all: &'a [Value], op: &str) -> Vec<&'a Value> {
+    of_kind(all, "op")
+        .into_iter()
+        .filter(|v| v["op"] == op)
+        .collect()
+}
+
+#[test]
+fn a_skip_records_a_reason_code_and_no_path() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = fx.add_worktree("a", "a");
+    let id = register(&home, &wt).unwrap().id;
+    // A `.git` that points elsewhere: skipped with a reason naming the path.
+    fs::write(wt.join(".git"), "gitdir: /nonexistent/bale-test\n").unwrap();
+    let out = cold(&home, &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Skipped(r) if r.contains(&*wt.to_string_lossy())),
+        "{out:?}"
+    );
+    let all = lines(&home);
+    let cold_ops = ops(&all, "cold");
+    assert_eq!(cold_ops.len(), 1, "{all:#?}");
+    let mut line = cold_ops[0].clone();
+    assert_eq!(line["outcome"], "skipped");
+    assert_eq!(line["reason"], "identity_mismatch");
+    line.as_object_mut().unwrap().remove("path");
+    assert!(!line.to_string().contains('/'), "{line}");
+}
+
+#[test]
+fn an_error_records_a_reason_code() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = fx.add_worktree("a", "a");
+    let id = register(&home, &wt).unwrap().id;
+    fs::remove_dir_all(&wt).unwrap();
+    assert!(up(&home, &id).is_err());
+    let all = lines(&home);
+    let up_ops = ops(&all, "up");
+    assert_eq!(up_ops.len(), 1, "{all:#?}");
+    assert_eq!(up_ops[0]["outcome"], "error");
+    assert_eq!(up_ops[0]["reason"], "missing");
+}
+
+#[test]
+fn an_op_inside_a_remove_intent_records_it() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = fx.add_worktree("a", "a");
+    let id = register(&home, &wt).unwrap().id;
+    bale_core::trace::with_intent("remove", || cold(&home, &id).unwrap());
+    // Errs, as the tree is gone; it still writes a line.
+    let _ = up(&home, &id);
+    let all = lines(&home);
+    assert_eq!(ops(&all, "cold")[0]["intent"], "remove", "{all:#?}");
+    assert!(ops(&all, "up")[0].get("intent").is_none(), "{all:#?}");
+}
+
+#[test]
+fn a_missing_target_writes_a_missing_op_line() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let gone = fx.repo.join("gone");
+    bale_core::trace::with_intent("remove", || {
+        bale_core::trace::with_trigger("hook:test", || {
+            bale_core::trace::missing(&home, "cold", &gone)
+        })
+    });
+    let all = lines(&home);
+    let cold_ops = ops(&all, "cold");
+    assert_eq!(cold_ops.len(), 1, "{all:#?}");
+    let line = cold_ops[0];
+    assert_eq!(line["outcome"], "missing");
+    assert_eq!(line["reason"], "missing");
+    assert_eq!(line["intent"], "remove");
+    assert_eq!(line["trigger"], "hook:test");
+    assert_eq!(line["path"], gone.to_string_lossy().as_ref());
+    assert!(line["id"].is_null(), "{line}");
+}
+
+#[test]
+fn a_long_path_is_clipped_to_keep_the_line_small() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = fx.add_worktree("a", "a");
+    let id = register(&home, &wt).unwrap().id;
+    let registry = Registry::open(home.clone());
+    let mut record = registry.get(&id).unwrap().unwrap();
+    record.path = PathBuf::from(format!("/{}", "p".repeat(5 * 1024)));
+    record.repo_common_dir = PathBuf::from(format!("/{}", "r".repeat(5 * 1024)));
+    registry.put(&record).unwrap();
+
+    sweep(&home, false).unwrap();
+
+    for entry in fs::read_dir(home.trace_dir()).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+            for l in fs::read_to_string(entry.path()).unwrap().lines() {
+                assert!(l.len() < 4096, "a line of {} bytes", l.len());
+            }
+        }
+    }
+    let all = lines(&home);
+    let trees = of_kind(&all, "tree");
+    assert_eq!(trees.len(), 1, "{all:#?}");
+    let t = trees[0];
+    assert!(t["path"].as_str().unwrap().ends_with('…'), "{t}");
+    assert!(t["repo"].as_str().unwrap().ends_with('…'), "{t}");
+    assert_eq!(t["clipped"], true, "{t}");
+}
+
+#[test]
+fn up_records_build_logs_before_removing_derived_data() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = xcode_worktree(&fx);
+    // Ignored, so up may remove it.
+    let exclude = fx.repo.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "/DD/\n").unwrap();
+    let id = register(&home, &wt).unwrap().id;
+    assert_eq!(
+        up(&home, &id).unwrap(),
+        Outcome::Done(bale_core::registry::Level::Baled)
+    );
+    assert!(!exists(&wt.join("DD")), "DerivedData is still there");
+    let all = lines(&home);
+    let builds = of_kind(&all, "build");
+    assert_eq!(builds.len(), 2, "{all:#?}");
+    assert!(builds.iter().all(|b| b["tree_id"] == id.as_str()));
 }

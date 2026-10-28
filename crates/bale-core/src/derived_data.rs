@@ -45,3 +45,27 @@ pub(crate) fn is_derived_data_root(dir: &Path) -> bool {
     let has_build = fs::symlink_metadata(dir.join("Build")).is_ok_and(|m| m.file_type().is_dir());
     is_file && has_build && workspace_path(&plist).is_some()
 }
+
+/// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
+pub(crate) fn global_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
+}
+
+/// The folders in Xcode's shared DerivedData built from the tree at `root`.
+pub(crate) fn global_for(root: &Path) -> Vec<PathBuf> {
+    global_root()
+        .map(|g| derived_data_for(root, &g))
+        .unwrap_or_default()
+}
+
+/// Every Xcode DerivedData root that belongs to the tree at `root`: the
+/// in-tree ones among its regenerable `regen` dirs, then the shared ones.
+pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = regen
+        .iter()
+        .filter(|d| is_derived_data_root(d))
+        .cloned()
+        .collect();
+    roots.extend(global_for(root));
+    roots
+}

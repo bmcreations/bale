@@ -16,7 +16,7 @@ use crate::ops::cold::{hex, sha_file, SavedFile, FILES};
 use crate::ops::disk::{
     apply_manifest, checkout_wip, ensure_checkout, file_mode, read_manifest, Manifest,
 };
-use crate::ops::up::{remove_entry, Outcome};
+use crate::ops::up::{remove_entry, Outcome, SkipCode, SkipReason};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
 
@@ -49,7 +49,10 @@ pub fn open(home: &BaleHome, id: &str) -> Result<OpenReport> {
 
 fn open_untraced(home: &BaleHome, id: &str) -> Result<OpenReport> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(OpenReport::plain(Outcome::Skipped("locked".into())));
+        return Ok(OpenReport::plain(Outcome::Skipped(SkipReason::new(
+            SkipCode::Locked,
+            "locked",
+        ))));
     };
     let registry = Registry::open(home.clone());
     let Some(mut record) = registry.get(id)? else {

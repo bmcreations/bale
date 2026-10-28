@@ -24,7 +24,96 @@ const DD_NOTE: &str = "DerivedData not removed: ";
 pub enum Outcome {
     Done(Level),
     Busy(Vec<Holder>),
-    Skipped(String),
+    Skipped(SkipReason),
+}
+
+/// Why an operation left a tree alone, by kind. The usage trace records
+/// only this, never the reason's text, which can name paths in the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipCode {
+    /// Another bale process holds the workspace lock.
+    Locked,
+    /// The tree is already cold.
+    Cold,
+    /// A `bale open` was left half done.
+    Opening,
+    /// The tree has uncommitted changes (`cold_if_clean`).
+    Dirty,
+    /// Someone other than bale locked the git worktree.
+    WorktreeLocked,
+    /// What is at the record's path is not the worktree's checkout.
+    IdentityMismatch,
+    SparseCheckout,
+    /// Assume-unchanged or skip-worktree index entries.
+    HiddenEntries,
+    /// A submodule holds changes or files the save would not keep.
+    Submodule,
+    NestedRepo,
+    /// A file's extended attributes, flags or ACL can't be saved.
+    DirtyXattr,
+    /// `open` would not give the tree back as it is.
+    NotRestorable,
+    /// Too little free space to check the save.
+    FreeSpace,
+    /// A dir the checks must read can't be read.
+    Unreadable,
+}
+
+impl SkipCode {
+    /// The code as the trace writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            SkipCode::Locked => "locked",
+            SkipCode::Cold => "cold",
+            SkipCode::Opening => "opening",
+            SkipCode::Dirty => "dirty",
+            SkipCode::WorktreeLocked => "worktree_locked",
+            SkipCode::IdentityMismatch => "identity_mismatch",
+            SkipCode::SparseCheckout => "sparse_checkout",
+            SkipCode::HiddenEntries => "hidden_entries",
+            SkipCode::Submodule => "submodule",
+            SkipCode::NestedRepo => "nested_repo",
+            SkipCode::DirtyXattr => "dirty_xattr",
+            SkipCode::NotRestorable => "not_restorable",
+            SkipCode::FreeSpace => "free_space",
+            SkipCode::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// A skip's kind and the text shown to the user. Derefs to the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipReason {
+    pub code: SkipCode,
+    pub text: String,
+}
+
+impl SkipReason {
+    pub fn new(code: SkipCode, text: impl Into<String>) -> SkipReason {
+        SkipReason {
+            code,
+            text: text.into(),
+        }
+    }
+}
+
+impl std::ops::Deref for SkipReason {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<str> for SkipReason {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
 }
 
 /// Creates a `Hot` record for a linked worktree, or refreshes an existing
@@ -174,7 +263,10 @@ pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
 pub fn up_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     crate::trace::op(home, "up", Some(id), || {
         let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-            return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
+            return Ok(UpReport::plain(Outcome::Skipped(SkipReason::new(
+                SkipCode::Locked,
+                "locked",
+            ))));
         };
         up_locked_report(home, id, &[])
     })
@@ -194,23 +286,27 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
     let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
 
-    let skip = |reason: &str| Ok(UpReport::plain(Outcome::Skipped(reason.into())));
+    let skip = |code: SkipCode, reason: &str| {
+        Ok(UpReport::plain(Outcome::Skipped(SkipReason::new(
+            code, reason,
+        ))))
+    };
     let mut kept = Vec::new();
     match record.level {
-        Level::Cooling | Level::Cold => return skip("cold"),
-        Level::Opening => return skip(OPENING),
+        Level::Cooling | Level::Cold => return skip(SkipCode::Cold, "cold"),
+        Level::Opening => return skip(SkipCode::Opening, OPENING),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
             // A folder recreated at the path is not this worktree: git there
             // may fall back to an enclosing repo, so remove nothing from it.
             if let Err(e) = super::disk::ensure_checkout(&root, &record.admin_dir) {
-                return skip(&format!(
-                    "{} is not the worktree's checkout: {e:#}",
-                    root.display()
-                ));
+                return skip(
+                    SkipCode::IdentityMismatch,
+                    &format!("{} is not the worktree's checkout: {e:#}", root.display()),
+                );
             }
             if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
-                return skip(&reason);
+                return skip(SkipCode::WorktreeLocked, &reason);
             }
             let holders = busy_holders(&root, ignore)?;
             if !holders.is_empty() {
@@ -218,6 +314,8 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
             }
             let (dirs, real) = bale_able(home, &root)?;
             kept = real;
+            // Xcode's build logs go with its DerivedData; record them first.
+            crate::trace::harvest(home, id, &crate::derived_data::all_for(&root, &dirs));
             let moves = trash_names(&dirs);
             record.trash = moves.iter().map(|(_, to)| to.clone()).collect();
             record.level = Level::Baling;

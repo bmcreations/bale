@@ -1826,3 +1826,87 @@ fn cli_ops_are_traced_with_the_cli_trigger() {
     assert_eq!(ops[0]["trigger"], "cli");
     assert_eq!(ops[0]["outcome"], "ok");
 }
+
+/// Every parsed line of every trace file under the env's BALE_HOME.
+fn trace_lines(env: &Env) -> Vec<Value> {
+    let Ok(dir) = fs::read_dir(env.bale_home().join("trace")) else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .flat_map(|e| {
+            fs::read_to_string(e.path())
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn sweep_sizes_global_derived_data_apart_from_the_tree() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Xcode's shared DerivedData for a project inside the tree.
+    let dd = env
+        .home()
+        .join("Library/Developer/Xcode/DerivedData/App-abc");
+    fs::create_dir_all(dd.join("Build/Products")).unwrap();
+    fs::write(dd.join("Build/Products/out.bin"), vec![7u8; 300_000]).unwrap();
+    // Xcode records the project's real path, which exists.
+    fs::create_dir(wt.join("App.xcodeproj")).unwrap();
+    let workspace = wt
+        .join("App.xcodeproj")
+        .to_string_lossy()
+        .replace('&', "&amp;");
+    fs::write(
+        dd.join("info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>{workspace}</string></dict></plist>\n"
+        ),
+    )
+    .unwrap();
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let all = trace_lines(&env);
+    let tree = all.iter().find(|v| v["kind"] == "tree").unwrap();
+    assert!(
+        tree["global_dd_bytes"].as_u64().unwrap() >= 300_000,
+        "{tree}"
+    );
+    // The checkout itself holds one small file.
+    assert!(tree["tree_bytes"].as_u64().unwrap() < 300_000, "{tree}");
+    assert!(tree["regen_bytes"].as_u64().unwrap() < 300_000, "{tree}");
+}
+
+#[test]
+fn remove_hook_ops_carry_the_remove_intent() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let input = payload("worktree_remove.json", &[("worktree_path", &wt)]);
+    let out = env.bale(&env.repo, &["hook", "claude", "remove"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Already gone.
+    let out = env.bale(&env.repo, &["hook", "claude", "remove"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let all = trace_lines(&env);
+    let colds: Vec<&Value> = all
+        .iter()
+        .filter(|v| v["kind"] == "op" && v["op"] == "cold")
+        .collect();
+    assert_eq!(colds.len(), 2, "{all:#?}");
+    assert!(colds.iter().all(|v| v["intent"] == "remove"), "{all:#?}");
+    assert!(
+        colds.iter().all(|v| v["trigger"] == "hook:claude"),
+        "{all:#?}"
+    );
+    assert!(colds.iter().any(|v| v["outcome"] == "ok"), "{all:#?}");
+    let missing = colds.iter().find(|v| v["outcome"] == "missing").unwrap();
+    assert_eq!(missing["path"], wt.to_string_lossy().as_ref());
+}

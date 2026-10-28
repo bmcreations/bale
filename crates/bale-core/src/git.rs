@@ -83,15 +83,37 @@ impl Git {
                 attempt += 1;
                 continue;
             }
-            bail!(
-                "git {} failed in {}: {}",
-                args.join(" "),
-                self.dir.display(),
-                stderr.trim()
-            );
+            return Err(GitError::new(args, &self.dir, &stderr).into());
         }
     }
 }
+
+/// A git command that exited with failure.
+#[derive(Debug)]
+pub struct GitError {
+    message: String,
+}
+
+impl GitError {
+    fn new(args: &[&str], dir: &Path, stderr: &str) -> GitError {
+        GitError {
+            message: format!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                dir.display(),
+                stderr.trim()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GitError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -171,12 +193,7 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     if !out.status.success() {
-        bail!(
-            "git {} failed in {}: {}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(GitError::new(&args, dir, &String::from_utf8_lossy(&out.stderr)).into());
     }
     let full = String::from_utf8_lossy(&out.stdout);
     let full = full.trim_end_matches(['\n', '\r']);

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::Map;
 
 use crate::config::{load_config, Config};
-use crate::derived_data::{derived_data_for, is_derived_data_root};
+use crate::derived_data::{all_for, global_for};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
@@ -17,7 +17,7 @@ use crate::ops::cold::cold_if_clean;
 use crate::ops::up::{bale_able_from, up_report, Outcome};
 use crate::par::par_map;
 use crate::registry::{Level, Record, Registry};
-use crate::trace::BuildLog;
+use crate::trace::{put_clipped, BuildLog, MAX_ID, MAX_PATH};
 use crate::BaleHome;
 
 /// Report text for a record `bale open` left half done; `sweep` puts the
@@ -104,7 +104,7 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     if dry_run {
         fields.insert("dry_run".into(), true.into());
     }
-    fields.insert("volumes".into(), crate::trace::volumes(&paths).into());
+    fields.insert("volumes".into(), crate::trace::volumes(home, &paths).into());
     fields.insert("duration_ms".into(), millis(start.elapsed()).into());
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
@@ -120,6 +120,9 @@ struct Measured {
     /// `(regen_bytes, tree_bytes)`; `None` for trees not on disk, after an
     /// error, or when cut short.
     sizes: Option<(u64, u64)>,
+    /// Bytes of the folders in Xcode's shared DerivedData built from the
+    /// tree, which `up` also removes on macOS; `None` when not sized.
+    global_dd: Option<u64>,
     truncated: bool,
     sizing_ms: Option<u64>,
     builds: Vec<BuildLog>,
@@ -143,9 +146,14 @@ fn measure(home: &BaleHome, record: &Record) -> Measured {
         Ok(regen) => {
             match bale_able_from(&root, regen.clone()) {
                 Ok((removable, _)) => {
-                    match crate::trace::size_tree(&root, &removable, start + SIZING_LIMIT) {
+                    let deadline = start + SIZING_LIMIT;
+                    match crate::trace::size_tree(&root, &removable, deadline) {
                         Some((tree, in_regen)) => m.sizes = Some((in_regen, tree)),
                         None => m.truncated = true,
+                    }
+                    if m.sizes.is_some() {
+                        m.global_dd = global_dd_bytes(&root, deadline);
+                        m.truncated = m.global_dd.is_none();
                     }
                     m.sizing_ms = Some(millis(start.elapsed()));
                 }
@@ -158,21 +166,20 @@ fn measure(home: &BaleHome, record: &Record) -> Measured {
     m
 }
 
-/// The build logs of every Xcode DerivedData root that belongs to the tree:
-/// the in-tree ones among `regen` and the global ones whose `WorkspacePath`
-/// lies in it.
-fn build_logs_for(root: &Path, regen: &[PathBuf]) -> Vec<BuildLog> {
-    let mut roots: Vec<PathBuf> = regen
-        .iter()
-        .filter(|d| is_derived_data_root(d))
-        .cloned()
-        .collect();
-    if let Some(home_dir) = dirs::home_dir() {
-        let global = home_dir.join("Library/Developer/Xcode/DerivedData");
-        roots.extend(derived_data_for(root, &global));
+/// Total size of the shared DerivedData folders built from the tree at
+/// `root`, or `None` when the walk passes `deadline`.
+fn global_dd_bytes(root: &Path, deadline: Instant) -> Option<u64> {
+    let mut total = 0;
+    for dd in global_for(root) {
+        total += crate::trace::size_tree(&dd, &[], deadline)?.0;
     }
+    Some(total)
+}
+
+/// The build logs of every Xcode DerivedData root that belongs to the tree.
+fn build_logs_for(root: &Path, regen: &[PathBuf]) -> Vec<BuildLog> {
     let mut out = Vec::new();
-    for dd in roots {
+    for dd in all_for(root, regen) {
         match crate::trace::build_logs(&dd) {
             Ok(logs) => out.extend(logs),
             Err(e) => crate::trace::warn(&e),
@@ -202,18 +209,24 @@ fn trace_tree(
     };
     let mut f = Map::new();
     f.insert("id".into(), record.id.clone().into());
-    f.insert("path".into(), record.path.to_string_lossy().into());
-    f.insert(
-        "repo".into(),
-        record.repo_common_dir.to_string_lossy().into(),
-    );
+    let path = record.path.to_string_lossy();
+    put_clipped(&mut f, "path", Some(&path), MAX_PATH);
+    let repo = record.repo_common_dir.to_string_lossy();
+    put_clipped(&mut f, "repo", Some(&repo), MAX_PATH);
     f.insert("level".into(), record.level.name().into());
     f.insert("pinned".into(), record.pinned.into());
     let origin = record.origin.as_ref();
-    f.insert("origin_tool".into(), origin.map(|o| o.tool.clone()).into());
-    f.insert(
-        "session_id".into(),
-        origin.map(|o| o.session.clone()).into(),
+    put_clipped(
+        &mut f,
+        "origin_tool",
+        origin.map(|o| o.tool.as_str()),
+        MAX_ID,
+    );
+    put_clipped(
+        &mut f,
+        "session_id",
+        origin.map(|o| o.session.as_str()),
+        MAX_ID,
     );
     f.insert(
         "last_source_edit".into(),
@@ -221,6 +234,7 @@ fn trace_tree(
     );
     f.insert("regen_bytes".into(), m.sizes.map(|s| s.0).into());
     f.insert("tree_bytes".into(), m.sizes.map(|s| s.1).into());
+    f.insert("global_dd_bytes".into(), m.global_dd.into());
     if m.truncated {
         f.insert("sizing_truncated".into(), true.into());
     }

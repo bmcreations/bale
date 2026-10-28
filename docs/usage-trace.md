@@ -3,20 +3,28 @@
 bale keeps a local log of how your worktrees are used, so a benchmark can
 replay it later. It records:
 
-- each `bale sweep` run: free and total space of every volume holding a
-  registered tree, and how long the run took;
+- each `bale sweep` run: free and total space of the volume holding
+  bale's state and of every volume holding a registered tree, and how long
+  the run took;
 - each registered tree on every sweep: its id, path, repo, level, pin,
   the tool and session that made it, its last source edit, the space its
-  build output and checkout take on disk, and what sweep decided;
+  checkout and its build output take on disk, the space of Xcode's shared
+  DerivedData built from it (`global_dd_bytes`, which `bale up` also
+  removes on macOS), and what sweep decided;
 - each operation (`new`, `adopt`, `up`, `cold`, `open`, `gc`): its outcome,
-  how long it took, what started it (`cli`, `sweep` or a tool's hook), and
-  for `up` and `cold` the free space gained;
+  a fixed reason code when it did not succeed, how long it took, what
+  started it (`cli`, `sweep` or a tool's hook), and for `up` and `cold` the
+  free space gained. A `cold` run by a tool's remove or archive hook also
+  carries `"intent": "remove"`, and a tree that was already gone is
+  recorded with outcome `missing`;
 - each Xcode build found in a tree's DerivedData build log manifest: start,
-  stop, duration, error count and title, once per build. Gradle builds are
-  not recorded.
+  stop, duration, error count and title, once per build. Manifests are
+  read on every sweep and by `bale up` and `bale cold` before they remove
+  DerivedData. Gradle builds are not recorded.
 
 No file contents are recorded, and the only paths are tree paths and repo
-git dirs.
+git dirs. Paths and ids longer than the trace allows are cut, and the line
+is marked `"clipped": true`.
 
 The trace lives in `$BALE_HOME/trace/` (`~/.bale/trace/` by default), one
 JSON-lines file per UTC day. `bale trace path` prints the directory. Files

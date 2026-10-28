@@ -2,7 +2,7 @@ mod support;
 
 use bale_core::derived_data::derived_data_for;
 use bale_core::git::worktrees;
-use bale_core::ops::up::{register, up, up_report, Outcome};
+use bale_core::ops::up::{register, up, up_report, Outcome, SkipCode, SkipReason};
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -207,7 +207,10 @@ fn user_locked_tree_is_skipped_untouched() {
         let id = register(&fx.home(), &wt).unwrap().id;
         lock(&fx, &wt, reason);
         let out = up(&fx.home(), &id).unwrap();
-        assert_eq!(out, Outcome::Skipped(want.into()));
+        assert_eq!(
+            out,
+            Outcome::Skipped(SkipReason::new(SkipCode::WorktreeLocked, want))
+        );
         assert!(wt.join("app/build/big.bin").exists());
         assert_eq!(level(&fx, &id), Level::Hot);
         assert_eq!(linked_lock(&fx).as_deref(), Some(reason.unwrap_or("")));

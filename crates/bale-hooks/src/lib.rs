@@ -145,7 +145,9 @@ pub fn display_path(path: &Path) -> String {
 /// no longer exists, 3 busy, 4 skipped, 1 error (as `bale cold`); a tree
 /// still there after a clean cold exits 1.
 pub fn remove_tree(home: &BaleHome, path: &Path, tool: Tool) -> ExitCode {
-    as_hook(tool, || remove_tree_untraced(home, path, tool))
+    as_hook(tool, || {
+        bale_core::trace::with_intent("remove", || remove_tree_untraced(home, path, tool))
+    })
 }
 
 /// Runs `f` with core's usage trace naming the trigger `hook:<tool>`.
@@ -155,6 +157,7 @@ pub(crate) fn as_hook<R>(tool: Tool, f: impl FnOnce() -> R) -> R {
 
 fn remove_tree_untraced(home: &BaleHome, path: &Path, tool: Tool) -> ExitCode {
     if fs::symlink_metadata(path).is_err() {
+        bale_core::trace::missing(home, "cold", path);
         return ExitCode::SUCCESS;
     }
     // Keep this process's cwd out of the tree.

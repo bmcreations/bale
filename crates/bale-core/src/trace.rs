@@ -18,7 +18,6 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use walkdir::WalkDir;
 
-use crate::busy::Holder;
 use crate::ops::disk::{free_space, total_space};
 use crate::ops::gc::GcReport;
 use crate::ops::open::OpenReport;
@@ -35,36 +34,65 @@ const MAX_LINE: usize = 4096;
 pub const KEEP_DAYS: i64 = 60;
 /// Free text (reasons, build titles) is cut to this many bytes.
 const MAX_TEXT: usize = 256;
+/// Paths are cut to this many bytes as JSON, so a line with two of them,
+/// two ids and its other fields stays below [`MAX_LINE`].
+pub(crate) const MAX_PATH: usize = 1024;
+/// Session ids and tool names are cut to this many bytes as JSON.
+pub(crate) const MAX_ID: usize = 256;
+/// Apple timestamps past this many seconds after the Unix epoch (about the
+/// year 5138) are treated as corrupt.
+const MAX_UNIX_SECS: f64 = 1e11;
 /// Seconds from the Unix epoch to Apple's reference date, 2001-01-01.
 const APPLE_EPOCH: f64 = 978_307_200.0;
 /// The ids of build logs already recorded, one `<id>\t<YYYY-MM-DD>` per line.
 const SEEN_BUILDS: &str = "seen-builds";
 
+type LocalSlot = std::thread::LocalKey<RefCell<Option<String>>>;
+
 thread_local! {
     static TRIGGER: RefCell<Option<String>> = const { RefCell::new(None) };
+    static INTENT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Runs `f` with `value` set in `key` on this thread, restoring the previous
+/// value afterwards (also on panic).
+fn scoped<R>(key: &'static LocalSlot, value: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(&'static LocalSlot, Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.1.take();
+            self.0.with(|t| *t.borrow_mut() = prev);
+        }
+    }
+    let prev = key.with(|t| t.borrow_mut().replace(value.to_string()));
+    let _restore = Restore(key, prev);
+    f()
+}
 
 /// Runs `f` with `trigger` recorded on every `op` line it writes on this
 /// thread: `cli`, `sweep` or `hook:<name>`, as the caller names it. The
 /// previous trigger is restored afterwards, so an inner call overrides an
 /// outer one only for its own extent.
 pub fn with_trigger<R>(trigger: &str, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<String>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let prev = self.0.take();
-            TRIGGER.with(|t| *t.borrow_mut() = prev);
-        }
-    }
-    let prev = TRIGGER.with(|t| t.borrow_mut().replace(trigger.to_string()));
-    let _restore = Restore(prev);
-    f()
+    scoped(&TRIGGER, trigger, f)
+}
+
+/// Runs `f` with `intent` recorded on every `op` line it writes on this
+/// thread, scoped as [`with_trigger`]. A caller that colds a tree because
+/// its tool is deleting it passes `remove`, so a replay can tell that from
+/// an idle cold.
+pub fn with_intent<R>(intent: &str, f: impl FnOnce() -> R) -> R {
+    scoped(&INTENT, intent, f)
 }
 
 fn trigger() -> Option<String> {
     TRIGGER.with(|t| t.borrow().clone())
+}
+
+fn intent() -> Option<String> {
+    INTENT.with(|t| t.borrow().clone())
 }
 
 /// Reports a trace failure: the run's one warning, the first time only.
@@ -115,6 +143,51 @@ pub(crate) fn clip(text: &str) -> String {
         end -= 1;
     }
     text[..end].to_string()
+}
+
+/// `text` cut so its JSON string form (quotes aside) takes at most `max`
+/// bytes, with `…` in place of what was cut; and whether anything was.
+/// Characters JSON escapes count at their escaped size.
+pub(crate) fn clip_field(text: &str, max: usize) -> (String, bool) {
+    let width = |c: char| match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    };
+    if text.chars().map(width).sum::<usize>() <= max {
+        return (text.to_string(), false);
+    }
+    let room = max.saturating_sub('…'.len_utf8());
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        used += width(c);
+        if used > room {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    (out, true)
+}
+
+/// Inserts `text` as `key`, clipped to `max` (see [`clip_field`]); a clip
+/// sets `"clipped": true` on the line.
+pub(crate) fn put_clipped(
+    fields: &mut Map<String, Value>,
+    key: &str,
+    text: Option<&str>,
+    max: usize,
+) {
+    let Some(text) = text else {
+        fields.insert(key.into(), Value::Null);
+        return;
+    };
+    let (text, clipped) = clip_field(text, max);
+    fields.insert(key.into(), text.into());
+    if clipped {
+        fields.insert("clipped".into(), true.into());
+    }
 }
 
 fn ms(d: Duration) -> u64 {
@@ -190,10 +263,14 @@ pub fn rfc3339(t: SystemTime) -> String {
     )
 }
 
-/// An Apple reference-date timestamp as a `SystemTime`.
+/// An Apple reference-date timestamp as a `SystemTime`; `None` when it is
+/// not finite, before 1970, or implausibly far ahead.
 fn from_apple(secs: f64) -> Option<SystemTime> {
     let unix = secs + APPLE_EPOCH;
-    (unix.is_finite() && unix >= 0.0).then(|| UNIX_EPOCH + Duration::from_secs_f64(unix))
+    if !(unix.is_finite() && (0.0..MAX_UNIX_SECS).contains(&unix)) {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(unix).ok()?)
 }
 
 /// Deletes trace files whose UTC day is more than [`KEEP_DAYS`] before
@@ -252,37 +329,30 @@ pub(crate) trait Traced {
     fn traced_id(&self) -> Option<&str> {
         None
     }
-    /// `(outcome, reason)`.
-    fn traced_outcome(&self) -> (&'static str, Option<String>);
+    /// `(outcome, reason code)`. The code is one of a fixed set, never
+    /// text from the operation, which can name paths inside the tree.
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>);
 }
 
 impl Traced for Outcome {
-    fn traced_outcome(&self) -> (&'static str, Option<String>) {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         match self {
             Outcome::Done(_) => ("ok", None),
-            Outcome::Busy(holders) => ("busy", busy_reason(holders)),
-            Outcome::Skipped(reason) => ("skipped", Some(clip(reason))),
+            Outcome::Busy(holders) if holders.is_empty() => ("busy", Some("changed")),
+            Outcome::Busy(_) => ("busy", Some("busy")),
+            Outcome::Skipped(reason) => ("skipped", Some(reason.code.name())),
         }
     }
 }
 
-/// The holders' commands, without their paths; `None` when cold's empty
-/// `Busy` says the tree changed instead.
-fn busy_reason(holders: &[Holder]) -> Option<String> {
-    let mut names: Vec<&str> = holders.iter().map(|h| h.command.as_str()).collect();
-    names.sort_unstable();
-    names.dedup();
-    (!names.is_empty()).then(|| clip(&names.join(", ")))
-}
-
 impl Traced for UpReport {
-    fn traced_outcome(&self) -> (&'static str, Option<String>) {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         self.outcome.traced_outcome()
     }
 }
 
 impl Traced for OpenReport {
-    fn traced_outcome(&self) -> (&'static str, Option<String>) {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         self.outcome.traced_outcome()
     }
 }
@@ -291,18 +361,35 @@ impl Traced for Record {
     fn traced_id(&self) -> Option<&str> {
         Some(&self.id)
     }
-    fn traced_outcome(&self) -> (&'static str, Option<String>) {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         ("ok", None)
     }
 }
 
 impl Traced for GcReport {
-    fn traced_outcome(&self) -> (&'static str, Option<String>) {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         match self.errors.len() {
             0 => ("ok", None),
-            n => ("error", Some(format!("{n} records not checked"))),
+            _ => ("error", Some("partial")),
         }
     }
+}
+
+/// The reason code for a failed operation, by the type of error in its
+/// chain: `git_error`, `missing` (a path not found), `io_error`, `other`.
+fn error_code(e: &anyhow::Error) -> &'static str {
+    for cause in e.chain() {
+        if cause.is::<crate::git::GitError>() {
+            return "git_error";
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::NotFound => "missing",
+                _ => "io_error",
+            };
+        }
+    }
+    "other"
 }
 
 /// Runs core operation `op` and appends its `op` line. For `up` and `cold`
@@ -331,7 +418,7 @@ pub(crate) fn op<T: Traced>(
             let (o, why) = r.traced_outcome();
             (o, why, r.traced_id().or(id))
         }
-        Err(e) => ("error", Some(clip(&e.root_cause().to_string())), id),
+        Err(e) => ("error", Some(error_code(e)), id),
     };
     fields.insert("id".into(), id.into());
     fields.insert("outcome".into(), outcome.into());
@@ -339,7 +426,7 @@ pub(crate) fn op<T: Traced>(
         fields.insert("reason".into(), reason.into());
     }
     fields.insert("duration_ms".into(), ms(duration).into());
-    fields.insert("trigger".into(), trigger().into());
+    insert_context(&mut fields);
     if probe.is_some() {
         let freed = before
             .zip(after)
@@ -349,6 +436,40 @@ pub(crate) fn op<T: Traced>(
     }
     emit(home, "op", fields);
     result
+}
+
+/// Adds the caller's `trigger` and, when set, its `intent`, scoped to the
+/// trace's own length limits.
+fn insert_context(fields: &mut Map<String, Value>) {
+    put_clipped(fields, "trigger", trigger().as_deref(), MAX_ID);
+    if let Some(intent) = intent() {
+        put_clipped(fields, "intent", Some(&intent), MAX_ID);
+    }
+}
+
+/// Writes the `op` line for an operation whose target was gone before it
+/// could run: outcome and reason `missing`, the target's `path`, and its
+/// id when a record for that path exists. Best-effort.
+pub fn missing(home: &BaleHome, op: &str, path: &Path) {
+    let id = std::path::absolute(path)
+        .ok()
+        .map(|p| crate::registry::workspace_id(&p))
+        .filter(|id| {
+            Registry::open(home.clone())
+                .get(id)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+    let mut fields = Map::new();
+    fields.insert("op".into(), op.into());
+    fields.insert("id".into(), id.into());
+    put_clipped(&mut fields, "path", Some(&path.to_string_lossy()), MAX_PATH);
+    fields.insert("outcome".into(), "missing".into());
+    fields.insert("reason".into(), "missing".into());
+    fields.insert("duration_ms".into(), 0.into());
+    insert_context(&mut fields);
+    emit(home, "op", fields);
 }
 
 /// An existing dir on the volume of `id`'s tree that outlives `cold`: the
@@ -398,21 +519,14 @@ pub(crate) fn size_tree(root: &Path, regen: &[PathBuf], deadline: Instant) -> Op
     Some((tree, in_regen))
 }
 
-/// A volume key and the mount point (Unix) or path root (elsewhere) of the
-/// volume holding `path`, which must exist.
-fn volume_of(path: &Path) -> Option<(String, PathBuf)> {
+/// A key for the volume holding `path`, which must exist, that stays the
+/// same across runs: `dev:<st_dev>` on Unix, the path's prefix (such as
+/// `c:`) elsewhere.
+fn volume_key(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let dev = fs::metadata(path).ok()?.dev();
-        let mut mount = path.to_path_buf();
-        while let Some(parent) = mount.parent() {
-            match fs::metadata(parent) {
-                Ok(m) if m.dev() == dev => mount = parent.to_path_buf(),
-                _ => break,
-            }
-        }
-        Some((dev.to_string(), mount))
+        Some(format!("dev:{}", fs::metadata(path).ok()?.dev()))
     }
     #[cfg(not(unix))]
     {
@@ -425,34 +539,51 @@ fn volume_of(path: &Path) -> Option<(String, PathBuf)> {
                 )
             })
             .collect();
-        Some((root.to_string_lossy().to_lowercase(), root))
+        Some(root.to_string_lossy().to_lowercase())
     }
 }
 
-/// `volumes` for the `sweep` line: free and total bytes of each distinct
-/// volume holding one of `paths` (or, for a tree that is gone, its nearest
-/// existing ancestor).
-pub(crate) fn volumes(paths: &[PathBuf]) -> Vec<Value> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in paths {
+/// At most this many volumes are listed on a `sweep` line.
+const MAX_VOLUMES: usize = 8;
+/// A volume's `sample_path` is cut to this many bytes as JSON.
+const MAX_SAMPLE: usize = 256;
+
+/// `volumes` for the `sweep` line: free and total bytes of the volume
+/// holding the state home and of each distinct volume holding one of
+/// `paths` (or, for a tree that is gone, its nearest existing ancestor).
+/// Each has a stable `key` and, for people reading the trace, the first
+/// tree path on it as `sample_path` (null for a volume with no tree).
+pub(crate) fn volumes(home: &BaleHome, paths: &[PathBuf]) -> Vec<Value> {
+    let mut found: Vec<(String, PathBuf, Option<&PathBuf>)> = Vec::new();
+    let candidates = std::iter::once((&home.0, None)).chain(paths.iter().map(|p| (p, Some(p))));
+    for (path, tree) in candidates {
         let Some(existing) = existing_ancestor(path) else {
             continue;
         };
-        let Some((key, mount)) = volume_of(&existing) else {
+        let Some(key) = volume_key(&existing) else {
             continue;
         };
-        if !seen.insert(key) {
-            continue;
+        match found.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, _, sample)) => {
+                if sample.is_none() {
+                    *sample = tree;
+                }
+            }
+            None => found.push((key, existing, tree)),
         }
-        let free = free_space(&mount);
-        let total = total_space(&mount);
-        match (free, total) {
-            (Ok(free), Ok(total)) => out.push(json!({
-                "mount_or_root": mount.to_string_lossy(),
-                "free_bytes": free,
-                "total_bytes": total,
-            })),
+    }
+    let mut out = Vec::new();
+    for (key, probe, sample) in found.into_iter().take(MAX_VOLUMES) {
+        match (free_space(&probe), total_space(&probe)) {
+            (Ok(free), Ok(total)) => {
+                let mut v = Map::new();
+                v.insert("key".into(), key.into());
+                let sample = sample.map(|p| p.to_string_lossy());
+                put_clipped(&mut v, "sample_path", sample.as_deref(), MAX_SAMPLE);
+                v.insert("free_bytes".into(), free.into());
+                v.insert("total_bytes".into(), total.into());
+                out.push(Value::Object(v));
+            }
             (Err(e), _) | (_, Err(e)) => warn(&e),
         }
     }
@@ -528,6 +659,18 @@ fn record_builds_inner(
     logs: &[(String, BuildLog)],
     now: SystemTime,
 ) -> Result<()> {
+    record_builds_with(home, logs, now, |fields| append(home, now, "build", fields))
+}
+
+/// [`record_builds`] with `write` appending each line. Each id goes into
+/// `seen-builds` right after its line is written, so a failure partway
+/// does not lead the next run to write the earlier lines again.
+fn record_builds_with(
+    home: &BaleHome,
+    logs: &[(String, BuildLog)],
+    now: SystemTime,
+    mut write: impl FnMut(Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     let dir = home.trace_dir();
     let seen_path = dir.join(SEEN_BUILDS);
     let mut seen: HashSet<String> = match fs::read_to_string(&seen_path) {
@@ -540,7 +683,6 @@ fn record_builds_inner(
     };
     let oldest = now - Duration::from_secs(KEEP_DAYS as u64 * 86_400);
     let today = utc_date(now);
-    let mut new_ids = String::new();
     for (tree_id, log) in logs {
         if seen.contains(&log.log_id) || log.log_id.contains(['\n', '\t']) {
             continue;
@@ -550,7 +692,12 @@ fn record_builds_inner(
         if stopped.or(started).is_some_and(|t| t < oldest) {
             continue;
         }
-        let duration = log.started.zip(log.stopped).map(|(a, b)| b - a);
+        let duration = started.zip(stopped).and_then(|(a, b)| {
+            log.started
+                .zip(log.stopped)
+                .map(|(x, y)| y - x)
+                .filter(|_| b >= a)
+        });
         let fields = json!({
             "tree_id": tree_id,
             "log_id": clip(&log.log_id),
@@ -563,20 +710,31 @@ fn record_builds_inner(
         let Value::Object(fields) = fields else {
             unreachable!()
         };
-        append(home, now, "build", fields)?;
+        write(fields)?;
         seen.insert(log.log_id.clone());
-        new_ids.push_str(&format!("{}\t{today}\n", log.log_id));
-    }
-    if !new_ids.is_empty() {
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&seen_path)
             .with_context(|| format!("opening {}", seen_path.display()))?;
-        file.write_all(new_ids.as_bytes())
+        file.write_all(format!("{}\t{today}\n", log.log_id).as_bytes())
             .with_context(|| format!("writing {}", seen_path.display()))?;
     }
     Ok(())
+}
+
+/// Records the build logs of the Xcode DerivedData `roots` as `tree_id`'s,
+/// as sweep does, so builds are not lost when an operation is about to
+/// remove the roots. Best-effort.
+pub(crate) fn harvest(home: &BaleHome, tree_id: &str, roots: &[PathBuf]) {
+    let mut logs = Vec::new();
+    for dd in roots {
+        match build_logs(dd) {
+            Ok(found) => logs.extend(found.into_iter().map(|b| (tree_id.to_string(), b))),
+            Err(e) => warn(&e),
+        }
+    }
+    record_builds(home, &logs, SystemTime::now());
 }
 
 #[cfg(test)]
@@ -621,6 +779,103 @@ mod tests {
             assert_eq!(trigger().as_deref(), Some("outer"));
         });
         assert_eq!(trigger(), None);
+    }
+
+    #[test]
+    fn out_of_range_apple_times_are_none() {
+        assert_eq!(from_apple(i64::MAX as f64), None);
+        assert_eq!(from_apple(f64::NAN), None);
+        assert_eq!(from_apple(1e19), None);
+        assert_eq!(from_apple(-1e12), None);
+    }
+
+    fn log(id: &str, started: Option<f64>, stopped: Option<f64>) -> (String, BuildLog) {
+        (
+            "tree".into(),
+            BuildLog {
+                log_id: id.into(),
+                started,
+                stopped,
+                errors: None,
+                title: None,
+            },
+        )
+    }
+
+    fn read_lines(home: &BaleHome) -> Vec<Value> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(home.trace_dir()).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+                for l in fs::read_to_string(entry.path()).unwrap().lines() {
+                    out.push(serde_json::from_str(l).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_build_with_bad_timestamps_records_nulls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = BaleHome(tmp.path().to_path_buf());
+        let logs = [
+            log("A", Some(i64::MAX as f64), Some(f64::NAN)),
+            log("B", Some(f64::NAN), Some(i64::MAX as f64)),
+        ];
+        record_builds(&home, &logs, SystemTime::now());
+        let lines = read_lines(&home);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        for l in &lines {
+            assert!(l["started"].is_null() && l["stopped"].is_null(), "{l}");
+            assert!(l["duration_s"].is_null(), "{l}");
+        }
+    }
+
+    #[test]
+    fn builds_written_before_a_failure_are_marked_seen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = BaleHome(tmp.path().to_path_buf());
+        let logs = [
+            log("A", None, None),
+            log("B", None, None),
+            log("C", None, None),
+        ];
+        let mut calls = 0;
+        let result = record_builds_with(&home, &logs, SystemTime::now(), |fields| {
+            calls += 1;
+            if calls == 2 {
+                bail!("disk full");
+            }
+            append(&home, SystemTime::now(), "build", fields)
+        });
+        assert!(result.is_err());
+        let seen = fs::read_to_string(home.trace_dir().join(SEEN_BUILDS)).unwrap();
+        let ids: Vec<&str> = seen.lines().filter_map(|l| l.split('\t').next()).collect();
+        assert_eq!(ids, ["A"]);
+        // The next run writes only what is left.
+        record_builds(&home, &logs, SystemTime::now());
+        let written: Vec<String> = read_lines(&home)
+            .iter()
+            .map(|l| l["log_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(written, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn clip_field_marks_long_values() {
+        let (short, clipped) = clip_field("abc", 10);
+        assert_eq!((short.as_str(), clipped), ("abc", false));
+        let (long, clipped) = clip_field(&"x".repeat(100), 10);
+        assert!(clipped);
+        assert!(long.ends_with('…'));
+        assert!(serde_json::to_string(&long).unwrap().len() <= 10 + 2);
+        // Escaped control characters count at their escaped size.
+        let (ctl, clipped) = clip_field(&"\u{1}".repeat(100), 64);
+        assert!(clipped);
+        assert!(
+            serde_json::to_string(&ctl).unwrap().len() <= 64 + 2,
+            "{ctl:?}"
+        );
     }
 
     #[test]
