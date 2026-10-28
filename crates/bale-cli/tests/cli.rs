@@ -998,3 +998,43 @@ fn cold_keeps_a_submodule_file_hidden_by_global_config() {
     assert!(stdout.contains("dirty submodule: lib"), "{stdout}");
     assert_eq!(fs::read_to_string(wt.join("lib/pre.txt")).unwrap(), "pre\n");
 }
+
+/// A filter that only applies on the worktree's branch (`includeIf
+/// "onbranch:..."` in the global config) must apply when open checks the
+/// tree out, as it did when cold checked the restore.
+#[cfg(unix)]
+#[test]
+fn open_checks_out_under_the_branchs_config() {
+    let env = Env::new();
+    fs::write(
+        env.home().join("rev.inc"),
+        "[filter \"rev\"]\n\tclean = rev\n\tsmudge = rev\n",
+    )
+    .unwrap();
+    fs::write(
+        env.home().join(".gitconfig"),
+        format!(
+            "[includeIf \"onbranch:feat\"]\n\tpath = {}\n",
+            env.home().join("rev.inc").display()
+        ),
+    )
+    .unwrap();
+    fs::write(env.repo.join(".gitattributes"), "*.txt filter=rev\n").unwrap();
+    env.git(&env.repo, &["add", ".gitattributes"]);
+    env.git(&env.repo, &["commit", "-q", "-m", "attrs"]);
+    let wt = env.add_worktree("feat");
+    fs::write(wt.join("notes.txt"), "hello world\n").unwrap();
+    let wt_arg = wt.to_str().unwrap();
+
+    for args in [["up", wt_arg], ["cold", wt_arg]] {
+        let out = env.bale(&env.repo, &args, None);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert!(!wt.exists(), "cold did not go through");
+    let out = env.bale(&env.repo, &["open", wt_arg], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(wt.join("notes.txt")).unwrap(),
+        "hello world\n"
+    );
+}

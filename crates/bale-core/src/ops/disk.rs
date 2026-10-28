@@ -271,6 +271,15 @@ pub(crate) fn apply_manifest(root: &Path, manifest: &Manifest, files_dir: &Path)
     Ok(())
 }
 
+/// Writes the wip tree into `g`'s work tree through git's filters and eol
+/// rules. Cold's check and open both check out with this, with the git
+/// dir's HEAD where cold found it, so they run under the same config
+/// (`includeIf "onbranch:..."` reads HEAD).
+pub(crate) fn checkout_wip(g: &Git, wip: &str) -> Result<()> {
+    g.run(&["read-tree", "-u", "--reset", wip])?;
+    Ok(())
+}
+
 /// Gives the owner full access to every dir under `root` (and `root`), so a
 /// check dir that copied a read-only dir mode can be removed.
 fn loosen(root: &Path) {
@@ -488,11 +497,11 @@ fn check_in(
     skip: Skip,
 ) -> Result<Verdict> {
     // A private index: the tree's own git dir is shared with the real one.
-    Git::at(work)
+    let g = Git::at(work)
         .env("GIT_DIR", git_dir.as_os_str())
         .env("GIT_WORK_TREE", work.as_os_str())
-        .env("GIT_INDEX_FILE", tmp.join("index").as_os_str())
-        .run(&["read-tree", "-u", "--reset", wip])?;
+        .env("GIT_INDEX_FILE", tmp.join("index").as_os_str());
+    checkout_wip(&g, wip)?;
     apply_manifest(work, manifest, &dest.join(FILES))?;
     let root_meta = fs::symlink_metadata(tree)?;
     let root = stamp(&root_meta);

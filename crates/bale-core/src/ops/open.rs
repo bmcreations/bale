@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::git::{self, Git};
 use crate::lock::WorkspaceLock;
 use crate::ops::cold::{hex, sha_file, SavedFile, FILES};
-use crate::ops::disk::{apply_manifest, file_mode, read_manifest, Manifest};
+use crate::ops::disk::{apply_manifest, checkout_wip, file_mode, read_manifest, Manifest};
 use crate::ops::up::{remove_entry, Outcome};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
 use crate::BaleHome;
@@ -326,15 +326,21 @@ fn restore(home: &BaleHome, record: &Record, saved: &Saved) -> Result<()> {
             record.admin_dir.display()
         );
     }
-    // Detach first: with HEAD still symbolic, `reset` would move the branch.
-    g.run(&["update-ref", "--no-deref", "HEAD", &saved.head])?;
-    g.run(&["read-tree", "-u", "--reset", &saved.wip])?;
-    g.run(&["reset", "-q", &saved.head])?;
-    restage_ignored_additions(&g, saved)?;
-
+    // Check out with HEAD as cold left it (on the recorded branch, or
+    // detached), as cold's check did: config can depend on the branch.
+    match &record.branch {
+        Some(branch) => g.run(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?,
+        None => g.run(&["update-ref", "--no-deref", "HEAD", &saved.head])?,
+    };
+    checkout_wip(&g, &saved.wip)?;
     let files = home.saved_dir(&record.id).join(FILES);
     apply_manifest(path, &saved.manifest, &files)?;
-    verify_restore(record, saved)
+    // Verified under the same HEAD too; below only the index changes.
+    verify_restore(record, saved)?;
+    // Detach before `reset`: with HEAD still symbolic it would move the branch.
+    g.run(&["update-ref", "--no-deref", "HEAD", &saved.head])?;
+    g.run(&["reset", "-q", &saved.head])?;
+    restage_ignored_additions(&g, saved)
 }
 
 /// `reset` unstages everything, which turns a staged, force-added ignored
