@@ -20,7 +20,7 @@ use bale_core::BaleHome;
 use toml_edit::{DocumentMut, Value};
 
 use crate::claude::sh_quote;
-use crate::cmdline::{bale_call, BaleCall};
+use crate::cmdline::{bale_call, is_bale, words, BaleCall};
 use crate::install::{
     backup_key, backup_path, read_config, tracked_by_git, tracked_note, Plan, Step,
 };
@@ -59,12 +59,13 @@ pub fn archive(home: &BaleHome) -> ExitCode {
     }
 }
 
-/// The command bale's script for `kind` runs.
+/// The command bale's script for `kind` runs. It runs bale only when the
+/// exe is there: the file is usually committed, and a teammate without bale
+/// at this path gets status 0 instead of a failing setup or archive. With
+/// bale present, bale's status is the command's.
 fn hook_command(exe: &Path, kind: &str) -> String {
-    format!(
-        "{} hook conductor {kind}",
-        sh_quote(&display_path(exe).replace('\\', "/"))
-    )
+    let exe = sh_quote(&display_path(exe).replace('\\', "/"));
+    format!("if [ -x {exe} ]; then {exe} hook conductor {kind}; fi")
 }
 
 /// `existing` with bale's `want` chained after it. The user's script runs
@@ -103,7 +104,7 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
     if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
         bail!(
             "{} is a symlink; bale will not replace it with a regular file. Add \
-             `{}` to the end of [scripts] setup and `{}` to the start of archive by hand",
+             `{}` to the end of [scripts] setup and `{}` to the end of archive by hand",
             path.display(),
             hook_command(exe, "setup"),
             hook_command(exe, "archive")
@@ -225,9 +226,22 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
     Ok(Plan::new(notes))
 }
 
-/// Whether `cmd` is exactly bale's script for `kind`, from any exe path.
+/// Whether `cmd` is exactly bale's script for `kind`, from any exe path:
+/// the guarded form [`hook_command`] writes, or the bare call earlier
+/// installs wrote.
 fn is_bale_script(cmd: &str, kind: &str) -> bool {
-    bale_call(cmd, &["hook", "conductor", kind]) == Some(BaleCall::Plain)
+    if bale_call(cmd, &["hook", "conductor", kind]) == Some(BaleCall::Plain) {
+        return true;
+    }
+    let Some(w) = words(cmd) else {
+        return false;
+    };
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    matches!(
+        w.as_slice(),
+        ["if", "[", "-x", guard, "]", ";", "then", exe, "hook", "conductor", k, ";", "fi"]
+            if guard == exe && is_bale(exe) && *k == kind
+    )
 }
 
 /// `value` split the way [`chain`] built it: the user's script (`None` when
@@ -468,10 +482,71 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_quotes_the_exe() {
+    fn hook_command_quotes_the_exe_and_guards_it() {
+        let q = r"'/opt/it'\''s/bale'";
         assert_eq!(
             hook_command(Path::new("/opt/it's/bale"), "setup"),
-            r"'/opt/it'\''s/bale' hook conductor setup"
+            format!("if [ -x {q} ]; then {q} hook conductor setup; fi")
         );
+    }
+
+    /// A teammate without bale at the installer's path: both scripts end in
+    /// status 0, alone and chained, so Conductor carries on as without bale.
+    #[cfg(unix)]
+    #[test]
+    fn scripts_exit_0_when_bale_is_missing() {
+        let missing = Path::new("/nonexistent/bale");
+        for kind in ["setup", "archive"] {
+            let want = hook_command(missing, kind);
+            assert_eq!(sh(&want), (String::new(), 0), "{kind}");
+            assert_eq!(
+                sh(&chain(kind, "echo hi", &want)),
+                ("hi\n".to_string(), 0),
+                "{kind}"
+            );
+        }
+    }
+
+    /// With bale present, its status is the archive script's: 3 when busy.
+    #[cfg(unix)]
+    #[test]
+    fn archive_keeps_bales_status_when_bale_is_present() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bale-conductor-stub-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("bale");
+        fs::write(&stub, "#!/bin/sh\necho \"BALE $*\"\nexit 3\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let want = hook_command(&stub, "archive");
+        let alone = sh(&want);
+        let chained = sh(&chain("archive", "echo bye", &want));
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(alone, ("BALE hook conductor archive\n".to_string(), 3));
+        assert_eq!(
+            chained,
+            ("bye\nBALE hook conductor archive\n".to_string(), 3)
+        );
+    }
+
+    /// Uninstall and repoint find bale's command in the guarded form and in
+    /// the unguarded form earlier installs wrote.
+    #[test]
+    fn unchain_reads_guarded_and_unguarded_forms() {
+        let old = |kind: &str| format!("'/old/bale' hook conductor {kind}");
+        let new = |kind: &str| hook_command(Path::new("/old/bale"), kind);
+        for kind in ["setup", "archive"] {
+            for bale in [old(kind), new(kind)] {
+                assert_eq!(unchain(kind, &bale), Some((None, bale.as_str())), "{bale}");
+                let chained = chain(kind, "npm i", &bale);
+                assert_eq!(
+                    unchain(kind, &chained),
+                    Some((Some("npm i"), bale.as_str())),
+                    "{chained}"
+                );
+            }
+            // The guard and the call naming different exes is not bale's.
+            let mixed = format!("if [ -x '/a/bale' ]; then '/b/bale' hook conductor {kind}; fi");
+            assert_eq!(unchain(kind, &mixed), None);
+        }
     }
 }

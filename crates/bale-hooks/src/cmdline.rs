@@ -75,7 +75,7 @@ pub(crate) enum BaleCall {
 }
 
 /// Whether `word` names bale's binary: its basename is `bale` or `bale.exe`.
-fn is_bale(word: &str) -> bool {
+pub(crate) fn is_bale(word: &str) -> bool {
     matches!(word.rsplit(['/', '\\']).next(), Some("bale" | "bale.exe"))
 }
 

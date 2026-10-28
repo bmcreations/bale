@@ -1499,15 +1499,16 @@ fn install_conductor_keeps_existing_scripts_and_comments() {
     // toml_edit writes a value with a newline as a multi-line string.
     assert_eq!(lines[3..5], ["setup = \"\"\"", "( npm install"], "{after}");
     assert!(
-        lines[5].starts_with(") && '")
-            && lines[5].ends_with(" hook conductor setup\"\"\" # keep this comment"),
+        lines[5].starts_with(") && if [ -x '")
+            && lines[5].ends_with(" hook conductor setup; fi\"\"\" # keep this comment"),
         "{after}"
     );
     assert_eq!(lines[6], "run = \"npm start\"");
     // The user's archive runs first, while the tree still exists.
     assert_eq!(lines[7..9], ["archive = \"\"\"", "( echo bye"], "{after}");
     assert!(
-        lines[9].starts_with("); '") && lines[9].ends_with(" hook conductor archive\"\"\""),
+        lines[9].starts_with("); if [ -x '")
+            && lines[9].ends_with(" hook conductor archive; fi\"\"\""),
         "{after}"
     );
     assert_eq!(
@@ -1543,8 +1544,8 @@ fn install_conductor_twice_is_noop() {
     assert!(out.status.success(), "{}", stderr(&out));
     let first = fs::read_to_string(&path).unwrap();
     assert!(first.contains("[scripts]"), "{first}");
-    assert!(first.contains(" hook conductor setup\""), "{first}");
-    assert!(first.contains(" hook conductor archive\""), "{first}");
+    assert!(first.contains(" hook conductor setup; fi\""), "{first}");
+    assert!(first.contains(" hook conductor archive; fi\""), "{first}");
 
     let out = env.bale(&env.repo, &args, None);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -2246,9 +2247,47 @@ fn install_conductor_repoints_bales_own_chained_command() {
         fs::read_to_string(&path).unwrap(),
         format!(
             "[scripts]\n\
-             setup = \"\"\"\n( npm i # c\n) && '{exe}' hook conductor setup\"\"\" # keep\n\
-             archive = \"'{exe}' hook conductor archive\"\n"
+             setup = \"\"\"\n( npm i # c\n) && if [ -x '{exe}' ]; then '{exe}' hook conductor setup; fi\"\"\" # keep\n\
+             archive = \"if [ -x '{exe}' ]; then '{exe}' hook conductor archive; fi\"\n"
         )
+    );
+}
+
+/// An install from before the guard, at this exe's path, gets the guarded
+/// form; uninstall takes either form out.
+#[test]
+fn install_conductor_guards_an_unguarded_install() {
+    let env = Env::new();
+    let path = conductor_settings(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
+    let unguarded = format!(
+        "[scripts]\n\
+         setup = \"\"\"\n( npm i\n) && '{exe}' hook conductor setup\"\"\"\n\
+         archive = \"'{exe}' hook conductor archive\"\n"
+    );
+    fs::write(&path, &unguarded).unwrap();
+    let out = install(&env, "conductor", true);
+    assert!(
+        !stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!(
+            "[scripts]\n\
+             setup = \"\"\"\n( npm i\n) && if [ -x '{exe}' ]; then '{exe}' hook conductor setup; fi\"\"\"\n\
+             archive = \"if [ -x '{exe}' ]; then '{exe}' hook conductor archive; fi\"\n"
+        )
+    );
+
+    fs::write(&path, &unguarded).unwrap();
+    let out = uninstall(&env, "conductor", true);
+    assert!(!stdout(&out).contains("left unchanged"), "{}", stdout(&out));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[scripts]\nsetup = \"npm i\"\n"
     );
 }
 
