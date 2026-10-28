@@ -215,7 +215,12 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         }
         let mut regen = regen_dirs(&dir);
         regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
-        let scan = scan_ignored_with(&dir, &submodule_deny(&sub_deny, sub), &regen)?;
+        let scan = scan_ignored_with(
+            &Git::at(&dir),
+            &dir,
+            &submodule_deny(&sub_deny, sub),
+            &regen,
+        )?;
         if !scan.entries.is_empty() || !scan.nested.is_empty() {
             ignored.push(sub);
         }
@@ -627,6 +632,88 @@ fn snapshot_tree_in(dir: &Path, place: Place) -> Result<String> {
     Ok(g.run(&["write-tree"])?.trim().to_string())
 }
 
+/// What changed inside a submodule of the checkout at `root` (nested ones
+/// included), if anything did. The wip commit holds only each submodule's
+/// HEAD, so an edit, an untracked file, or an ignored file outside the
+/// regenerable output (judged as `refusal` judges it) would be deleted
+/// unsaved. Each submodule's git dir is named explicitly, so this works on
+/// a moved-aside tree too, where git can't enter a submodule on its own.
+fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
+    let sub_deny: Vec<String> = ex.deny.iter().chain(&ex.regen_extra).cloned().collect();
+    let mut pending: Vec<String> = gitlinks(&Git::at(root))?;
+    let root_regen = if pending.is_empty() {
+        Vec::new()
+    } else {
+        regen_dirs(root)
+    };
+    while let Some(sub) = pending.pop() {
+        let dir = root.join(&sub);
+        let Some(git_dir) = submodule_git_dir(&dir)? else {
+            // Not checked out: an empty or missing dir holds nothing.
+            let empty = match fs::read_dir(&dir) {
+                Ok(mut entries) => entries.next().is_none(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+                Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+            };
+            if empty {
+                continue;
+            }
+            return Ok(Some(format!("submodule {sub} has files but no .git")));
+        };
+        let g = Git::at(&dir)
+            .env("GIT_DIR", git_dir.as_os_str())
+            .env("GIT_WORK_TREE", dir.as_os_str());
+        // `dirty` still reports a nested submodule's new commits; its
+        // contents are checked when it is popped.
+        let status = g.run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "-z",
+            "--ignore-submodules=dirty",
+        ])?;
+        let status: Vec<&str> = status.split('\0').filter(|e| !e.is_empty()).collect();
+        if !status.is_empty() {
+            return Ok(Some(format!(
+                "submodule {sub} changed while saving: {}",
+                status.join(", ")
+            )));
+        }
+        let mut regen = regen_dirs(&dir);
+        regen.extend(root_regen.iter().filter(|r| r.starts_with(&dir)).cloned());
+        let scan = scan_ignored_with(&g, &dir, &submodule_deny(&sub_deny, &sub), &regen)?;
+        let found: Vec<PathBuf> = scan.entries.into_iter().map(|(rel, _)| rel).collect();
+        if !found.is_empty() || !scan.nested.is_empty() {
+            return Ok(Some(format!(
+                "submodule {sub} has unsaved ignored files: {}",
+                join_paths(&[found, scan.nested].concat())
+            )));
+        }
+        pending.extend(gitlinks(&g)?.into_iter().map(|p| format!("{sub}/{p}")));
+    }
+    Ok(None)
+}
+
+/// The git dir of the submodule checkout at `dir`: its `.git` dir, or the
+/// one its `.git` file names (relative to `dir`). `None` without a `.git`.
+fn submodule_git_dir(dir: &Path) -> Result<Option<PathBuf>> {
+    let dot_git = dir.join(".git");
+    let meta = match fs::symlink_metadata(&dot_git) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dot_git.display())),
+    };
+    if meta.is_dir() {
+        return Ok(Some(dot_git));
+    }
+    let text =
+        fs::read_to_string(&dot_git).with_context(|| format!("reading {}", dot_git.display()))?;
+    let Some(target) = text.trim_end_matches(['\n', '\r']).strip_prefix("gitdir: ") else {
+        bail!("{} does not name a git dir", dot_git.display());
+    };
+    Ok(Some(dir.join(target)))
+}
+
 /// Paths of the index's submodule entries (mode 160000).
 fn gitlinks(g: &Git) -> Result<Vec<String>> {
     let out = g.run(&["ls-files", "-s", "-z"])?;
@@ -711,7 +798,7 @@ struct IgnoredScan {
 
 fn scan_ignored(dir: &Path, ex: &Exclusions) -> Result<IgnoredScan> {
     let regen: Vec<PathBuf> = ex.regen.iter().map(|r| dir.join(r)).collect();
-    scan_ignored_with(dir, &ex.deny, &regen)
+    scan_ignored_with(&Git::at(dir), dir, &ex.deny, &regen)
 }
 
 /// `deny` as it applies inside the submodule at `sub` (relative to the
@@ -742,7 +829,13 @@ fn regen_dirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// `scan_ignored` with the regenerable dirs (absolute) given by the caller.
-fn scan_ignored_with(dir: &Path, deny: &[String], regen: &[PathBuf]) -> Result<IgnoredScan> {
+/// `g` lists the ignored files of the checkout at `dir`.
+fn scan_ignored_with(
+    g: &Git,
+    dir: &Path,
+    deny: &[String],
+    regen: &[PathBuf],
+) -> Result<IgnoredScan> {
     let regen: Vec<PathBuf> = regen
         .iter()
         .filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf))
@@ -764,7 +857,7 @@ fn scan_ignored_with(dir: &Path, deny: &[String], regen: &[PathBuf]) -> Result<I
                 .any(|d| rel.starts_with(d.trim_end_matches('/')))
     };
 
-    let listed = Git::at(dir).run(&[
+    let listed = g.run(&[
         "ls-files",
         "-z",
         "--others",
@@ -1024,6 +1117,9 @@ fn verify_in(
         }
     }
 
+    if let Some(change) = submodule_change(root, ex)? {
+        return Ok(Some(change));
+    }
     let rebuilt = snapshot_tree_in(root, place)?;
     let tree = Git::at(root).run(&["rev-parse", &format!("{wip}^{{tree}}")])?;
     if rebuilt != tree.trim() {
@@ -1152,17 +1248,14 @@ mod tests {
         git(&sub, &["init", "-q", "-b", "main"]);
         git(&sub, &["config", "user.name", "t"]);
         git(&sub, &["config", "user.email", "t@t"]);
+        // Gradle makes `build/` regenerable inside the submodule.
+        fs::write(sub.join("a.txt"), "a\n").unwrap();
+        fs::write(sub.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        fs::write(sub.join("settings.gradle.kts"), "").unwrap();
+        git(&sub, &["add", "."]);
         git(
             &sub,
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "s",
-            ],
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "s"],
         );
         let wt = tmp.join("wt");
         git(
@@ -1209,6 +1302,167 @@ mod tests {
         assert!(trash_siblings(&wt).unwrap().is_empty());
         assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
         assert!(!wt.exists());
+    }
+
+    /// Runs `cold` with `write` acting on the checkout just before the
+    /// rename, for a worktree with submodule `lib`.
+    fn cold_with_late_submodule_write(
+        write: impl Fn(&Path) + 'static,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        BaleHome,
+        String,
+        Result<Outcome>,
+    ) {
+        let (tmp, repo) = repo();
+        let wt = with_submodule(tmp.path(), &repo);
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+        let seam = set_seam(&BEFORE_RENAME, write);
+        let out = cold(&home, &id);
+        drop(seam);
+        (tmp, wt, home, id, out)
+    }
+
+    /// A late write inside the submodule is not in the wip commit (which
+    /// holds only the submodule's HEAD); the tree must come back with it.
+    fn assert_late_submodule_write_kept(rel: &str, text: &str) {
+        let rel_in = rel.to_string();
+        let text_in = text.to_string();
+        let (_tmp, wt, home, id, out) = cold_with_late_submodule_write(move |root: &Path| {
+            let path = root.join("lib").join(&rel_in);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &text_in).unwrap()
+        });
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()), "{rel}");
+        assert_eq!(
+            fs::read_to_string(wt.join("lib").join(rel)).unwrap(),
+            text,
+            "{rel}"
+        );
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Baled);
+    }
+
+    #[test]
+    fn tracked_edit_in_submodule_before_rename_moves_the_tree_back() {
+        assert_late_submodule_write_kept("a.txt", "edited\n");
+    }
+
+    #[test]
+    fn untracked_file_in_submodule_before_rename_moves_the_tree_back() {
+        assert_late_submodule_write_kept("late.txt", "late\n");
+    }
+
+    #[test]
+    fn ignored_file_in_submodule_before_rename_moves_the_tree_back() {
+        assert_late_submodule_write_kept("late.log", "late\n");
+    }
+
+    /// A late write inside a submodule of the submodule is caught too.
+    #[test]
+    fn write_in_nested_submodule_before_rename_moves_the_tree_back() {
+        let (tmp, repo) = repo();
+        let inner = tmp.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        git(&inner, &["init", "-q", "-b", "main"]);
+        git(&inner, &["config", "user.name", "t"]);
+        git(&inner, &["config", "user.email", "t@t"]);
+        fs::write(inner.join("i.txt"), "i\n").unwrap();
+        git(&inner, &["add", "."]);
+        git(
+            &inner,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "i"],
+        );
+        let sub = tmp.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["config", "user.name", "t"]);
+        git(&sub, &["config", "user.email", "t@t"]);
+        git(
+            &sub,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                inner.to_str().unwrap(),
+                "deep",
+            ],
+        );
+        git(
+            &sub,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "s"],
+        );
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "lib",
+            ],
+        );
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "-q",
+                "--init",
+                "--recursive",
+            ],
+        );
+        git(
+            &wt,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "sub"],
+        );
+        assert!(wt.join("lib/deep/i.txt").is_file());
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let seam = set_seam(&BEFORE_RENAME, |root: &Path| {
+            fs::write(root.join("lib/deep/i.txt"), "edited\n").unwrap()
+        });
+        let out = cold(&home, &id);
+        drop(seam);
+
+        assert_eq!(out.unwrap(), Outcome::Busy(Vec::new()));
+        assert_eq!(
+            fs::read_to_string(wt.join("lib/deep/i.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        // Unchanged since, it goes cold.
+        fs::write(wt.join("lib/deep/i.txt"), "i\n").unwrap();
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
+    }
+
+    /// Regenerable output written inside the submodule in the window is not
+    /// a change: none of it is saved, and it goes with the tree.
+    #[test]
+    fn build_output_in_submodule_before_rename_still_goes_cold() {
+        let (_tmp, wt, home, id, out) = cold_with_late_submodule_write(|root: &Path| {
+            fs::create_dir_all(root.join("lib/build")).unwrap();
+            fs::write(root.join("lib/build/out.class"), "x").unwrap()
+        });
+        assert_eq!(out.unwrap(), Outcome::Done(Level::Cold));
+        assert!(!wt.exists());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_eq!(record.level, Level::Cold);
     }
 
     /// A commit inside the submodule in the window changes its gitlink.
