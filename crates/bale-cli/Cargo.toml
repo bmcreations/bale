@@ -13,7 +13,7 @@ bale-core = { path = "../bale-core" }
 bale-hooks = { path = "../bale-hooks" }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-tempfile = "3.27.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+tempfile = "3.27.0"

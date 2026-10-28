@@ -4,7 +4,9 @@
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::str::FromStr;
 
+use anyhow::{bail, Result};
 use bale_core::busy::Holder;
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::up::{resolve, Outcome};
@@ -12,7 +14,10 @@ use bale_core::BaleHome;
 
 pub mod claude;
 pub mod git;
+pub mod install;
 pub mod proc;
+
+use install::Plan;
 
 /// A tool bale hooks into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +42,25 @@ impl Tool {
         }
     }
 
+    /// The tool's name on the command line, as in `--hooks claude,git`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Claude => "claude",
+            Tool::Git => "git",
+            Tool::Conductor => "conductor",
+            Tool::Cursor => "cursor",
+            Tool::Codex => "codex",
+        }
+    }
+
+    const ALL: [Tool; 5] = [
+        Tool::Claude,
+        Tool::Git,
+        Tool::Conductor,
+        Tool::Cursor,
+        Tool::Codex,
+    ];
+
     /// The tool's name in messages.
     fn label(self) -> &'static str {
         match self {
@@ -46,6 +70,36 @@ impl Tool {
             Tool::Cursor => "Cursor",
             Tool::Codex => "Codex",
         }
+    }
+}
+
+impl FromStr for Tool {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Tool, String> {
+        Tool::ALL
+            .into_iter()
+            .find(|t| t.name() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Tool::ALL.iter().map(|t| t.name()).collect();
+                format!("unknown tool {s:?}; expected one of {}", names.join(", "))
+            })
+    }
+}
+
+/// The plan that hooks `tool` up to bale at `exe`. Claude Code's settings
+/// live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
+/// they require.
+pub fn install_plan(tool: Tool, exe: &Path, home: &Path, repo: Option<&Path>) -> Result<Plan> {
+    let needs_repo = matches!(tool, Tool::Git | Tool::Conductor | Tool::Cursor);
+    let repo = match repo {
+        None if needs_repo => bail!("--repo is required for {}", tool.name()),
+        repo => repo,
+    };
+    match (tool, repo) {
+        (Tool::Claude, _) => claude::install_plan(home, exe),
+        (Tool::Git, Some(repo)) => git::install_plan(repo, exe),
+        _ => bail!("{} hooks are not supported yet", tool.name()),
     }
 }
 
@@ -132,6 +186,25 @@ fn busy_text(path: &Path, holders: &[Holder], tool: Tool) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn tool_names_round_trip() {
+        for t in Tool::ALL {
+            assert_eq!(t.name().parse::<Tool>(), Ok(t));
+        }
+        assert!("vim".parse::<Tool>().unwrap_err().contains("vim"));
+    }
+
+    #[test]
+    fn repo_is_required_before_support_is_checked() {
+        let p = Path::new("/nowhere");
+        for t in [Tool::Git, Tool::Conductor, Tool::Cursor] {
+            let err = install_plan(t, p, p, None).err().unwrap().to_string();
+            assert_eq!(err, format!("--repo is required for {}", t.name()));
+        }
+        let err = install_plan(Tool::Conductor, p, p, Some(p)).err().unwrap();
+        assert_eq!(err.to_string(), "conductor hooks are not supported yet");
+    }
 
     #[test]
     fn busy_without_holders_says_the_tree_changed() {

@@ -90,14 +90,14 @@ enum Command {
         #[command(subcommand)]
         kind: HookKind,
     },
-    /// Install the 30-minute sweep schedule, or with flags only the given hooks.
+    /// Install the 30-minute sweep schedule, or with --hooks only those tools' hooks.
     Install {
-        /// Add WorktreeCreate and WorktreeRemove hooks to ~/.claude/settings.json.
-        #[arg(long)]
-        claude_hooks: bool,
-        /// Install a post-checkout hook in this repo that registers new worktrees.
-        #[arg(long, value_name = "REPO")]
-        git_hook: Option<PathBuf>,
+        /// Comma-separated tools to hook: claude, git, conductor, cursor, codex.
+        #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
+        hooks: Vec<bale_hooks::Tool>,
+        /// The repo whose hooks to edit; required for git, conductor and cursor.
+        #[arg(long, value_name = "REPO", requires = "hooks")]
+        repo: Option<PathBuf>,
         /// Print the files and commands without changing anything.
         #[arg(long)]
         print_only: bool,
@@ -212,10 +212,10 @@ fn main() -> ExitCode {
             } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
         },
         Command::Install {
-            claude_hooks,
-            git_hook,
+            hooks,
+            repo,
             print_only,
-        } => install::plan(claude_hooks, git_hook.as_deref()).and_then(|plan| {
+        } => install::plan(&hooks, repo.as_deref()).and_then(|plan| {
             if print_only {
                 plan.print();
                 Ok(ExitCode::SUCCESS)

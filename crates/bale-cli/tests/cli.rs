@@ -386,7 +386,11 @@ fn git_hook_install_chains_existing() {
     write_hook(&hook, &format!("echo ran > '{}'", sh_path(&marker)));
     let repo = env.repo.to_str().unwrap();
 
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(hooks_dir(&env).join("post-checkout.pre-bale").is_file());
 
@@ -402,7 +406,11 @@ fn git_hook_install_twice_does_not_double_chain() {
     write_hook(&hooks_dir(&env).join("post-checkout"), original);
     let repo = env.repo.to_str().unwrap();
     for _ in 0..2 {
-        let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+        let out = env.bale(
+            &env.repo,
+            &["install", "--hooks", "git", "--repo", repo],
+            None,
+        );
         assert!(out.status.success(), "{}", stderr(&out));
     }
     let dir = hooks_dir(&env);
@@ -418,7 +426,11 @@ fn git_hook_previous_failure_propagates() {
     let env = Env::new();
     write_hook(&hooks_dir(&env).join("post-checkout"), "exit 7");
     let repo = env.repo.to_str().unwrap();
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     // git reports any failing post-checkout as exit 1, not the hook's code.
     let out = env.git_out(&env.repo, &["checkout", "-q", "-b", "other"]);
@@ -445,7 +457,11 @@ fn git_hook_goes_in_hooks_path_outside_tree() {
         &["config", "core.hooksPath", shared.to_str().unwrap()],
     );
     let repo = env.repo.to_str().unwrap();
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(shared.join("post-checkout.pre-bale").is_file());
     let hook = fs::read_to_string(shared.join("post-checkout")).unwrap();
@@ -460,7 +476,11 @@ fn git_hook_refuses_hooks_path_inside_tree() {
     env.git(&env.repo, &["config", "core.hooksPath", ".husky"]);
     let before = fs::read_to_string(husky.join("post-checkout")).unwrap();
     let repo = env.repo.to_str().unwrap();
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(!out.status.success());
     let all = format!("{}{}", stdout(&out), stderr(&out));
     assert!(all.contains("hook git post-checkout"), "{all}");
@@ -500,7 +520,7 @@ fn claude_hooks_install_is_idempotent_and_keeps_existing() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, SETTINGS).unwrap();
 
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
         stdout(&out).contains("+"),
@@ -508,7 +528,7 @@ fn claude_hooks_install_is_idempotent_and_keeps_existing() {
         stdout(&out)
     );
     let first = fs::read_to_string(&path).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&path).unwrap(), first);
 
@@ -523,8 +543,8 @@ fn claude_hooks_install_is_idempotent_and_keeps_existing() {
         "echo hello"
     );
     for (event, kind) in [
-        ("WorktreeCreate", "claude-worktree-create"),
-        ("WorktreeRemove", "claude-worktree-remove"),
+        ("WorktreeCreate", "claude create"),
+        ("WorktreeRemove", "claude remove"),
     ] {
         let groups = v["hooks"][event].as_array().unwrap();
         assert_eq!(groups.len(), 1, "{event}: {groups:?}");
@@ -541,7 +561,7 @@ fn claude_hooks_install_refuses_invalid_json() {
     let path = settings_path(&env);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "{ not json").unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
     assert!(!path.with_file_name("settings.json.bak-bale").exists());
@@ -616,8 +636,9 @@ fn print_only_shows_schedule_and_changes_nothing() {
         &[
             "install",
             "--print-only",
-            "--claude-hooks",
-            "--git-hook",
+            "--hooks",
+            "claude,git",
+            "--repo",
             repo,
         ],
         None,
@@ -719,7 +740,7 @@ fn remove_hook_still_sees_non_ancestor_holders() {
 fn claude_hooks_install_creates_missing_settings_without_backup() {
     let env = Env::new();
     let path = settings_path(&env);
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(v["hooks"]["WorktreeCreate"].is_array(), "{v}");
@@ -733,7 +754,7 @@ fn claude_hooks_install_refuses_other_worktree_hook() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let other = r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":"my-tool create"}]}]}}"#;
     fs::write(&path, other).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(&path).unwrap(), other);
     assert!(!path.with_file_name("settings.json.bak-bale").exists());
@@ -751,7 +772,7 @@ fn claude_hooks_install_refuses_non_object_and_trailing_data() {
         let path = settings_path(&env);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, text).unwrap();
-        let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+        let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
         assert!(!out.status.success(), "accepted {text:?}");
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
     }
@@ -766,7 +787,7 @@ fn claude_hooks_install_rewrites_stale_bale_entries() {
       "WorktreeCreate":[{"hooks":[{"type":"command","command":"'/old/Cellar/bale/0.1/bin/bale' hook claude-worktree-create"}]}],
       "WorktreeRemove":[{"hooks":[{"type":"command","command":"'/old/Cellar/bale/0.1/bin/bale' hook claude-worktree-remove"}]}]}}"#;
     fs::write(&path, stale).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     for event in ["WorktreeCreate", "WorktreeRemove"] {
@@ -775,6 +796,7 @@ fn claude_hooks_install_rewrites_stale_bale_entries() {
         let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(!cmd.contains("/old/"), "{cmd}");
         assert!(cmd.contains("bale"), "{cmd}");
+        assert!(!cmd.contains("claude-worktree"), "{cmd}");
     }
 }
 
@@ -787,7 +809,7 @@ fn claude_hooks_install_refuses_symlinked_settings() {
     let real = env.tmp.path().join("dotfiles-settings.json");
     fs::write(&real, SETTINGS).unwrap();
     std::os::unix::fs::symlink(&real, &path).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(err.contains("symlink"), "{err}");
@@ -796,7 +818,7 @@ fn claude_hooks_install_refuses_symlinked_settings() {
         err.contains("WorktreeCreate") && err.contains("WorktreeRemove"),
         "{err}"
     );
-    assert!(err.contains("hook claude-worktree-remove"), "{err}");
+    assert!(err.contains("hook claude remove"), "{err}");
     assert!(err.contains(env!("CARGO_BIN_EXE_bale")), "{err}");
     assert!(fs::symlink_metadata(&path)
         .unwrap()
@@ -814,7 +836,7 @@ fn claude_hooks_install_keeps_file_mode() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, SETTINGS).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("reformatted"), "{}", stdout(&out));
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -826,14 +848,22 @@ fn git_hook_install_rewrites_stale_bale_path() {
     let env = Env::new();
     let hook = hooks_dir(&env).join("post-checkout");
     let repo = env.repo.to_str().unwrap();
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let current = fs::read_to_string(&hook).unwrap();
     let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
     assert!(current.contains(&exe), "{current}");
     fs::write(&hook, current.replace(&exe, "/old/bin/bale")).unwrap();
 
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let rewritten = fs::read_to_string(&hook).unwrap();
     assert!(rewritten.contains(&exe) && !rewritten.contains("/old/bin/bale"));
@@ -851,7 +881,11 @@ fn git_hook_notes_global_hooks_path() {
     )
     .unwrap();
     let repo = env.repo.to_str().unwrap();
-    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    let out = env.bale(
+        &env.repo,
+        &["install", "--hooks", "git", "--repo", repo],
+        None,
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let all = format!("{}{}", stdout(&out), stderr(&out));
     assert!(all.contains("global git config"), "{all}");
@@ -994,12 +1028,121 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
       "WorktreeCreate":[{"hooks":[{"type":"command","command":"env BALE_HOME=/x '/old/bale' hook claude-worktree-create"}]}],
       "WorktreeRemove":[{"hooks":[{"type":"command","command":"nice '/old/bale' hook claude-worktree-remove"}]}]}}"#;
     fs::write(&path, wrapped).unwrap();
-    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&path).unwrap(), wrapped);
     let text = stdout(&out);
     assert!(text.contains("left unchanged"), "{text}");
     assert!(text.contains("nice '/old/bale'"), "{text}");
+}
+
+#[test]
+fn claude_hooks_install_replaces_old_form_entries() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
+    let old = serde_json::json!({"hooks": {
+        "WorktreeCreate": [{"hooks": [{"type": "command",
+            "command": format!("'{exe}' hook claude-worktree-create")}]}],
+        "WorktreeRemove": [{"hooks": [{"type": "command",
+            "command": format!("'{exe}' hook claude-worktree-remove")}]}]}});
+    fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for (event, kind) in [("WorktreeCreate", "create"), ("WorktreeRemove", "remove")] {
+        let groups = v["hooks"][event].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{v}");
+        let hooks = groups[0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1, "{v}");
+        let cmd = hooks[0]["command"].as_str().unwrap();
+        assert_eq!(cmd, format!("'{exe}' hook claude {kind}"));
+    }
+}
+
+const USER_HOOKS: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "my-guard check"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "my-tool cleanup"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+#[test]
+fn install_hooks_claude_keeps_user_hooks() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, USER_HOOKS).unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let first = fs::read_to_string(&path).unwrap();
+    let v: Value = serde_json::from_str(&first).unwrap();
+    let user: Value = serde_json::from_str(USER_HOOKS).unwrap();
+    assert_eq!(v["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
+    // bale's archive-side entry runs before the user's.
+    let remove = v["hooks"]["WorktreeRemove"].as_array().unwrap();
+    assert_eq!(remove.len(), 2, "{v}");
+    let bale = remove[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(bale.ends_with(" hook claude remove"), "{bale}");
+    assert_eq!(remove[1], user["hooks"]["WorktreeRemove"][0]);
+    let create = v["hooks"]["WorktreeCreate"].as_array().unwrap();
+    assert_eq!(create.len(), 1, "{v}");
+
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("\n+ "), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("already installed"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), first);
+}
+
+#[test]
+fn install_conductor_without_repo_errors() {
+    let env = Env::new();
+    let before = listing(&env.home());
+    for tool in ["conductor", "cursor", "git"] {
+        let out = env.bale(&env.repo, &["install", "--hooks", tool], None);
+        assert!(!out.status.success(), "{tool}");
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!("--repo is required for {tool}")),
+            "{tool}: {err}"
+        );
+    }
+    assert_eq!(listing(&env.home()), before);
+}
+
+#[test]
+fn install_rejects_unknown_hook_name() {
+    let env = Env::new();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude,vim"], None);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("vim"), "{}", stderr(&out));
+    assert!(!settings_path(&env).exists());
 }
 
 #[test]

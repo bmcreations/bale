@@ -1,5 +1,6 @@
 //! Claude Code's WorktreeCreate and WorktreeRemove hooks
-//! (`bale hook claude create|remove`).
+//! (`bale hook claude create|remove`), and their install into
+//! `~/.claude/settings.json`.
 //!
 //! Claude Code contract, from https://code.claude.com/docs/en/hooks (read
 //! 2026-10-28, sections "WorktreeCreate" and "WorktreeRemove"):
@@ -27,8 +28,9 @@ use bale_core::git::{self, Git};
 use bale_core::ops::new::{new_workspace, workspace_path};
 use bale_core::ops::up::register;
 use bale_core::BaleHome;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
+use crate::install::{Plan, Step};
 use crate::{display_path, remove_tree, Tool};
 
 /// Reads the hook's JSON payload from stdin.
@@ -164,4 +166,256 @@ pub fn remove(home: &BaleHome) -> Result<ExitCode> {
     let payload = read_payload()?;
     let path = PathBuf::from(field(&payload, "worktree_path")?);
     Ok(remove_tree(home, &path, Tool::Claude))
+}
+
+/// Each settings.json event bale hooks, with its `bale hook claude` subcommand.
+const HOOKS: [(&str, &str); 2] = [("WorktreeCreate", "create"), ("WorktreeRemove", "remove")];
+
+/// `s` single-quoted for sh, which Claude Code runs command hooks with.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The command line bale's hook entry for `kind` runs.
+fn hook_command(exe: &Path, kind: &str) -> String {
+    format!(
+        "{} hook claude {kind}",
+        sh_quote(&display_path(exe).replace('\\', "/"))
+    )
+}
+
+/// The `hook ...` tails that mark bale's entry for `kind`: the current one
+/// and the `claude-worktree-<kind>` name it replaced, so a reinstall
+/// rewrites an old entry instead of adding a second.
+fn hook_tails(kind: &str) -> [String; 2] {
+    [
+        format!(" hook claude {kind}"),
+        format!(" hook claude-worktree-{kind}"),
+    ]
+}
+
+/// Whether `cmd` runs bale's hook for `kind` in any form, plain or wrapped.
+fn mentions_hook(cmd: &str, kind: &str) -> bool {
+    hook_tails(kind).iter().any(|t| cmd.contains(t.as_str()))
+}
+
+/// The exe path in `cmd` when `cmd` is exactly bale's own entry for `kind`
+/// (current or old name): a single-quoted (sh) or double-quoted path to
+/// `bale` or `bale.exe`, then the hook subcommand. Anything else, such as a
+/// command wrapped in `env` or `nice`, is the user's and gives `None`.
+fn bale_hook_path(cmd: &str, kind: &str) -> Option<String> {
+    let quoted = hook_tails(kind)
+        .iter()
+        .find_map(|t| cmd.strip_suffix(t.as_str()))?;
+    let path = match quoted.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) if !inner.contains(['"', '\\']) => inner.to_string(),
+        Some(_) => return None,
+        None => sh_unquote(quoted)?,
+    };
+    let base = path.rsplit(['/', '\\']).next()?;
+    matches!(base, "bale" | "bale.exe").then_some(path)
+}
+
+/// The inverse of [`sh_quote`]: `'...'` segments joined by `\'`.
+fn sh_unquote(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        rest = rest.strip_prefix('\'')?;
+        let end = rest.find('\'')?;
+        out.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        if rest.is_empty() {
+            return Some(out);
+        }
+        rest = rest.strip_prefix("\\'")?;
+        out.push('\'');
+    }
+}
+
+/// One settings.json hook group running `bale hook claude <kind>`.
+fn hook_group(exe: &Path, kind: &str) -> Value {
+    json!({ "hooks": [{ "type": "command", "command": hook_command(exe, kind) }] })
+}
+
+/// Adds bale's WorktreeCreate and WorktreeRemove entries to
+/// `<home>/.claude/settings.json`, keeping every other hook. bale's remove
+/// entry goes before any user WorktreeRemove hook. A user WorktreeCreate hook
+/// is refused: Claude Code would run both, and two hooks creating the same
+/// worktree conflict.
+pub fn install_plan(home: &Path, exe: &Path) -> Result<Plan> {
+    let path = home.join(".claude").join("settings.json");
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        let hooks: Map<String, Value> = HOOKS
+            .iter()
+            .map(|(event, kind)| (event.to_string(), json!([hook_group(exe, kind)])))
+            .collect();
+        bail!(
+            "{} is a symlink; bale will not replace it with a regular file. Add these \
+             hooks to the file it points at by hand, or replace the link with a copy:\n{}",
+            path.display(),
+            serde_json::to_string_pretty(&json!({ "hooks": hooks }))?
+        );
+    }
+    let mode = meta.map(|m| m.permissions());
+    let before = match fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut root: Value = match &before {
+        Some(text) => serde_json::from_str(text).with_context(|| {
+            format!("{} is not valid JSON; leaving it unchanged", path.display())
+        })?,
+        None => Value::Object(Map::new()),
+    };
+    let obj = root
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", path.display()))?;
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .with_context(|| format!("\"hooks\" in {} is not an object", path.display()))?;
+
+    let mut changed = false;
+    let mut notes = Vec::new();
+    for (event, kind) in HOOKS {
+        let groups = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .with_context(|| format!("hooks.{event} in {} is not an array", path.display()))?;
+        let want = hook_command(exe, kind);
+        let mut ours = false;
+        for h in groups
+            .iter_mut()
+            .filter_map(|g| g["hooks"].as_array_mut())
+            .flatten()
+        {
+            let Some(cmd) = h["command"].as_str() else {
+                continue;
+            };
+            if !mentions_hook(cmd, kind) {
+                continue;
+            }
+            ours = true;
+            if bale_hook_path(cmd, kind).is_none() {
+                // The user's own command around bale, e.g. `env ... bale hook ...`.
+                notes.push(Step::Note(format!(
+                    "note: left unchanged in {}: {event} hook `{cmd}` runs bale but is \
+                     not bale's plain entry",
+                    display_path(&path)
+                )));
+            } else if cmd != want {
+                // bale's own entry from another binary path or the old name:
+                // point it here.
+                h["command"] = Value::String(want.clone());
+                changed = true;
+            }
+        }
+        if ours {
+            continue;
+        }
+        if kind == "create" && !groups.is_empty() {
+            bail!(
+                "{} already has a {event} hook; remove it first, then rerun",
+                path.display()
+            );
+        }
+        // Before the user's remove hooks, so bale colds the tree first.
+        groups.insert(0, hook_group(exe, kind));
+        changed = true;
+    }
+
+    if !changed {
+        notes.push(Step::Note(format!(
+            "{}: Claude Code hooks already installed",
+            display_path(&path)
+        )));
+        return Ok(Plan::new(notes));
+    }
+    let after = serde_json::to_string_pretty(&root)? + "\n";
+    notes.extend([
+        Step::Mkdir(
+            path.parent()
+                .expect("settings path has a parent")
+                .to_path_buf(),
+        ),
+        Step::Settings {
+            path,
+            before,
+            after,
+            mode,
+        },
+    ]);
+    Ok(Plan::new(notes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sh_quote_escapes_a_single_quote() {
+        assert_eq!(sh_quote("/opt/it's/bale"), r"'/opt/it'\''s/bale'");
+    }
+
+    #[test]
+    fn bale_hook_path_accepts_only_a_quoted_bale_path() {
+        assert_eq!(
+            bale_hook_path(r"'/opt/it'\''s/bale' hook claude create", "create").as_deref(),
+            Some("/opt/it's/bale")
+        );
+        assert_eq!(
+            bale_hook_path(
+                r#""C:/Program Files/bale/bale.exe" hook claude create"#,
+                "create"
+            )
+            .as_deref(),
+            Some("C:/Program Files/bale/bale.exe")
+        );
+        for other in [
+            "env X=1 '/x/bale' hook claude create",
+            "nice '/x/bale' hook claude create",
+            "/x/bale hook claude create",
+            "'/x/not-bale' hook claude create",
+            "'/x/bale' hook claude remove",
+            "'/x/bale' hook claude create --flag",
+            "'/x/a' '/x/bale' hook claude create",
+        ] {
+            assert_eq!(bale_hook_path(other, "create"), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn bale_hook_path_accepts_the_old_name() {
+        assert_eq!(
+            bale_hook_path("'/x/bale' hook claude-worktree-remove", "remove").as_deref(),
+            Some("/x/bale")
+        );
+        assert_eq!(
+            bale_hook_path("'/x/bale' hook claude-worktree-remove", "create"),
+            None
+        );
+        assert!(mentions_hook(
+            "nice '/x/bale' hook claude-worktree-create",
+            "create"
+        ));
+        assert!(mentions_hook("'/x/bale' hook claude create", "create"));
+        assert!(!mentions_hook("'/x/bale' hook claude remove", "create"));
+    }
+
+    #[test]
+    fn hook_command_uses_the_claude_subcommand() {
+        assert_eq!(
+            hook_command(Path::new("/opt/bale"), "remove"),
+            "'/opt/bale' hook claude remove"
+        );
+    }
 }
