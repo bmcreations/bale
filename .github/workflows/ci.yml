@@ -20,4 +20,4 @@ jobs:
         run: |
           git config --global user.email "ci@example.com"
           git config --global user.name "ci"
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
