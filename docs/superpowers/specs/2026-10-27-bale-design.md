@@ -332,6 +332,31 @@ backend untested. Treat it as a starting point and test each backend separately.
 
 On this machine the regenerable total is 92.5 GB across 31 worktrees, plus 16 GB of global DerivedData.
 
+## Later: devices for mobile projects
+
+This is a separate module, planned after tier 1 ships. It is off for repos with no iOS or Android target.
+
+Simulators and emulators use as much disk as the worktrees do. Measured on 2026-10-27:
+
+- `~/Library/Developer/CoreSimulator/Devices` takes 72 GB across 15 devices, the two largest at 22 GB and
+  12 GB.
+- `~/.android/avd` takes 26 GB. Two of its AVDs (`flipcash_blockstore` and `invites_android`) are already
+  named after features.
+
+How the module works:
+
+- Each workspace can own one device. It is created from a base device: `xcrun simctl clone` on iOS (a
+  copy-on-write clone on APFS), or a new AVD on the shared system image on Android.
+- Device state is not preserved. Baling a workspace wipes its device's data, and colding it deletes the
+  device. On open, a fresh device is created from the base.
+- `bale` never boots, pauses or stops a device. It only creates, wipes and deletes, through `xcrun simctl` and
+  `avdmanager` and by deleting AVD files.
+- loupe is optional. When it is installed, `bale` checks loupe's claims and skips any device that another
+  session has claimed or that the user has marked hands-off. Without loupe, `bale` skips any device that is
+  booted.
+- `migrate` reports devices by size and never links or deletes them on its own. The user picks which device
+  belongs to which workspace.
+
 ## Packaging
 
 - Written in Rust, as a single static binary per platform.
