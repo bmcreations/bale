@@ -190,6 +190,23 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         r#"echo "$displaypath""#,
     ])?;
     let subs: Vec<&str> = subs.lines().filter(|l| !l.is_empty()).collect();
+    // A gitlink whose dir has no `.git` is not checked out, so `foreach`
+    // skips it and nothing would save what is in it.
+    let mut gitlink_paths = gitlinks(&g)?;
+    for sub in &subs {
+        if submodule_git_dir(&root.join(sub))?.is_some() {
+            let inner = gitlinks(&Git::at(root.join(sub)))?;
+            gitlink_paths.extend(inner.into_iter().map(|p| format!("{sub}/{p}")));
+        }
+    }
+    for path in gitlink_paths {
+        let dir = root.join(&path);
+        if submodule_git_dir(&dir)?.is_none() && !is_empty_or_missing(&dir)? {
+            return Ok(Some(format!(
+                "submodule {path} is not checked out but has files"
+            )));
+        }
+    }
     // Inside a submodule regenerable output is judged by name: none of it
     // is saved, and up leaves it in place (root's git can't see into it).
     let sub_deny: Vec<String> = ex.deny.iter().chain(&ex.regen_extra).cloned().collect();
@@ -651,12 +668,7 @@ fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         let dir = root.join(&sub);
         let Some(git_dir) = submodule_git_dir(&dir)? else {
             // Not checked out: an empty or missing dir holds nothing.
-            let empty = match fs::read_dir(&dir) {
-                Ok(mut entries) => entries.next().is_none(),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => true,
-                Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-            };
-            if empty {
+            if is_empty_or_missing(&dir)? {
                 continue;
             }
             return Ok(Some(format!("submodule {sub} has files but no .git")));
@@ -701,6 +713,14 @@ fn submodule_change(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
         pending.extend(gitlinks(&g)?.into_iter().map(|p| format!("{sub}/{p}")));
     }
     Ok(None)
+}
+
+fn is_empty_or_missing(dir: &Path) -> Result<bool> {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
 }
 
 /// The git dir of the submodule checkout at `dir`: its `.git` dir, or the
@@ -1722,6 +1742,38 @@ mod tests {
             fs::read_to_string(wt.join("lib/a.txt")).unwrap(),
             "edited\n"
         );
+    }
+
+    /// Files in a submodule dir that is not checked out are in no save;
+    /// cold refuses before saving anything.
+    #[test]
+    fn uninitialized_submodule_with_files_is_refused() {
+        let (tmp, wt, home, id) = submodule_case(|wt| {
+            git(wt, &["submodule", "deinit", "-q", "-f", "lib"]);
+            fs::write(wt.join("lib/x.txt"), "x\n").unwrap();
+        });
+        let out = cold(&home, &id).unwrap();
+        assert_eq!(
+            out,
+            Outcome::Skipped("submodule lib is not checked out but has files".into())
+        );
+        assert!(wt.join("lib/x.txt").is_file());
+        let wip = Git::at(tmp.path().join("r")).run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/bale/{id}/wip"),
+        ]);
+        assert!(wip.is_err(), "nothing is saved");
+    }
+
+    /// An empty, not checked out submodule dir holds nothing to lose.
+    #[test]
+    fn uninitialized_empty_submodule_goes_cold() {
+        let (_tmp, _wt, home, id) = submodule_case(|wt| {
+            git(wt, &["submodule", "deinit", "-q", "-f", "lib"]);
+        });
+        assert_eq!(cold(&home, &id).unwrap(), Outcome::Done(Level::Cold));
     }
 
     /// The trash marker lets `recover` delete the trash without checking
