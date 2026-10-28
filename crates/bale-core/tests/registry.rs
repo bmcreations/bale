@@ -100,7 +100,12 @@ fn id_stable_for_same_path() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(id, workspace_id(&p));
     assert_ne!(id, workspace_id(&p2));
-    // Falls back to the given path once it is gone.
+    // The id must survive the directory being removed (cold workspaces).
     std::fs::remove_dir(&p).unwrap();
-    assert_eq!(workspace_id(&p), workspace_id(&p));
+    assert_eq!(workspace_id(&p), id);
+    let nested = p.join("gone").join("deeper");
+    std::fs::create_dir_all(&nested).unwrap();
+    let nid = workspace_id(&nested);
+    std::fs::remove_dir_all(&p).unwrap();
+    assert_eq!(workspace_id(&nested), nid);
 }

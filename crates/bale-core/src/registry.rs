@@ -35,9 +35,31 @@ pub struct Record {
 /// First 12 hex characters of the sha256 of the canonicalized path, falling
 /// back to the given path when it no longer exists.
 pub fn workspace_id(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = canonical_or_ancestor(path);
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Canonicalizes `path`; when it no longer exists, canonicalizes the nearest
+/// existing ancestor and re-joins the remaining components, so the result
+/// matches what canonicalize gave while the path existed.
+fn canonical_or_ancestor(path: &Path) -> PathBuf {
+    if let Ok(c) = fs::canonicalize(path) {
+        return c;
+    }
+    let mut rest = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_os_string());
+        }
+        if let Ok(mut c) = fs::canonicalize(parent) {
+            c.extend(rest.iter().rev());
+            return c;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
 }
 
 pub struct Registry {
@@ -61,12 +83,17 @@ impl Registry {
 
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
         let path = self.record_path(id);
-        if !path.exists() {
-            return Ok(None);
+        match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map(Some)
+                .with_context(|| format!("corrupt record {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading record {}", path.display())),
         }
-        Self::read(&path).map(Some)
     }
 
+    /// Callers hold the `WorkspaceLock` for this id (the shared tmp name relies on it).
+    ///
     /// Writes `<id>.json.tmp`, fsyncs it, renames it over `<id>.json`, then
     /// fsyncs the directory (skipped on Windows).
     pub fn put(&self, record: &Record) -> Result<()> {
