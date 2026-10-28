@@ -89,6 +89,8 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool) -> Result<Outcome> 
     let mut record = registry
         .get(id)?
         .with_context(|| format!("record for {id} vanished"))?;
+    // The branch may have changed since registration; open restores this one.
+    record.branch = git::current_branch(&root)?;
     git::lock_worktree(&root, &root)?;
     record.level = Level::Cooling;
     registry.put(&record)?;
@@ -316,6 +318,7 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             back_to_baled(registry, &mut record, &root)?;
             return Ok(Outcome::Skipped(reason));
         }
+        record.branch = git::current_branch(&root)?;
         git::lock_worktree(&root, &root)?;
         return finish(home, registry, record, &root);
     }

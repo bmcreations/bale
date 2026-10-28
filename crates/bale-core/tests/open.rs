@@ -629,3 +629,79 @@ fn uninitialized_submodule_is_noted() {
     );
     assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
 }
+
+/// Registered on `feat-a`, switched to `feat-b` (optionally with a commit),
+/// then colded by id: open lands on `feat-b`.
+fn switch_then_cold_by_id(commit: bool) {
+    let fx = Fixture::new();
+    commit_ignore(&fx);
+    let wt = fx.add_worktree("wt", "feat-a");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(&wt, &["switch", "-q", "-c", "feat-b"]);
+    if commit {
+        fs::write(wt.join("f"), "on feat-b\n").unwrap();
+        git(&wt, &["commit", "-qam", "feat-b work"]);
+    }
+    let feat_a = rev(&fx.repo, "feat-a");
+
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.branch.as_deref(), Some("feat-b"));
+
+    let report = open(&fx.home(), &id).unwrap();
+    assert_eq!(report.detached_reason, None);
+    assert_eq!(
+        git(&wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/feat-b"
+    );
+    assert_eq!(rev(&fx.repo, "feat-a"), feat_a);
+    if commit {
+        assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "on feat-b\n");
+    }
+}
+
+#[test]
+fn cold_by_id_keeps_a_branch_switched_to_without_a_commit() {
+    switch_then_cold_by_id(false);
+}
+
+#[test]
+fn cold_by_id_keeps_a_branch_switched_to_with_a_commit() {
+    switch_then_cold_by_id(true);
+}
+
+#[test]
+fn cold_by_id_after_detaching_opens_detached() {
+    let fx = Fixture::new();
+    commit_ignore(&fx);
+    let wt = fx.add_worktree("wt", "feat-a");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(&wt, &["switch", "-q", "--detach"]);
+
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.branch, None);
+    open(&fx.home(), &id).unwrap();
+    assert!(git(&wt, &["branch", "--show-current"]).trim().is_empty());
+}
+
+/// A Cooling record whose checkout is still there is saved again from
+/// scratch; it saves the branch current then.
+#[test]
+fn cooling_recovery_saves_the_current_branch() {
+    let fx = Fixture::new();
+    commit_ignore(&fx);
+    let wt = fx.add_worktree("wt", "feat-a");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    git(&wt, &["switch", "-q", "-c", "feat-b"]);
+    set_level(&fx, &id, Level::Cooling);
+
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.branch.as_deref(), Some("feat-b"));
+    open(&fx.home(), &id).unwrap();
+    assert_eq!(
+        git(&wt, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/feat-b"
+    );
+}

@@ -32,25 +32,29 @@ impl Git {
         self
     }
 
+    fn output(&self, args: &[&str]) -> Result<std::process::Output> {
+        Command::new("git")
+            .args(args)
+            .current_dir(&self.dir)
+            .env("LC_ALL", "C")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // A git hook sets these; they would redirect us to another repo.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .envs(self.envs.iter().map(|(k, v)| (k, v)))
+            .output()
+            .with_context(|| format!("failed to run git {}", args.join(" ")))
+    }
+
     /// Runs `git <args>` in the directory and returns stdout. Retries up to five
     /// times (100, 200, 400, 800, 1600 ms) when stderr reports a held
     /// `index.lock` or ref lock; any other failure returns immediately.
     pub fn run(&self, args: &[&str]) -> Result<String> {
         let mut attempt = 0;
         loop {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(&self.dir)
-                .env("LC_ALL", "C")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                // A git hook sets these; they would redirect us to another repo.
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_COMMON_DIR")
-                .envs(self.envs.iter().map(|(k, v)| (k, v)))
-                .output()
-                .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+            let out = self.output(args)?;
             if out.status.success() {
                 return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
             }
@@ -138,6 +142,29 @@ pub fn common_dir(dir: &Path) -> Result<PathBuf> {
 /// This worktree's private admin dir (`.git` itself for the main worktree).
 pub fn admin_dir(dir: &Path) -> Result<PathBuf> {
     path_query(dir, "--git-dir")
+}
+
+/// The branch checked out at `dir` (without `refs/heads/`), or `None` when
+/// HEAD is detached.
+pub fn current_branch(dir: &Path) -> Result<Option<String>> {
+    let args = ["symbolic-ref", "-q", "HEAD"];
+    let out = Git::at(dir).output(&args)?;
+    if out.status.code() == Some(1) && out.stderr.is_empty() {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let full = String::from_utf8_lossy(&out.stdout);
+    let full = full.trim_end_matches(['\n', '\r']);
+    Ok(Some(
+        full.strip_prefix("refs/heads/").unwrap_or(full).to_string(),
+    ))
 }
 
 /// True when `status --porcelain` shows anything, untracked files included.
