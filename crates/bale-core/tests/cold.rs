@@ -173,6 +173,9 @@ fn cold_refuses_main_checkout() {
         last_activity: SystemTime::now(),
         note: None,
         trash: Vec::new(),
+        origin: None,
+        pinned: false,
+        scope: None,
     };
     Registry::open(fx.home()).put(&rec).unwrap();
     let err = cold(&fx.home(), &id).unwrap_err();

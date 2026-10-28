@@ -2,17 +2,18 @@ mod install;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::gc::{gc, GcReport};
+use bale_core::ops::meta::set_pinned;
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
-use bale_core::registry::Registry;
+use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
 
@@ -101,6 +102,24 @@ enum Command {
         /// Print the files and commands without changing anything.
         #[arg(long)]
         print_only: bool,
+    },
+    /// Keep sweep from upping or colding a worktree.
+    Pin {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
+    },
+    /// Let sweep manage a pinned worktree again.
+    Unpin {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
+    },
+    /// Show a registered worktree: its level, pin, origin session and git scope.
+    Show {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
     },
     /// List registered worktrees.
     Ls {
@@ -242,6 +261,9 @@ fn main() -> ExitCode {
                 plan.apply().map(|()| ExitCode::SUCCESS)
             }
         }),
+        Command::Pin { target } => cmd_pin(&home, &target, true),
+        Command::Unpin { target } => cmd_pin(&home, &target, false),
+        Command::Show { target } => cmd_show(&home, &target).map(|()| ExitCode::SUCCESS),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
     };
     result.unwrap_or_else(|e| {
@@ -476,24 +498,170 @@ fn human(bytes: u64) -> String {
 fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
     let records = Registry::open(home.clone()).all()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&records)?);
+        let rows = records
+            .iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(r)?;
+                v["origin"] = serde_json::to_value(&r.origin)?;
+                v["pinned"] = r.pinned.into();
+                v["scope"] = serde_json::to_value(scope_of(r).map(|(s, _)| s))?;
+                Ok(v)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     println!(
-        "{:<12}  {:<7}  {:<10}  {:<20}  PATH",
-        "ID", "LEVEL", "ACTIVE", "BRANCH"
+        "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  PATH",
+        "ID", "LEVEL", "ACTIVE", "BRANCH", "SESSION"
     );
     for r in records {
+        let level = format!("{}{}", if r.pinned { "*" } else { "" }, r.level.name());
         println!(
-            "{:<12}  {:<7}  {:<10}  {:<20}  {}",
+            "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  {}",
             r.id,
-            r.level.name(),
+            level,
             ago(r.last_activity),
             r.branch.as_deref().unwrap_or("(detached)"),
+            truncate(&session_label(&r), SESSION_WIDTH),
             r.path.display()
         );
     }
     Ok(())
+}
+
+/// Widest `SESSION` cell in `bale ls`, in chars.
+const SESSION_WIDTH: usize = 50;
+
+/// What `bale ls` names a tree's session: its title when known, else the
+/// newest commit subject, else `-`.
+fn session_label(r: &Record) -> String {
+    r.origin
+        .as_ref()
+        .and_then(|o| o.title.clone())
+        .or_else(|| scope_of(r).and_then(|(s, _)| s.subjects.into_iter().next()))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// `text` cut to at most `max` chars, ending in `…` when cut.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The tree's scope and whether it is live: read from git for a hot or
+/// baled tree, else the snapshot cold saved, if any.
+fn scope_of(r: &Record) -> Option<(Scope, bool)> {
+    match r.level {
+        Level::Hot | Level::Baled => bale_core::git::scope(&r.path).ok().map(|s| (s, true)),
+        _ => r.scope.clone().map(|s| (s, false)),
+    }
+}
+
+fn cmd_pin(home: &BaleHome, target: &str, pinned: bool) -> Result<ExitCode> {
+    let id = resolve(home, target)?;
+    set_pinned(home, &id, pinned)?;
+    println!("{id}: {}", if pinned { "pinned" } else { "unpinned" });
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The record for an id or a registered path; never registers anything.
+fn lookup(home: &BaleHome, target: &str) -> Result<Record> {
+    let registry = Registry::open(home.clone());
+    if let Some(r) = registry.get(target)? {
+        return Ok(r);
+    }
+    let path = std::path::absolute(target)?;
+    registry
+        .get(&workspace_id(&path))?
+        .with_context(|| format!("{target} is not registered; run `bale adopt` first"))
+}
+
+fn cmd_show(home: &BaleHome, target: &str) -> Result<()> {
+    let r = lookup(home, target)?;
+    print!(
+        "{}",
+        show_text(&r, r.origin.as_ref().and_then(|o| o.title.clone()))
+    );
+    Ok(())
+}
+
+/// `bale show`'s text for `r`, with `title` the session title if known.
+fn show_text(r: &Record, title: Option<String>) -> String {
+    let mut out = String::new();
+    let mut line = |label: &str, value: &str| out.push_str(&format!("{label:<9} {value}\n"));
+    line("id:", &r.id);
+    line("path:", &r.path.display().to_string());
+    line("level:", r.level.name());
+    line("pinned:", if r.pinned { "yes" } else { "no" });
+    match &r.origin {
+        Some(o) => line("origin:", &format!("{} session {}", o.tool, o.session)),
+        None => line("origin:", "unknown"),
+    }
+    if let Some(title) = title {
+        line("title:", &title);
+    }
+    match scope_of(r) {
+        None => out.push_str("scope:    none saved\n"),
+        Some((s, live)) => out.push_str(&scope_text(&s, live)),
+    }
+    out
+}
+
+fn scope_text(s: &Scope, live: bool) -> String {
+    let mut out = String::from(if live {
+        "scope (live from git):\n"
+    } else {
+        "scope (saved when it went cold):\n"
+    });
+    let mut line = |label: &str, value: &str| out.push_str(&format!("  {label:<9} {value}\n"));
+    let branch = s.branch.as_deref().unwrap_or("(detached)");
+    match &s.upstream {
+        Some(u) => line(
+            "branch:",
+            &format!(
+                "{branch} (upstream {u}, {} ahead, {} behind)",
+                s.ahead, s.behind
+            ),
+        ),
+        None => line("branch:", &format!("{branch} (no upstream)")),
+    }
+    if s.unpushed > 0 {
+        let noun = if s.unpushed == 1 { "commit" } else { "commits" };
+        line("unpushed:", &format!("{} {noun} on no remote", s.unpushed));
+    }
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(s.last_commit_unix.max(0) as u64);
+    line("commit:", &format!("last {}", ago(when)));
+    let changes = if s.changed_files == 0 {
+        "none uncommitted".to_string()
+    } else {
+        format!(
+            "{} {} changed, {} {}(+), {} {}(-)",
+            s.changed_files,
+            plural(s.changed_files, "file"),
+            s.insertions,
+            plural(s.insertions, "insertion"),
+            s.deletions,
+            plural(s.deletions, "deletion"),
+        )
+    };
+    line("changes:", &changes);
+    for subject in &s.subjects {
+        out.push_str(&format!("    {subject}\n"));
+    }
+    out
+}
+
+fn plural(n: u32, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 fn ago(t: SystemTime) -> String {

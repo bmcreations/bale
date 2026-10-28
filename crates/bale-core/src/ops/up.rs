@@ -106,6 +106,9 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
                 last_activity,
                 note: None,
                 trash: Vec::new(),
+                origin: None,
+                pinned: false,
+                scope: None,
             }
         }
     };

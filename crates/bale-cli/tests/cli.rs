@@ -1551,3 +1551,154 @@ fn install_conductor_does_not_chain_bale_twice() {
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), text);
 }
+
+/// `feat` worktree with two commits no remote ref has (`main` counts as
+/// pushed through `refs/remotes/origin/main`).
+fn unpushed_worktree(env: &Env) -> PathBuf {
+    env.git(
+        &env.repo,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    let wt = env.add_worktree("feat");
+    for (file, subject) in [("a", "first change"), ("b", "add the session column")] {
+        fs::write(wt.join(file), "x\n").unwrap();
+        env.git(&wt, &["add", file]);
+        env.git(&wt, &["commit", "-q", "-m", subject]);
+    }
+    wt
+}
+
+/// The `bale ls` row whose last column is `wt`'s path.
+fn ls_row(env: &Env, wt: &Path) -> String {
+    let out = env.bale(&env.repo, &["ls"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let want = canon(wt);
+    stdout(&out)
+        .lines()
+        .find(|l| {
+            l.split("  ")
+                .last()
+                .is_some_and(|p| canon(Path::new(p.trim())) == want)
+        })
+        .unwrap_or_else(|| panic!("no row for {}: {}", wt.display(), stdout(&out)))
+        .to_string()
+}
+
+#[test]
+fn pin_and_unpin_mark_the_tree_in_ls() {
+    let env = Env::new();
+    let wt = env.add_worktree("feat");
+    // Default target is the current directory, as with adopt.
+    let out = env.bale(&wt, &["pin"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).ends_with(": pinned\n"), "{}", stdout(&out));
+    let row = ls_row(&env, &wt);
+    assert!(row.contains("*hot"), "{row}");
+
+    let out = env.bale(&env.repo, &["unpin", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).ends_with(": unpinned\n"), "{}", stdout(&out));
+    let row = ls_row(&env, &wt);
+    assert!(!row.contains('*'), "{row}");
+    assert!(row.contains(" hot "), "{row}");
+}
+
+#[test]
+fn ls_shows_session_column_and_json_fields() {
+    let env = Env::new();
+    let wt = unpushed_worktree(&env);
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = env.bale(&env.repo, &["ls"], None);
+    let header = stdout(&out).lines().next().unwrap().to_string();
+    let cols: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(
+        cols,
+        ["ID", "LEVEL", "ACTIVE", "BRANCH", "SESSION", "PATH"],
+        "{header}"
+    );
+    // No title known: the newest commit subject stands in.
+    let row = ls_row(&env, &wt);
+    assert!(row.contains("add the session column"), "{row}");
+
+    let out = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rec = &v.as_array().unwrap()[0];
+    assert_eq!(rec["pinned"], false);
+    assert!(rec["origin"].is_null(), "{rec}");
+    assert_eq!(rec["scope"]["unpushed"], 2);
+    assert_eq!(rec["scope"]["subjects"][0], "add the session column");
+}
+
+#[test]
+fn ls_truncates_long_subjects_to_50_chars() {
+    let env = Env::new();
+    let wt = env.add_worktree("feat");
+    env.git(
+        &env.repo,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    let long = "x".repeat(80);
+    env.git(&wt, &["commit", "-q", "--allow-empty", "-m", &long]);
+    env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    let row = ls_row(&env, &wt);
+    assert!(!row.contains(&"x".repeat(51)), "{row}");
+    assert!(row.contains(&"x".repeat(49)), "{row}");
+}
+
+#[test]
+fn show_prints_live_then_saved_scope() {
+    let env = Env::new();
+    let wt = unpushed_worktree(&env);
+    fs::write(wt.join("f"), "two\n").unwrap();
+    let arg = wt.to_str().unwrap();
+    env.bale(&env.repo, &["pin", arg], None);
+
+    let out = env.bale(&env.repo, &["show", arg], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for want in [
+        "level:    hot",
+        "pinned:   yes",
+        "scope (live from git):",
+        "branch:   feat (no upstream)",
+        "2 commits on no remote",
+        "add the session column",
+        "first change",
+        "1 file changed, 1 insertion(+), 1 deletion(-)",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    let id = text
+        .lines()
+        .find_map(|l| l.strip_prefix("id:"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let out = env.bale(&env.repo, &["cold", arg], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Cold: the checkout is gone, so show prints what cold saved, by id.
+    let out = env.bale(&env.repo, &["show", &id], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for want in [
+        "level:    cold",
+        "scope (saved when it went cold):",
+        "2 commits on no remote",
+        "add the session column",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn show_refuses_an_unregistered_tree_without_registering_it() {
+    let env = Env::new();
+    let wt = env.add_worktree("feat");
+    let out = env.bale(&env.repo, &["show", wt.to_str().unwrap()], None);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not registered"), "{}", stderr(&out));
+    assert!(!env.is_registered(&wt));
+}

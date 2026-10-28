@@ -17,6 +17,9 @@ fn record(id: &str) -> Record {
         last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         note: None,
         trash: Vec::new(),
+        origin: None,
+        pinned: false,
+        scope: None,
     }
 }
 

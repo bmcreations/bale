@@ -106,6 +106,10 @@ fn cold_with(home: &BaleHome, id: &str, require_clean: bool, ignore: &[u32]) -> 
         .with_context(|| format!("record for {id} vanished"))?;
     // The branch may have changed since registration; open restores this one.
     record.branch = git::current_branch(&root)?;
+    // Lets a cold tree still describe itself; best effort, never a refusal.
+    if let Ok(scope) = git::scope(&root) {
+        record.scope = Some(scope);
+    }
     git::lock_worktree(&root, &root)?;
     record.level = Level::Cooling;
     registry.put(&record)?;

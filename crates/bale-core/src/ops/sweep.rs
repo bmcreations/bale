@@ -77,6 +77,11 @@ pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, Stri
 }
 
 fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String) {
+    // A pinned tree is left to its owner, even mid-transition; only the
+    // interrupted-open hint still shows, since it changes nothing.
+    if record.pinned && record.level != Level::Opening {
+        return (Action::Keep, "pinned".into());
+    }
     let action = match plan(home, record) {
         Ok(action) => action,
         Err(e) => {
