@@ -219,7 +219,8 @@ pub fn install_plan(repo: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
         },
         Step::Note(format!(
             "note: {} is usually committed; commit it so every Conductor workspace of \
-             this repo runs bale",
+             this repo runs bale. It holds this machine's absolute path to bale; the \
+             scripts skip bale where it is not at that path",
             display_path(&path)
         )),
     ]);

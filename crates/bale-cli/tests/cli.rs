@@ -1518,6 +1518,11 @@ fn install_conductor_keeps_existing_scripts_and_comments() {
     );
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("committed"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("this machine's absolute path to bale"),
+        "{}",
+        stdout(&out)
+    );
     let after = fs::read_to_string(&path).unwrap();
     let lines: Vec<&str> = after.lines().collect();
     assert_eq!(lines[0], "# Team scripts for Conductor.");
