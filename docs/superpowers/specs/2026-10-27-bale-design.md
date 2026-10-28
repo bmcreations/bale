@@ -205,8 +205,10 @@ against what was captured before it is used.
    A directory with a regenerable name that holds files git tracks, or untracked files that are not
    ignored, is kept and reported: it is source, not build output. A regenerable-named entry that is itself
    untracked and not ignored, including a symlink, is kept the same way. So is a regenerable-named directory
-   inside a submodule or a nested repository (any directory between the workspace root and it has a `.git`
-   entry): the workspace's git can't see what it holds.
+   inside a submodule or a nested repository (any directory between the workspace root and it, or it, has a
+   `.git` entry): the workspace's git can't see what it holds. A nested repository inside an ignored
+   regenerable directory, such as `build/x/.git`, is treated as part of that directory's output: it is
+   removed with it, and `cold` does not save it.
 6. Remove the workspace's external build output too. That includes Xcode DerivedData folders under
    `~/Library/Developer/Xcode/DerivedData` whose `info.plist` `WorkspacePath` points into this workspace.
    A folder with a missing or unreadable `WorkspacePath` is left alone. So is global DerivedData that matches
@@ -245,9 +247,15 @@ Everything in `bale up`, then:
    saved. An allowlist would miss the next secret someone adds. Files are stored with mode 0600, never in any
    shared store.
 4. Verify the saved state by hashing it against the tree.
-5. Rename the checkout directory to a trash name and verify the moved tree again. A process that opened the
-   tree after the busy check could have written to it; on any change, move it back, return the record to
-   `baled` and report the tree busy. Otherwise remove the trash directory. The worktree stays locked in git.
+5. Rename the checkout directory to a trash name and verify the moved tree again, with the same checks as
+   step 4. That includes each submodule's contents, nested submodules too: a tracked edit, an untracked
+   file, or an ignored file that is not regenerable inside a submodule counts as a change, since the wip
+   commit holds only the submodule's commit. Then check again for processes holding the moved tree. A
+   process that opened the tree after the busy check could have written to it. On any change, move the tree
+   back, return the record to `baled` and report it busy (with the holders, when the re-check found some).
+   If a check itself fails, move the tree back the same way and report the error. Only when both checks pass,
+   record the trash name and the wip commit it was checked against, then remove the trash directory. The
+   worktree stays locked in git.
 6. Write the registry record as `cold`.
 
 ### `bale open`
@@ -295,6 +303,24 @@ the source it saves is about 1 GB per Android worktree.)*
 - If the branch is checked out in another worktree, `open` stays detached at the saved commit and reports it.
 - `cold` refuses trees with submodules that have their own uncommitted changes, and trees using sparse
   checkout. LFS pointer files need no special handling, because the checkout restores them.
+
+### Recovering an interrupted `cold`
+
+A record left `cooling` by a crash resumes on the next `cold` or sweep.
+
+- If the checkout is still at its path, `cold` saves and verifies it again from step 2.
+- If the checkout is gone and `refs/bale/<id>/wip` does not resolve, or the saved manifest is missing,
+  nothing is deleted: `cold` reports an error and leaves any trash directory beside the path.
+- Otherwise each trash directory beside the path is handled in turn:
+  - If step 5 recorded it (both the trash name and the wip commit match), it was already checked and is
+    deleted.
+  - If it was not recorded and has no `.git`, it is kept and reported as an error, since git can't check it
+    against the save.
+  - If it was not recorded, it is checked against the save as in step 5. If it matches, it is deleted. If it
+    changed, or the check fails, it is moved back to the recorded path and the record returns to `baled`;
+    a change is reported busy, and a failed check as an error. If the move back fails, the trash stays where it
+    is, the record stays `cooling`, and the error names both paths.
+- When every trash directory is gone, the record is written `cold`.
 
 ### Configuration
 
