@@ -50,6 +50,53 @@ pub struct Record {
     /// before the first move so a resumed `up` removes exactly these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trash: Vec<PathBuf>,
+    /// The tool session that made the tree, as its adapter recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+    /// A pinned tree is never upped or colded by `sweep`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
+    /// What the tree held, saved by `cold` just before it deletes the
+    /// checkout, so a cold tree still describes itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Which tool session a tree belongs to. Core stores it and never reads it;
+/// the meaning of each field is the adapter's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    pub tool: String,
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// A tree's git state, from [`crate::git::scope`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Scope {
+    pub branch: Option<String>,
+    /// The upstream's short name (`origin/main`), when one is set.
+    pub upstream: Option<String>,
+    /// Commits on HEAD and not on the upstream; 0 without one.
+    pub ahead: u32,
+    /// Commits on the upstream and not on HEAD; 0 without one.
+    pub behind: u32,
+    /// Commits on HEAD that no remote ref has.
+    pub unpushed: u32,
+    /// Newest first, at most 8: commits since the merge-base with the
+    /// upstream or, without one, the unpushed ones.
+    pub subjects: Vec<String>,
+    pub last_commit_unix: i64,
+    /// Files changed against HEAD, untracked non-ignored files included.
+    pub changed_files: u32,
+    pub insertions: u32,
+    pub deletions: u32,
 }
 
 /// First 12 hex characters of the sha256 of the canonicalized path, falling

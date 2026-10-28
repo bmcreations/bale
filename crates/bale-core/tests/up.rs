@@ -2,11 +2,11 @@ mod support;
 
 use bale_core::derived_data::derived_data_for;
 use bale_core::git::worktrees;
-use bale_core::ops::up::{register, up, up_report, Outcome};
+use bale_core::ops::up::{register, up, up_report, Outcome, SkipCode, SkipReason};
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
-use support::Fixture;
+use support::{write_plist, Fixture};
 
 /// A `.gitignore` in `wt` that ignores Gradle's output dirs.
 fn ignore_build(wt: &Path) {
@@ -207,7 +207,10 @@ fn user_locked_tree_is_skipped_untouched() {
         let id = register(&fx.home(), &wt).unwrap().id;
         lock(&fx, &wt, reason);
         let out = up(&fx.home(), &id).unwrap();
-        assert_eq!(out, Outcome::Skipped(want.into()));
+        assert_eq!(
+            out,
+            Outcome::Skipped(SkipReason::new(SkipCode::WorktreeLocked, want))
+        );
         assert!(wt.join("app/build/big.bin").exists());
         assert_eq!(level(&fx, &id), Level::Hot);
         assert_eq!(linked_lock(&fx).as_deref(), Some(reason.unwrap_or("")));
@@ -325,18 +328,6 @@ fn non_worktree_refused() {
     assert!(register(&fx.home(), &dir).is_err());
 }
 
-fn write_plist(dir: &Path, workspace_path: &Path) {
-    fs::create_dir_all(dir).unwrap();
-    let mut dict = plist::Dictionary::new();
-    dict.insert(
-        "WorkspacePath".into(),
-        plist::Value::String(workspace_path.to_string_lossy().into_owned()),
-    );
-    plist::Value::Dictionary(dict)
-        .to_file_xml(dir.join("info.plist"))
-        .unwrap();
-}
-
 #[test]
 fn derived_data_matching() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -345,11 +336,11 @@ fn derived_data_matching() {
     fs::create_dir_all(ws.join("App.xcworkspace")).unwrap();
     fs::create_dir_all(&other).unwrap();
     let dd = tmp.path().join("dd");
-    write_plist(&dd.join("A"), &ws.join("App.xcworkspace"));
-    write_plist(&dd.join("B"), &other);
+    write_plist(&dd.join("A"), Some(&ws.join("App.xcworkspace")));
+    write_plist(&dd.join("B"), Some(&other));
     fs::create_dir_all(dd.join("C")).unwrap();
     // A sibling whose name extends the workspace's must not match.
-    write_plist(&dd.join("D"), &tmp.path().join("ws2/App.xcworkspace"));
+    write_plist(&dd.join("D"), Some(&tmp.path().join("ws2/App.xcworkspace")));
     fs::create_dir_all(dd.join("E")).unwrap();
     fs::write(dd.join("E/info.plist"), "not a plist").unwrap();
 
@@ -584,4 +575,42 @@ fn registers_a_worktree_of_a_submodule() {
 
     let rec = register(&fx.home(), &wt).unwrap();
     assert_eq!(rec.level, Level::Hot);
+}
+
+/// An Xcode worktree whose ignored `build/dd` is a DerivedData root.
+fn xcode_worktree(fx: &Fixture) -> PathBuf {
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+    write_plist(&wt.join("build/dd"), Some(&wt.join("App.xcodeproj")));
+    fs::create_dir_all(wt.join("build/dd/Build/Products")).unwrap();
+    fs::write(wt.join("build/dd/Build/Products/big.bin"), vec![0u8; 1024]).unwrap();
+    fs::create_dir_all(wt.join("src")).unwrap();
+    fs::write(wt.join("src/main.swift"), "print(1)\n").unwrap();
+    wt
+}
+
+#[test]
+fn up_removes_in_tree_derived_data() {
+    let fx = Fixture::new();
+    let wt = xcode_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!wt.join("build/dd").exists());
+    assert!(wt.join("src/main.swift").exists());
+    assert!(trash_left(&wt).is_empty());
+}
+
+#[test]
+fn derived_data_with_tracked_file_is_kept() {
+    let fx = Fixture::new();
+    let wt = xcode_worktree(&fx);
+    fs::write(wt.join("build/dd/keep.txt"), "keep\n").unwrap();
+    support::git(&wt, &["add", "-f", "build/dd/keep.txt"]);
+    support::git(&wt, &["commit", "-qm", "keep"]);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    up(&fx.home(), &id).unwrap();
+    assert!(wt.join("build/dd/keep.txt").exists());
+    assert!(wt.join("build/dd/Build/Products/big.bin").exists());
 }

@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "bale-core",
+ "bale-hooks",
  "clap",
  "serde_json",
  "tempfile",
@@ -101,6 +102,18 @@ dependencies = [
  "tempfile",
  "toml",
  "walkdir",
+]
+
+[[package]]
+name = "bale-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bale-core",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml_edit",
 ]
 
 [[package]]

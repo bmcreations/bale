@@ -2,17 +2,22 @@
 //! record is handled on its own; a failure in one becomes that record's row.
 
 use std::fs;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde_json::Map;
 
 use crate::config::{load_config, Config};
+use crate::derived_data::{global_root, index, is_derived_data_root, workspace_key, DdDir};
 use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
 use crate::ops::up::{bale_able_from, up_report, Outcome};
+use crate::par::par_map;
 use crate::registry::{Level, Record, Registry};
+use crate::trace::{put_clipped, BuildLog, Size, MAX_ID, MAX_PATH};
 use crate::BaleHome;
 
 /// Report text for a record `bale open` left half done; `sweep` puts the
@@ -58,30 +63,353 @@ pub fn decide(
 /// returning one `(id, action, result)` row each; a record file that does
 /// not parse becomes a `Report` row keyed by its file stem. Errs only when
 /// the registry directory cannot be read.
+///
+/// Also appends the run's usage trace (see [`crate::trace`]): a `tree` line
+/// per record, a `build` line per Xcode build log not seen before, and one
+/// `sweep` line; then prunes old trace files. Sizes and build logs are read
+/// before any tree is changed.
 pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
+    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run))
+}
+
+fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
+    let start = Instant::now();
     let records = Registry::open(home.clone()).all_lenient()?;
-    Ok(records
-        .into_iter()
-        .map(|(stem, record)| match record {
+    // Xcode's shared DerivedData is listed once and each folder in it sized
+    // once, however many trees it belongs to.
+    let global = global_root().map(|g| index(&g)).unwrap_or_default();
+    let roots: Vec<Option<PathBuf>> = records
+        .iter()
+        .map(|(_, r)| r.as_ref().ok().map(|r| workspace_key(&r.path)))
+        .collect();
+    let matches = match_trees(&global, &roots);
+    let mut measured = par_map(&records, |(_, record)| match record {
+        Ok(r) => measure(home, r),
+        Err(_) => Measured::default(),
+    });
+    let wanted: Vec<bool> = measured.iter().map(|m| m.wants_global).collect();
+    let global_dd = size_global_dd(&global, &matches, &wanted, |dir, deadline| {
+        crate::trace::size_tree(dir, &[], deadline)
+    });
+    // Build logs in the shared folders, from the same listing, before any
+    // tree's `up` removes one.
+    for ((m, mine), dd) in measured.iter_mut().zip(&matches).zip(&global_dd.per_tree) {
+        m.global_dd = *dd;
+        if m.wants_global {
+            for &i in mine {
+                m.builds.extend(logs_of(&global[i].dir));
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(records.len());
+    let mut builds = Vec::new();
+    let mut paths = Vec::new();
+    for ((stem, record), m) in records.into_iter().zip(measured) {
+        match record {
             Ok(record) => {
-                let (action, result) = sweep_one(home, &record, dry_run);
-                (record.id, action, result)
+                let (action, result, edited) = sweep_one(home, &record, dry_run);
+                trace_tree(home, &record, &action, edited, &m);
+                builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
+                paths.push(record.path.clone());
+                rows.push((record.id, action, result));
             }
             Err(e) => {
                 // The row is keyed by the file stem, so the cause alone suffices.
                 let text = format!("corrupt record: {}", e.root_cause());
-                (stem, Action::Report(text.clone()), text)
+                rows.push((stem, Action::Report(text.clone()), text));
             }
-        })
-        .collect())
+        }
+    }
+    let now = SystemTime::now();
+    crate::trace::record_builds(home, &builds, now);
+    let mut fields = Map::new();
+    if dry_run {
+        fields.insert("dry_run".into(), true.into());
+    }
+    fields.insert("volumes".into(), crate::trace::volumes(home, &paths).into());
+    fields.insert("global_dd_total_bytes".into(), global_dd.total.into());
+    fields.insert(
+        "global_dd_unattributed_bytes".into(),
+        global_dd.unattributed.into(),
+    );
+    if global_dd.truncated {
+        fields.insert("global_dd_truncated".into(), true.into());
+    }
+    if global_dd.unattributed_truncated {
+        fields.insert("global_dd_unattributed_truncated".into(), true.into());
+    }
+    fields.insert("duration_ms".into(), millis(start.elapsed()).into());
+    crate::trace::emit(home, "sweep", fields);
+    crate::trace::prune(home, now);
+    Ok(rows)
 }
 
-fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String) {
-    let action = match plan(home, record) {
-        Ok(action) => action,
+/// Sizing longer than this for one tree's checkout is cut short; the bytes
+/// counted so far are recorded with `sizing_truncated`.
+const SIZING_LIMIT: Duration = Duration::from_secs(30);
+
+/// Walking one folder in Xcode's shared DerivedData longer than this is cut
+/// short; the bytes counted so far are recorded with `global_dd_truncated`.
+/// Folders no tree claims share one such budget, from the start of the
+/// shared DerivedData pass.
+const GLOBAL_DD_LIMIT: Duration = Duration::from_secs(120);
+
+/// What sweep reads from a tree before changing anything, for its trace.
+#[derive(Default)]
+struct Measured {
+    /// `(regen_bytes, tree_bytes)`, partial when `truncated`; `None` for
+    /// trees not on disk or after an error.
+    sizes: Option<(u64, u64)>,
+    truncated: bool,
+    /// The tree is on disk and `Hot` or `Baled`, so its share of Xcode's
+    /// shared DerivedData is sized too.
+    wants_global: bool,
+    /// Bytes of the folders in Xcode's shared DerivedData built from the
+    /// tree, which `up` also removes on macOS; `None` when not sized.
+    global_dd: Option<DdBytes>,
+    sizing_ms: Option<u64>,
+    builds: Vec<BuildLog>,
+}
+
+/// Sizes a `Hot` or `Baled` checkout and reads the Xcode build logs inside
+/// it. Shared DerivedData is left to [`size_global_dd`]. Errors warn once
+/// (via the trace) and leave the fields empty.
+fn measure(home: &BaleHome, record: &Record) -> Measured {
+    let mut m = Measured::default();
+    if !matches!(record.level, Level::Hot | Level::Baled) {
+        return m;
+    }
+    let start = Instant::now();
+    let root = match crate::paths::canonicalize(&record.path) {
+        Ok(root) => root,
+        Err(_) => return m,
+    };
+    m.wants_global = true;
+    let regen =
+        load_config(home, Some(&root)).map(|cfg| regenerable_dirs(&root, &detect(&root), &cfg));
+    match regen {
+        Ok(regen) => {
+            match bale_able_from(&root, regen.clone()) {
+                Ok((removable, _)) => {
+                    let size = crate::trace::size_tree(&root, &removable, start + SIZING_LIMIT);
+                    m.sizes = Some((size.in_regen, size.tree));
+                    m.truncated = size.truncated;
+                    m.sizing_ms = Some(millis(start.elapsed()));
+                }
+                Err(e) => crate::trace::warn(&e),
+            }
+            for dd in regen.iter().filter(|d| is_derived_data_root(d)) {
+                m.builds.extend(logs_of(dd));
+            }
+        }
+        Err(e) => crate::trace::warn(&e),
+    }
+    m
+}
+
+/// The build logs of one Xcode DerivedData root; errors warn and give none.
+fn logs_of(dd: &Path) -> Vec<BuildLog> {
+    crate::trace::build_logs(dd).unwrap_or_else(|e| {
+        crate::trace::warn(&e);
+        Vec::new()
+    })
+}
+
+/// For each tree root (as [`workspace_key`]; `None` for a record that did
+/// not parse), the positions in `index` of the shared DerivedData folders
+/// built from it.
+fn match_trees(index: &[DdDir], roots: &[Option<PathBuf>]) -> Vec<Vec<usize>> {
+    roots
+        .iter()
+        .map(|root| match root {
+            Some(root) => (0..index.len())
+                .filter(|&i| index[i].built_from(root))
+                .collect(),
+            None => Vec::new(),
+        })
+        .collect()
+}
+
+/// A tree's share of Xcode's shared DerivedData.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DdBytes {
+    bytes: u64,
+    /// One of its folders was cut short; `bytes` is what was counted.
+    truncated: bool,
+}
+
+/// Xcode's shared DerivedData as sweep saw it.
+struct GlobalDd {
+    /// Per tree, `Some` where `wanted`.
+    per_tree: Vec<Option<DdBytes>>,
+    /// Every folder, each counted once.
+    total: u64,
+    /// Folders built from no registered tree, or with no `WorkspacePath`.
+    unattributed: u64,
+    /// Some folder was cut short.
+    truncated: bool,
+    /// Some unattributed folder was cut short or never started.
+    unattributed_truncated: bool,
+}
+
+/// Sizes each folder in `index` exactly once with `size(dir, deadline)` on
+/// up to [`crate::par::THREADS`] threads, then attributes the bytes. A
+/// folder that `matches` puts under several trees counts in full for each
+/// of them, as either tree's `up` would remove it, and once in the totals.
+/// Folders some tree claims go first, each with [`GLOBAL_DD_LIMIT`] from
+/// its own start; the rest share one [`GLOBAL_DD_LIMIT`] from the start.
+fn size_global_dd(
+    index: &[DdDir],
+    matches: &[Vec<usize>],
+    wanted: &[bool],
+    size: impl Fn(&Path, Instant) -> Size + Sync,
+) -> GlobalDd {
+    let start = Instant::now();
+    let mut claimed = vec![false; index.len()];
+    for &i in matches.iter().flatten() {
+        claimed[i] = true;
+    }
+    let mut order: Vec<usize> = (0..index.len()).filter(|&i| claimed[i]).collect();
+    order.extend((0..index.len()).filter(|&i| !claimed[i]));
+    let sized = par_map(&order, |&i| {
+        if claimed[i] {
+            size(&index[i].dir, Instant::now() + GLOBAL_DD_LIMIT)
+        } else if start.elapsed() >= GLOBAL_DD_LIMIT {
+            Size {
+                truncated: true,
+                ..Size::default()
+            }
+        } else {
+            size(&index[i].dir, start + GLOBAL_DD_LIMIT)
+        }
+    });
+    let mut sizes = vec![Size::default(); index.len()];
+    for (i, s) in order.into_iter().zip(sized) {
+        sizes[i] = s;
+    }
+    let mut out = GlobalDd {
+        per_tree: Vec::with_capacity(matches.len()),
+        total: 0,
+        unattributed: 0,
+        truncated: false,
+        unattributed_truncated: false,
+    };
+    for (i, s) in sizes.iter().enumerate() {
+        out.total += s.tree;
+        out.truncated |= s.truncated;
+        if !claimed[i] {
+            out.unattributed += s.tree;
+            out.unattributed_truncated |= s.truncated;
+        }
+    }
+    for (mine, &want) in matches.iter().zip(wanted) {
+        out.per_tree.push(want.then(|| DdBytes {
+            bytes: mine.iter().map(|&i| sizes[i].tree).sum(),
+            truncated: mine.iter().any(|&i| sizes[i].truncated),
+        }));
+    }
+    out
+}
+
+/// Appends the record's `tree` line.
+fn trace_tree(
+    home: &BaleHome,
+    record: &Record,
+    action: &Action,
+    edited: Option<SystemTime>,
+    m: &Measured,
+) {
+    let (name, reason) = match action {
+        Action::Keep if record.pinned => ("skip", Some("pinned".to_string())),
+        Action::Keep => ("keep", None),
+        Action::Up => ("up", None),
+        Action::Cold => ("cold", None),
+        // Probe errors name paths inside the tree; the trace keeps none.
+        Action::Report(text) if text == "missing" || text.starts_with("interrupted") => {
+            ("report", Some(text.replace("<id>", &record.id)))
+        }
+        Action::Report(_) => ("report", Some("probe failed".to_string())),
+    };
+    let mut f = Map::new();
+    f.insert("id".into(), record.id.clone().into());
+    let path = record.path.to_string_lossy();
+    put_clipped(&mut f, "path", Some(&path), MAX_PATH);
+    let repo = record.repo_common_dir.to_string_lossy();
+    put_clipped(&mut f, "repo", Some(&repo), MAX_PATH);
+    f.insert("level".into(), record.level.name().into());
+    f.insert("pinned".into(), record.pinned.into());
+    let origin = record.origin.as_ref();
+    put_clipped(
+        &mut f,
+        "origin_tool",
+        origin.map(|o| o.tool.as_str()),
+        MAX_ID,
+    );
+    put_clipped(
+        &mut f,
+        "session_id",
+        origin.map(|o| o.session.as_str()),
+        MAX_ID,
+    );
+    f.insert(
+        "last_source_edit".into(),
+        edited.map(crate::trace::rfc3339).into(),
+    );
+    f.insert("regen_bytes".into(), m.sizes.map(|s| s.0).into());
+    f.insert("tree_bytes".into(), m.sizes.map(|s| s.1).into());
+    f.insert(
+        "global_dd_bytes".into(),
+        m.global_dd.map(|d| d.bytes).into(),
+    );
+    if m.global_dd.is_some_and(|d| d.truncated) {
+        f.insert("global_dd_truncated".into(), true.into());
+    }
+    if m.truncated {
+        f.insert("sizing_truncated".into(), true.into());
+    }
+    f.insert("sizing_ms".into(), m.sizing_ms.into());
+    f.insert("action".into(), name.into());
+    if let Some(reason) = reason {
+        f.insert("reason".into(), crate::trace::clip(&reason).into());
+    }
+    crate::trace::emit(home, "tree", f);
+}
+
+fn millis(d: Duration) -> u64 {
+    d.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Decides and applies the policy for one record: `(action, result, last
+/// source edit)`, the last as sweep's idle logic saw it (`None` when it was
+/// not probed or no file remains).
+fn sweep_one(
+    home: &BaleHome,
+    record: &Record,
+    dry_run: bool,
+) -> (Action, String, Option<SystemTime>) {
+    // A pinned tree is left to its owner, even mid-transition. An
+    // interrupted transition still gets a hint, since that changes nothing:
+    // open's own, or for up and cold the command that finishes it.
+    if record.pinned {
+        let stranded = match record.level {
+            Level::Opening => None,
+            Level::Baling => Some(("baling", "up")),
+            Level::Cooling => Some(("going cold", "cold")),
+            _ => return (Action::Keep, "pinned".into(), None),
+        };
+        if let Some((doing, cmd)) = stranded {
+            let text = format!(
+                "interrupted while {doing}; pinned, so sweep leaves it: run `bale {cmd} {}`",
+                record.id
+            );
+            return (Action::Report(text.clone()), text, None);
+        }
+    }
+    let (action, edited) = match plan(home, record) {
+        Ok(planned) => planned,
         Err(e) => {
             let text = format!("{e:#}");
-            return (Action::Report(text.clone()), text);
+            return (Action::Report(text.clone()), text, None);
         }
     };
     let result = match &action {
@@ -101,7 +429,7 @@ fn sweep_one(home: &BaleHome, record: &Record, dry_run: bool) -> (Action, String
         },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
     };
-    (action, result)
+    (action, result, edited)
 }
 
 /// The action fixed by the level alone, without probes or config.
@@ -119,16 +447,16 @@ fn level_action(level: Level) -> Option<Action> {
 /// become `Report` rows and can never lead to `Cold`. Level-only actions
 /// load no config, so a broken config cannot block a resume or the
 /// interrupted-open hint.
-fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
+fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)> {
     // Cooling may legitimately have no checkout; cold's recovery handles it.
     if matches!(record.level, Level::Cold | Level::Opening | Level::Cooling) {
-        return Ok(level_action(record.level).expect("level-only action"));
+        return Ok((level_action(record.level).expect("level-only action"), None));
     }
     if fs::symlink_metadata(&record.path).is_err() {
-        return Ok(Action::Report("missing".into()));
+        return Ok((Action::Report("missing".into()), None));
     }
     if let Some(action) = level_action(record.level) {
-        return Ok(action);
+        return Ok((action, None));
     }
     let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
@@ -145,7 +473,11 @@ fn plan(home: &BaleHome, record: &Record) -> Result<Action> {
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
         && !bale_able_from(&root, regen)?.0.is_empty();
-    Ok(decide(record.level, idle_for, dirty, has_regen, &cfg))
+    let edited = (changed > UNIX_EPOCH).then_some(changed);
+    Ok((
+        decide(record.level, idle_for, dirty, has_regen, &cfg),
+        edited,
+    ))
 }
 
 /// `now` minus the later of the two times; zero when that lies in the future.
@@ -189,6 +521,118 @@ mod tests {
 
     fn d(n: u64) -> Duration {
         Duration::from_secs(n * 86400)
+    }
+
+    /// A shared DerivedData dir under `dd_root` named `name`, built from the
+    /// project at `workspace` (or with no plist when `None`).
+    fn dd_dir(dd_root: &Path, name: &str, workspace: Option<&Path>) -> PathBuf {
+        let dir = dd_root.join(name);
+        fs::create_dir_all(dir.join("Build")).unwrap();
+        if let Some(ws) = workspace {
+            fs::create_dir_all(ws).unwrap();
+            let ws = ws.to_string_lossy().replace('&', "&amp;");
+            fs::write(
+                dir.join("info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                     <key>WorkspacePath</key><string>{ws}</string></dict></plist>\n"
+                ),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// Global DerivedData under a temp dir: `shared` built from a project
+    /// in `outer/sub`, `stray` from a project in no tree, and `cache` with
+    /// no plist. Trees are registered at `outer` and `outer/sub`.
+    fn nested_trees() -> (tempfile::TempDir, Vec<DdDir>, Vec<Option<PathBuf>>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = crate::paths::canonicalize(tmp.path()).unwrap();
+        let dd_root = base.join("DerivedData");
+        let outer = base.join("outer");
+        let inner = outer.join("sub");
+        dd_dir(&dd_root, "shared", Some(&inner.join("App.xcodeproj")));
+        dd_dir(
+            &dd_root,
+            "stray",
+            Some(&base.join("elsewhere/App.xcodeproj")),
+        );
+        dd_dir(&dd_root, "cache", None);
+        let index = crate::derived_data::index(&dd_root);
+        (tmp, index, vec![Some(outer), Some(inner)])
+    }
+
+    fn fake_size(path: &Path) -> Size {
+        let name = path.file_name().unwrap().to_string_lossy();
+        match name.as_ref() {
+            "shared" => Size {
+                tree: 100,
+                in_regen: 0,
+                truncated: false,
+            },
+            "stray" => Size {
+                tree: 10,
+                in_regen: 0,
+                truncated: true,
+            },
+            _ => Size {
+                tree: 1,
+                in_regen: 0,
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_global_dd_dir_is_walked_once_when_several_trees_resolve_to_it() {
+        let (_tmp, index, roots) = nested_trees();
+        assert_eq!(index.len(), 3);
+        let matches = match_trees(&index, &roots);
+        assert_eq!(matches[0], matches[1], "{matches:?}");
+        assert_eq!(matches[0].len(), 1, "{matches:?}");
+
+        let walks = std::sync::Mutex::new(Vec::new());
+        let global = size_global_dd(&index, &matches, &[true, true], |dir, _| {
+            walks.lock().unwrap().push(dir.to_path_buf());
+            fake_size(dir)
+        });
+        let mut walks = walks.into_inner().unwrap();
+        walks.sort();
+        let before = walks.len();
+        walks.dedup();
+        assert_eq!(walks.len(), before, "a dir was walked twice: {walks:?}");
+        assert_eq!(walks.len(), 3, "{walks:?}");
+
+        let shared = Some(DdBytes {
+            bytes: 100,
+            truncated: false,
+        });
+        assert_eq!(global.per_tree, vec![shared, shared]);
+    }
+
+    #[test]
+    fn unattributed_global_dd_is_totalled_with_partial_counts() {
+        let (_tmp, index, roots) = nested_trees();
+        let matches = match_trees(&index, &roots);
+        // Only the inner tree is measured; the outer one still counts as
+        // registered, so `shared` is attributed.
+        let global = size_global_dd(&index, &matches, &[false, true], |dir, _| fake_size(dir));
+        assert_eq!(
+            global.per_tree,
+            vec![
+                None,
+                Some(DdBytes {
+                    bytes: 100,
+                    truncated: false
+                })
+            ]
+        );
+        assert_eq!(global.total, 111);
+        // `stray` was cut short at 10 bytes: counted, not dropped to 0.
+        assert_eq!(global.unattributed, 11);
+        assert!(global.unattributed_truncated);
+        assert!(global.truncated);
     }
 
     #[test]

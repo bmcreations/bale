@@ -180,7 +180,7 @@ fn probe_busy(rows: &mut [PlanRow]) {
             }
         }
     }
-    match busy_holders_many(&paths) {
+    match busy_holders_many(&paths, &[]) {
         Ok(lists) => {
             for (&i, holders) in candidates.iter().zip(lists) {
                 if !holders.is_empty() {

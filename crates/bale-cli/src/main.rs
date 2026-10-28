@@ -1,19 +1,20 @@
-mod hook;
 mod install;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
-use bale_core::ops::cold::cold;
+use anyhow::{Context, Result};
+use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::gc::{gc, GcReport};
+use bale_core::ops::meta::set_pinned;
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::sweep::{sweep, Action};
-use bale_core::ops::up::{resolve, up_report, Outcome};
-use bale_core::registry::Registry;
+use bale_core::ops::up::{register, resolve, up_report, Outcome};
+use bale_core::par::par_map;
+use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
 use bale_core::BaleHome;
 use clap::{Parser, Subcommand};
 
@@ -36,6 +37,9 @@ enum Command {
     Cold {
         /// Worktree path or workspace id.
         target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
     },
     /// Restore a cold worktree at its path, then remove its saved state.
     Open {
@@ -67,6 +71,15 @@ enum Command {
         /// Branch to check out, created when missing (default: the name).
         #[arg(long)]
         branch: Option<String>,
+        /// Print only the new worktree's path.
+        #[arg(long)]
+        print_path: bool,
+    },
+    /// Register an existing linked worktree.
+    Adopt {
+        /// The worktree checkout (default: the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Forget worktrees that are gone, and clear stale leftovers on hot ones.
     Gc {
@@ -74,22 +87,58 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Entry points for Claude Code and git hooks.
+    /// Entry points for Claude Code, Codex, Cursor, Conductor and git hooks.
     Hook {
         #[command(subcommand)]
         kind: HookKind,
     },
-    /// Install the 30-minute sweep schedule, or with flags only the given hooks.
+    /// Install the 30-minute sweep schedule, or with --hooks only those tools' hooks.
     Install {
-        /// Add WorktreeCreate and WorktreeRemove hooks to ~/.claude/settings.json.
-        #[arg(long)]
-        claude_hooks: bool,
-        /// Install a post-checkout hook in this repo that registers new worktrees.
-        #[arg(long, value_name = "REPO")]
-        git_hook: Option<PathBuf>,
+        /// Comma-separated tools to hook: claude, git, conductor, cursor, codex.
+        #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
+        hooks: Vec<bale_hooks::Tool>,
+        /// The repo whose hooks to edit; required for git, conductor and cursor.
+        #[arg(long, value_name = "REPO", requires = "hooks")]
+        repo: Option<PathBuf>,
         /// Print the files and commands without changing anything.
         #[arg(long)]
         print_only: bool,
+    },
+    /// Remove the sweep schedule, or with --hooks only bale's entries in those tools' hooks.
+    /// Saved state and cold worktrees are kept.
+    ///
+    /// A config file left empty is deleted when bale finds no backup of it
+    /// and git does not track it. That includes a ~/.claude/settings.json
+    /// ($CLAUDE_CONFIG_DIR/settings.json when that is set) installed by an older bale whose settings.json.bak-bale was since
+    /// deleted: bale treats it as its own.
+    Uninstall {
+        /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex.
+        #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
+        hooks: Vec<bale_hooks::Tool>,
+        /// The repo whose hooks to edit; required for git, conductor and cursor.
+        #[arg(long, value_name = "REPO", requires = "hooks")]
+        repo: Option<PathBuf>,
+        /// Print the files and commands without changing anything.
+        #[arg(long)]
+        print_only: bool,
+    },
+    /// Keep sweep from upping or colding a worktree.
+    Pin {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
+    },
+    /// Let sweep manage a pinned worktree again.
+    Unpin {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
+    },
+    /// Show a registered worktree: its level, pin, origin session and git scope.
+    Show {
+        /// Worktree path or workspace id (default: the current directory).
+        #[arg(default_value = ".")]
+        target: String,
     },
     /// List registered worktrees.
     Ls {
@@ -97,16 +146,83 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The local usage trace bale records for benchmarking.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Print the directory the trace is kept in.
+    Path,
 }
 
 #[derive(Subcommand)]
 enum HookKind {
-    /// Claude Code WorktreeCreate: JSON on stdin, prints the worktree path.
-    ClaudeWorktreeCreate,
-    /// Claude Code WorktreeRemove: JSON on stdin, colds the worktree.
-    ClaudeWorktreeRemove,
-    /// git post-checkout: registers a newly added linked worktree.
-    GitPostCheckout {
+    /// Claude Code's WorktreeCreate and WorktreeRemove hooks.
+    Claude {
+        #[command(subcommand)]
+        event: ClaudeHook,
+    },
+    /// git hooks.
+    Git {
+        #[command(subcommand)]
+        event: GitHook,
+    },
+    /// Conductor's setup and archive scripts.
+    Conductor {
+        #[command(subcommand)]
+        event: ConductorHook,
+    },
+    /// Cursor's worktree setup script.
+    Cursor {
+        #[command(subcommand)]
+        event: CursorHook,
+    },
+    /// Codex's environment setup script.
+    Codex {
+        #[command(subcommand)]
+        event: CodexHook,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaudeHook {
+    /// WorktreeCreate: JSON on stdin, prints the worktree path.
+    Create,
+    /// WorktreeRemove: JSON on stdin, colds the worktree.
+    Remove,
+}
+
+#[derive(Subcommand)]
+enum ConductorHook {
+    /// setup: registers $CONDUCTOR_WORKSPACE_PATH (or the cwd); always exits 0.
+    Setup,
+    /// archive: colds $CONDUCTOR_WORKSPACE_PATH (or the cwd).
+    Archive,
+}
+
+#[derive(Subcommand)]
+enum CursorHook {
+    /// setup: registers the cwd; always exits 0.
+    Setup,
+}
+
+#[derive(Subcommand)]
+enum CodexHook {
+    /// setup: registers PATH (default: the cwd); always exits 0.
+    Setup {
+        /// The worktree to register.
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitHook {
+    /// post-checkout: registers a newly added linked worktree.
+    PostCheckout {
         prev: String,
         new: String,
         flag: String,
@@ -116,7 +232,15 @@ enum HookKind {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let home = BaleHome::from_env();
-    let result = match cli.command {
+    let result = bale_core::trace::with_trigger("cli", || run(cli.command, home));
+    result.unwrap_or_else(|e| {
+        eprintln!("bale: {e:#}");
+        ExitCode::from(1)
+    })
+}
+
+fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
+    match command {
         Command::Up { target } => resolve(&home, &target).and_then(|id| {
             let baled = up_report(&home, &id)?;
             let code = report(&id, baled.outcome);
@@ -125,9 +249,8 @@ fn main() -> ExitCode {
             }
             Ok(code)
         }),
-        Command::Cold { target } => {
-            resolve(&home, &target).and_then(|id| Ok(report_cold(&id, cold(&home, &id)?)))
-        }
+        Command::Cold { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| Ok(report_cold(&id, cold_ignoring(&home, &id, &ignore_pid)?))),
         Command::Open { target } => resolve(&home, &target).and_then(|id| {
             let opened = open(&home, &id)?;
             let code = report(&id, opened.outcome);
@@ -141,12 +264,23 @@ fn main() -> ExitCode {
         }),
         Command::Sweep { dry_run } => cmd_sweep(&home, dry_run).map(|()| ExitCode::SUCCESS),
         Command::Migrate { repos, apply } => cmd_migrate(&home, &repos, apply),
-        Command::New { name, repo, branch } => {
-            new_workspace(&home, &repo, &name, branch.as_deref()).map(|r| {
+        Command::New {
+            name,
+            repo,
+            branch,
+            print_path,
+        } => new_workspace(&home, &repo, &name, branch.as_deref()).map(|r| {
+            if print_path {
+                println!("{}", r.path.display());
+            } else {
                 println!("{}: {}", r.id, r.path.display());
-                ExitCode::SUCCESS
-            })
-        }
+            }
+            ExitCode::SUCCESS
+        }),
+        Command::Adopt { path } => register(&home, &path).map(|r| {
+            println!("{}: {}", r.id, r.level.name());
+            ExitCode::SUCCESS
+        }),
         Command::Gc { dry_run } => gc(&home, dry_run).map(|report| {
             for (to_stderr, line) in gc_lines(&report, dry_run) {
                 if to_stderr {
@@ -162,30 +296,61 @@ fn main() -> ExitCode {
             }
         }),
         Command::Hook { kind } => match kind {
-            HookKind::ClaudeWorktreeCreate => hook::claude_worktree_create(&home),
-            HookKind::ClaudeWorktreeRemove => hook::claude_worktree_remove(&home),
-            HookKind::GitPostCheckout { prev, flag, .. } => {
-                Ok(hook::git_post_checkout(&home, &prev, &flag))
-            }
+            HookKind::Claude {
+                event: ClaudeHook::Create,
+            } => bale_hooks::claude::create(&home),
+            HookKind::Claude {
+                event: ClaudeHook::Remove,
+            } => bale_hooks::claude::remove(&home),
+            HookKind::Git {
+                event: GitHook::PostCheckout { prev, new, flag },
+            } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
+            HookKind::Conductor {
+                event: ConductorHook::Setup,
+            } => Ok(bale_hooks::conductor::setup(&home)),
+            HookKind::Conductor {
+                event: ConductorHook::Archive,
+            } => Ok(bale_hooks::conductor::archive(&home)),
+            HookKind::Cursor {
+                event: CursorHook::Setup,
+            } => Ok(bale_hooks::cursor::setup(&home)),
+            HookKind::Codex {
+                event: CodexHook::Setup { path },
+            } => Ok(bale_hooks::codex::setup(&home, path)),
         },
         Command::Install {
-            claude_hooks,
-            git_hook,
+            hooks,
+            repo,
             print_only,
-        } => install::plan(claude_hooks, git_hook.as_deref()).and_then(|plan| {
-            if print_only {
-                plan.print();
-                Ok(ExitCode::SUCCESS)
-            } else {
-                plan.apply().map(|()| ExitCode::SUCCESS)
-            }
-        }),
+        } => install::plan(&hooks, repo.as_deref(), &home)
+            .and_then(|plan| run_plan(&plan, print_only)),
+        Command::Uninstall {
+            hooks,
+            repo,
+            print_only,
+        } => install::uninstall_plan(&hooks, repo.as_deref(), &home)
+            .and_then(|plan| run_plan(&plan, print_only)),
+        Command::Pin { target } => cmd_pin(&home, &target, true),
+        Command::Unpin { target } => cmd_pin(&home, &target, false),
+        Command::Show { target } => cmd_show(&home, &target).map(|()| ExitCode::SUCCESS),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
-    };
-    result.unwrap_or_else(|e| {
-        eprintln!("bale: {e:#}");
-        ExitCode::from(1)
-    })
+        Command::Trace {
+            command: TraceCommand::Path,
+        } => {
+            println!("{}", home.trace_dir().display());
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Prints `plan` with `print_only`, else applies it.
+fn run_plan(plan: &bale_hooks::install::Plan, print_only: bool) -> Result<ExitCode> {
+    if print_only {
+        plan.print();
+        Ok(ExitCode::SUCCESS)
+    } else {
+        plan.apply().map(|()| ExitCode::SUCCESS)
+    }
 }
 
 /// Why `up` left a regenerable-named dir in place.
@@ -225,7 +390,7 @@ fn report_cold(id: &str, outcome: Outcome) -> ExitCode {
 /// What `report` prints for a busy tree.
 fn busy_report(id: &str, holders: &[bale_core::busy::Holder], during_cold: bool) -> String {
     if holders.is_empty() && during_cold {
-        return format!("{id}: {}\n", hook::CHANGED_DURING_COLD);
+        return format!("{id}: {}\n", bale_hooks::CHANGED_DURING_COLD);
     }
     let mut text = format!("{id}: busy, left untouched\n");
     for h in holders {
@@ -414,24 +579,183 @@ fn human(bytes: u64) -> String {
 fn cmd_ls(home: &BaleHome, json: bool) -> Result<()> {
     let records = Registry::open(home.clone()).all()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&records)?);
+        let scopes = par_map(&records, |r| scope_of(r).map(|(s, _)| s));
+        let rows = records
+            .iter()
+            .zip(scopes)
+            .map(|(r, scope)| {
+                let mut v = serde_json::to_value(r)?;
+                v["origin"] = serde_json::to_value(&r.origin)?;
+                v["pinned"] = r.pinned.into();
+                v["scope"] = serde_json::to_value(scope)?;
+                Ok(v)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     println!(
-        "{:<12}  {:<7}  {:<10}  {:<20}  PATH",
-        "ID", "LEVEL", "ACTIVE", "BRANCH"
+        "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  PATH",
+        "ID", "LEVEL", "ACTIVE", "BRANCH", "SESSION"
     );
-    for r in records {
+    let home_dir = install::home_dir().ok();
+    let labels = par_map(&records, |r| session_label(r, home_dir.as_deref()));
+    for (r, label) in records.iter().zip(labels) {
+        let level = format!("{}{}", if r.pinned { "*" } else { "" }, r.level.name());
         println!(
-            "{:<12}  {:<7}  {:<10}  {:<20}  {}",
+            "{:<12}  {:<8}  {:<10}  {:<20}  {:<50}  {}",
             r.id,
-            r.level.name(),
+            level,
             ago(r.last_activity),
             r.branch.as_deref().unwrap_or("(detached)"),
+            truncate(&label, SESSION_WIDTH),
             r.path.display()
         );
     }
     Ok(())
+}
+
+/// Widest `SESSION` cell in `bale ls`, in chars.
+const SESSION_WIDTH: usize = 50;
+
+/// What `bale ls` names a tree's session: its title when known, else the
+/// newest commit subject, else `-`. A live tree costs one or two git
+/// processes for the subject, and none when it has a title.
+fn session_label(r: &Record, home_dir: Option<&Path>) -> String {
+    title(r, home_dir)
+        .or_else(|| match r.level {
+            Level::Hot | Level::Baled => bale_core::git::latest_subject(&r.path).ok().flatten(),
+            _ => r.scope.as_ref().and_then(|s| s.subjects.first().cloned()),
+        })
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The tree's session title, from its origin or its tool.
+fn title(r: &Record, home_dir: Option<&Path>) -> Option<String> {
+    match home_dir {
+        Some(home) => bale_hooks::describe(r, home),
+        None => r.origin.as_ref().and_then(|o| o.title.clone()),
+    }
+}
+
+/// `text` cut to at most `max` chars, ending in `…` when cut.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The tree's scope and whether it is live: read from git for a hot or
+/// baled tree, else the snapshot cold saved, if any.
+fn scope_of(r: &Record) -> Option<(Scope, bool)> {
+    match r.level {
+        Level::Hot | Level::Baled => bale_core::git::scope(&r.path).ok().map(|s| (s, true)),
+        _ => r.scope.clone().map(|s| (s, false)),
+    }
+}
+
+fn cmd_pin(home: &BaleHome, target: &str, pinned: bool) -> Result<ExitCode> {
+    let id = resolve(home, target)?;
+    set_pinned(home, &id, pinned)?;
+    println!("{id}: {}", if pinned { "pinned" } else { "unpinned" });
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The record for an id or a registered path; never registers anything.
+fn lookup(home: &BaleHome, target: &str) -> Result<Record> {
+    let registry = Registry::open(home.clone());
+    if let Some(r) = registry.get(target)? {
+        return Ok(r);
+    }
+    let path = std::path::absolute(target)?;
+    registry
+        .get(&workspace_id(&path))?
+        .with_context(|| format!("{target} is not registered; run `bale adopt` first"))
+}
+
+fn cmd_show(home: &BaleHome, target: &str) -> Result<()> {
+    let r = lookup(home, target)?;
+    let home_dir = install::home_dir().ok();
+    print!("{}", show_text(&r, title(&r, home_dir.as_deref())));
+    Ok(())
+}
+
+/// `bale show`'s text for `r`, with `title` the session title if known.
+fn show_text(r: &Record, title: Option<String>) -> String {
+    let mut out = String::new();
+    let mut line = |label: &str, value: &str| out.push_str(&format!("{label:<9} {value}\n"));
+    line("id:", &r.id);
+    line("path:", &r.path.display().to_string());
+    line("level:", r.level.name());
+    line("pinned:", if r.pinned { "yes" } else { "no" });
+    match &r.origin {
+        Some(o) if o.session.is_empty() => line("origin:", &o.tool),
+        Some(o) => line("origin:", &format!("{} session {}", o.tool, o.session)),
+        None => line("origin:", "unknown"),
+    }
+    if let Some(title) = title {
+        line("title:", &title);
+    }
+    match scope_of(r) {
+        None => out.push_str("scope:    none saved\n"),
+        Some((s, live)) => out.push_str(&scope_text(&s, live)),
+    }
+    out
+}
+
+fn scope_text(s: &Scope, live: bool) -> String {
+    let mut out = String::from(if live {
+        "scope (live from git):\n"
+    } else {
+        "scope (saved when it went cold):\n"
+    });
+    let mut line = |label: &str, value: &str| out.push_str(&format!("  {label:<9} {value}\n"));
+    let branch = s.branch.as_deref().unwrap_or("(detached)");
+    match &s.upstream {
+        Some(u) => line(
+            "branch:",
+            &format!(
+                "{branch} (upstream {u}, {} ahead, {} behind)",
+                s.ahead, s.behind
+            ),
+        ),
+        None => line("branch:", &format!("{branch} (no upstream)")),
+    }
+    if s.unpushed > 0 {
+        let noun = if s.unpushed == 1 { "commit" } else { "commits" };
+        line("unpushed:", &format!("{} {noun} on no remote", s.unpushed));
+    }
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(s.last_commit_unix.max(0) as u64);
+    line("commit:", &format!("last {}", ago(when)));
+    let changes = if s.changed_files == 0 {
+        "none uncommitted".to_string()
+    } else {
+        format!(
+            "{} {} changed, {} {}(+), {} {}(-)",
+            s.changed_files,
+            plural(s.changed_files, "file"),
+            s.insertions,
+            plural(s.insertions, "insertion"),
+            s.deletions,
+            plural(s.deletions, "deletion"),
+        )
+    };
+    line("changes:", &changes);
+    for subject in &s.subjects {
+        out.push_str(&format!("    {subject}\n"));
+    }
+    out
+}
+
+fn plural(n: u32, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
 }
 
 fn ago(t: SystemTime) -> String {
@@ -452,10 +776,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn show_omits_an_empty_session() {
+        let origin = |session: &str| bale_core::registry::Origin {
+            tool: "cursor".into(),
+            session: session.into(),
+            title: None,
+        };
+        let mut r = Record {
+            id: "0123456789ab".into(),
+            repo_common_dir: "/nowhere/.git".into(),
+            path: "/nowhere/wt".into(),
+            admin_dir: "/nowhere/.git/worktrees/wt".into(),
+            branch: None,
+            head: String::new(),
+            level: bale_core::registry::Level::Cold,
+            last_activity: std::time::SystemTime::UNIX_EPOCH,
+            note: None,
+            trash: Vec::new(),
+            origin: Some(origin("")),
+            pinned: false,
+            scope: None,
+        };
+        assert!(show_text(&r, None).contains("origin:   cursor\n"));
+        r.origin = Some(origin("s1"));
+        assert!(show_text(&r, None).contains("origin:   cursor session s1\n"));
+    }
+
+    #[test]
     fn busy_report_without_holders_says_the_tree_changed() {
         assert_eq!(
             busy_report("wt-1", &[], true),
-            format!("wt-1: {}\n", hook::CHANGED_DURING_COLD)
+            format!("wt-1: {}\n", bale_hooks::CHANGED_DURING_COLD)
         );
     }
 

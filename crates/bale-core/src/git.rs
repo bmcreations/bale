@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::registry::Scope;
+
 /// Lock reason bale writes; only locks with this reason are ever released.
 pub const LOCK_REASON: &str = "baled by bale";
 
@@ -81,15 +83,37 @@ impl Git {
                 attempt += 1;
                 continue;
             }
-            bail!(
-                "git {} failed in {}: {}",
-                args.join(" "),
-                self.dir.display(),
-                stderr.trim()
-            );
+            return Err(GitError::new(args, &self.dir, &stderr).into());
         }
     }
 }
+
+/// A git command that exited with failure.
+#[derive(Debug)]
+pub struct GitError {
+    message: String,
+}
+
+impl GitError {
+    fn new(args: &[&str], dir: &Path, stderr: &str) -> GitError {
+        GitError {
+            message: format!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                dir.display(),
+                stderr.trim()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GitError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -169,12 +193,7 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     if !out.status.success() {
-        bail!(
-            "git {} failed in {}: {}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(GitError::new(&args, dir, &String::from_utf8_lossy(&out.stderr)).into());
     }
     let full = String::from_utf8_lossy(&out.stdout);
     let full = full.trim_end_matches(['\n', '\r']);
@@ -229,4 +248,131 @@ pub fn unlock_worktree_if_ours(repo: &Path, path: &Path) -> Result<bool> {
     let p = path.to_string_lossy();
     Git::at(repo).run(&["worktree", "unlock", &p])?;
     Ok(true)
+}
+
+/// Most commit subjects a [`Scope`] keeps.
+const SCOPE_SUBJECTS: &str = "8";
+
+/// The newest subject [`scope`] would list first, at the cost of one or two
+/// git processes instead of scope's seven: the newest commit in
+/// `@{upstream}..HEAD`, or with no upstream, in `HEAD --not --remotes`.
+/// `None` when that range is empty.
+pub fn latest_subject(root: &Path) -> Result<Option<String>> {
+    let g = Git::at(root);
+    let log = ["log", "-1", "--format=%s"];
+    // Fails when no upstream is set (or it names a ref that is gone).
+    let out = match g.run(&[&log[..], &["@{upstream}..HEAD"]].concat()) {
+        Ok(out) => out,
+        Err(_) => g.run(&[&log[..], &["HEAD", "--not", "--remotes"]].concat())?,
+    };
+    Ok(out.lines().next().map(str::to_string))
+}
+
+/// The tree's branch, upstream, unpushed commits and uncommitted changes.
+pub fn scope(root: &Path) -> Result<Scope> {
+    let g = Git::at(root);
+    let count = |args: &[&str]| -> Result<u32> {
+        let out = g.run(args)?;
+        out.trim()
+            .parse()
+            .with_context(|| format!("git {} printed {out:?}", args.join(" ")))
+    };
+    // Fails when no upstream is set (or it names a ref that is gone).
+    let upstream = g
+        .run(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (ahead, behind) = match &upstream {
+        Some(_) => {
+            let out = g.run(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])?;
+            let mut n = out.split_whitespace().map(str::parse::<u32>);
+            match (n.next(), n.next()) {
+                (Some(Ok(a)), Some(Ok(b))) => (a, b),
+                _ => bail!("git rev-list --left-right printed {out:?}"),
+            }
+        }
+        None => (0, 0),
+    };
+    let unpushed = count(&["rev-list", "--count", "HEAD", "--not", "--remotes"])?;
+    let log = ["log", "--format=%s", "-n", SCOPE_SUBJECTS];
+    let subjects = match &upstream {
+        Some(_) => g.run(&[&log[..], &["@{upstream}..HEAD"]].concat())?,
+        None => g.run(&[&log[..], &["HEAD", "--not", "--remotes"]].concat())?,
+    };
+    let last = g.run(&["log", "-1", "--format=%ct", "HEAD"])?;
+    let last_commit_unix = last
+        .trim()
+        .parse()
+        .with_context(|| format!("git log printed {last:?}"))?;
+    let (changed, insertions, deletions) =
+        parse_shortstat(&g.run(&["--no-optional-locks", "diff", "--shortstat", "HEAD"])?);
+    let untracked = g.run(&[
+        "--no-optional-locks",
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+    ])?;
+    let untracked = untracked.split('\0').filter(|p| !p.is_empty()).count() as u32;
+    Ok(Scope {
+        branch: current_branch(root)?,
+        upstream,
+        ahead,
+        behind,
+        unpushed,
+        subjects: subjects.lines().map(str::to_string).collect(),
+        last_commit_unix,
+        changed_files: changed + untracked,
+        insertions,
+        deletions,
+    })
+}
+
+/// `(files, insertions, deletions)` from `git diff --shortstat`, e.g.
+/// ` 2 files changed, 3 insertions(+), 1 deletion(-)`; zeros when empty.
+fn parse_shortstat(text: &str) -> (u32, u32, u32) {
+    let (mut files, mut ins, mut del) = (0, 0, 0);
+    for part in text.trim().split(',') {
+        let mut words = part.split_whitespace();
+        let (Some(n), Some(what)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(n) = n.parse() else { continue };
+        if what.starts_with("file") {
+            files = n;
+        } else if what.starts_with("insertion") {
+            ins = n;
+        } else if what.starts_with("deletion") {
+            del = n;
+        }
+    }
+    (files, ins, del)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_shortstat;
+
+    #[test]
+    fn shortstat_parses_every_shape() {
+        assert_eq!(parse_shortstat(""), (0, 0, 0));
+        assert_eq!(
+            parse_shortstat(" 2 files changed, 3 insertions(+), 1 deletion(-)\n"),
+            (2, 3, 1)
+        );
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 1 deletion(-)\n"),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 4 insertions(+)\n"),
+            (1, 4, 0)
+        );
+    }
 }

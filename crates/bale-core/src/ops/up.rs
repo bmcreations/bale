@@ -24,13 +24,108 @@ const DD_NOTE: &str = "DerivedData not removed: ";
 pub enum Outcome {
     Done(Level),
     Busy(Vec<Holder>),
-    Skipped(String),
+    Skipped(SkipReason),
+}
+
+/// Why an operation left a tree alone, by kind. The usage trace records
+/// only this, never the reason's text, which can name paths in the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipCode {
+    /// Another bale process holds the workspace lock.
+    Locked,
+    /// The tree is already cold.
+    Cold,
+    /// A `bale open` was left half done.
+    Opening,
+    /// The tree has uncommitted changes (`cold_if_clean`).
+    Dirty,
+    /// Someone other than bale locked the git worktree.
+    WorktreeLocked,
+    /// What is at the record's path is not the worktree's checkout.
+    IdentityMismatch,
+    SparseCheckout,
+    /// Assume-unchanged or skip-worktree index entries.
+    HiddenEntries,
+    /// A submodule holds changes or files the save would not keep.
+    Submodule,
+    NestedRepo,
+    /// A file's extended attributes, flags or ACL can't be saved.
+    DirtyXattr,
+    /// `open` would not give the tree back as it is.
+    NotRestorable,
+    /// Too little free space to check the save.
+    FreeSpace,
+    /// A dir the checks must read can't be read.
+    Unreadable,
+}
+
+impl SkipCode {
+    /// The code as the trace writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            SkipCode::Locked => "locked",
+            SkipCode::Cold => "cold",
+            SkipCode::Opening => "opening",
+            SkipCode::Dirty => "dirty",
+            SkipCode::WorktreeLocked => "worktree_locked",
+            SkipCode::IdentityMismatch => "identity_mismatch",
+            SkipCode::SparseCheckout => "sparse_checkout",
+            SkipCode::HiddenEntries => "hidden_entries",
+            SkipCode::Submodule => "submodule",
+            SkipCode::NestedRepo => "nested_repo",
+            SkipCode::DirtyXattr => "dirty_xattr",
+            SkipCode::NotRestorable => "not_restorable",
+            SkipCode::FreeSpace => "free_space",
+            SkipCode::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// A skip's kind and the text shown to the user. Derefs to the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipReason {
+    pub code: SkipCode,
+    pub text: String,
+}
+
+impl SkipReason {
+    pub fn new(code: SkipCode, text: impl Into<String>) -> SkipReason {
+        SkipReason {
+            code,
+            text: text.into(),
+        }
+    }
+}
+
+impl std::ops::Deref for SkipReason {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<str> for SkipReason {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
 }
 
 /// Creates a `Hot` record for a linked worktree, or refreshes an existing
 /// record's path, branch, head and admin dir (keeping its level). Errors for
 /// the main checkout and for paths that are not a worktree of their repo.
 pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
+    crate::trace::op(home, "adopt", None, || register_untraced(home, path))
+}
+
+/// `register` without an `op` line, for operations that register on the
+/// way (`resolve`, `new`) and are traced as themselves.
+pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> {
     let root = crate::paths::canonicalize(path)
         .with_context(|| format!("resolving {}", path.display()))?;
     // Without its own gitfile, git here climbs to an enclosing repo and the
@@ -106,6 +201,9 @@ pub fn register(home: &BaleHome, path: &Path) -> Result<Record> {
                 last_activity,
                 note: None,
                 trash: Vec::new(),
+                origin: None,
+                pinned: false,
+                scope: None,
             }
         }
     };
@@ -127,7 +225,7 @@ pub fn resolve(home: &BaleHome, arg: &str) -> Result<String> {
     if fs::symlink_metadata(path).is_ok() {
         match by_path {
             Some(r) if !matches!(r.level, Level::Hot | Level::Baled) => return Ok(r.id),
-            _ => return Ok(register(home, path)?.id),
+            _ => return Ok(register_untraced(home, path)?.id),
         }
     }
     if let Some(r) = registry.get(arg)? {
@@ -163,18 +261,24 @@ pub fn up(home: &BaleHome, id: &str) -> Result<Outcome> {
 
 /// `up`, also naming the regenerable-named dirs it kept.
 pub fn up_report(home: &BaleHome, id: &str) -> Result<UpReport> {
-    let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
-        return Ok(UpReport::plain(Outcome::Skipped("locked".into())));
-    };
-    up_locked_report(home, id)
+    crate::trace::op(home, "up", Some(id), || {
+        let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
+            return Ok(UpReport::plain(Outcome::Skipped(SkipReason::new(
+                SkipCode::Locked,
+                "locked",
+            ))));
+        };
+        up_locked_report(home, id, &[])
+    })
 }
 
 /// `up` for a caller that already holds the `WorkspaceLock` for `id`.
-pub(crate) fn up_locked(home: &BaleHome, id: &str) -> Result<Outcome> {
-    up_locked_report(home, id).map(|r| r.outcome)
+/// Processes in `ignore` do not count as holding the tree.
+pub(crate) fn up_locked(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<Outcome> {
+    up_locked_report(home, id, ignore).map(|r| r.outcome)
 }
 
-fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
+fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpReport> {
     let registry = Registry::open(home.clone());
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
@@ -182,30 +286,36 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     let root = crate::paths::canonicalize(&record.path)
         .with_context(|| format!("resolving {}", record.path.display()))?;
 
-    let skip = |reason: &str| Ok(UpReport::plain(Outcome::Skipped(reason.into())));
+    let skip = |code: SkipCode, reason: &str| {
+        Ok(UpReport::plain(Outcome::Skipped(SkipReason::new(
+            code, reason,
+        ))))
+    };
     let mut kept = Vec::new();
     match record.level {
-        Level::Cooling | Level::Cold => return skip("cold"),
-        Level::Opening => return skip(OPENING),
+        Level::Cooling | Level::Cold => return skip(SkipCode::Cold, "cold"),
+        Level::Opening => return skip(SkipCode::Opening, OPENING),
         Level::Baling => {}
         Level::Hot | Level::Baled => {
             // A folder recreated at the path is not this worktree: git there
             // may fall back to an enclosing repo, so remove nothing from it.
             if let Err(e) = super::disk::ensure_checkout(&root, &record.admin_dir) {
-                return skip(&format!(
-                    "{} is not the worktree's checkout: {e:#}",
-                    root.display()
-                ));
+                return skip(
+                    SkipCode::IdentityMismatch,
+                    &format!("{} is not the worktree's checkout: {e:#}", root.display()),
+                );
             }
             if let Some(reason) = git::find_worktree(&root, &root)?.foreign_lock() {
-                return skip(&reason);
+                return skip(SkipCode::WorktreeLocked, &reason);
             }
-            let holders = busy_holders(&root)?;
+            let holders = busy_holders(&root, ignore)?;
             if !holders.is_empty() {
                 return Ok(UpReport::plain(Outcome::Busy(holders)));
             }
             let (dirs, real) = bale_able(home, &root)?;
             kept = real;
+            // Xcode's build logs go with its DerivedData; record them first.
+            crate::trace::harvest(home, id, &crate::derived_data::all_for(&root, &dirs));
             let moves = trash_names(&dirs);
             record.trash = moves.iter().map(|(_, to)| to.clone()).collect();
             record.level = Level::Baling;
@@ -224,8 +334,14 @@ fn up_locked_report(home: &BaleHome, id: &str) -> Result<UpReport> {
     record.trash.clear();
     #[cfg(target_os = "macos")]
     {
-        let failures = dirs::home_dir()
-            .map(|h| remove_derived_data(&root, &h.join("Library/Developer/Xcode/DerivedData")))
+        let failures = crate::paths::home_dir()
+            .map(|h| {
+                remove_derived_data(
+                    &root,
+                    &h.join("Library/Developer/Xcode/DerivedData"),
+                    ignore,
+                )
+            })
             .unwrap_or_default();
         if !failures.is_empty() {
             record.note = Some(format!("{DD_NOTE}{}", failures.join("; ")));
@@ -465,13 +581,13 @@ pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
 /// returns a message per folder that could not be probed or removed. A folder
 /// a process holds is left alone. Missing `dd_root` is not a failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn remove_derived_data(root: &Path, dd_root: &Path) -> Vec<String> {
+fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<String> {
     let mut failures = Vec::new();
     if !dd_root.is_dir() {
         return failures;
     }
     for dir in crate::derived_data::derived_data_for(root, dd_root) {
-        match busy_holders(&dir) {
+        match busy_holders(&dir, ignore) {
             Ok(h) if !h.is_empty() => continue,
             Ok(_) => {}
             Err(e) => {
@@ -584,7 +700,7 @@ mod tests {
     #[test]
     fn missing_derived_data_root_is_not_a_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope")).is_empty());
+        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope"), &[]).is_empty());
     }
 
     #[cfg(unix)]
@@ -608,7 +724,7 @@ mod tests {
         let locked = folder.join("Build/locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let failures = remove_derived_data(&ws, &tmp.path().join("dd"));
+        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &[]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("App-abc"), "{failures:?}");

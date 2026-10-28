@@ -1,0 +1,12 @@
+[package]
+name = "bale-hooks"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+bale-core = { path = "../bale-core" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+toml_edit = "=0.22.27"

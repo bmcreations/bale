@@ -11,6 +11,24 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
+/// The user's home dir: `HOME` or `USERPROFILE` (the latter first on
+/// Windows), else the OS's own answer. On Windows `dirs::home_dir` asks the
+/// shell for the profile folder and never reads `USERPROFILE`, so every
+/// part of bale reads the variables first and agrees on one home.
+pub fn home_dir() -> Option<PathBuf> {
+    let order = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    order
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

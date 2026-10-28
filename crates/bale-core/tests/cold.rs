@@ -1,13 +1,15 @@
 mod support;
 
 use bale_core::git::worktrees;
+#[cfg(unix)]
+use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::cold::{cold, cold_if_clean, exclusions, save_ignored, save_wip};
-use bale_core::ops::up::{register, resolve, Outcome};
+use bale_core::ops::up::{register, resolve, Outcome, SkipCode, SkipReason};
 use bale_core::registry::{workspace_id, Level, Record, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use support::{git, Fixture};
+use support::{git, write_plist, Fixture};
 
 /// Commits a `.gitignore` on main, then adds a Gradle worktree `wt` with a
 /// modified tracked `f`, untracked `b.txt`, ignored `.env`, ignored `build/`
@@ -135,6 +137,42 @@ fn cold_saves_everything_and_removes_dir() {
     assert_eq!(entry.locked.as_deref(), Some("baled by bale"));
 }
 
+/// Sets `path`'s mtime to `t`.
+fn set_mtime(path: &Path, t: SystemTime) {
+    let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(t).unwrap();
+}
+
+/// An edit that leaves a tracked file's size and stat time as the index
+/// recorded them is seen only by git's racy-clean check, which compares
+/// entries against the index file's mtime. With `core.checkStat=minimal`
+/// (whole seconds, no ctime or inode) this is what Linux git does when the
+/// edit lands in the same second as the checkout. `fs::copy` gives a fresh
+/// mtime on Linux, so there this fails unless bale sets the index copy's
+/// mtime back; macOS and Windows copies keep it.
+#[test]
+fn cold_saves_an_edit_only_the_racy_check_sees() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    git(&wt, &["config", "core.checkStat", "minimal"]);
+    let past = SystemTime::now() - std::time::Duration::from_secs(10);
+    // The index records `f` at `past`.
+    set_mtime(&wt.join("f"), past);
+    git(&wt, &["update-index", "--refresh"]);
+    // Same size, same mtime, and the index no older than the entry.
+    fs::write(wt.join("f"), "two\n").unwrap();
+    set_mtime(&wt.join("f"), past);
+    let index = git(
+        &wt,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    set_mtime(Path::new(index.trim_end()), past);
+
+    let id = register(&fx.home(), &wt).unwrap().id;
+    assert_eq!(cold(&fx.home(), &id).unwrap(), Outcome::Done(Level::Cold));
+    assert_eq!(show(&fx, &format!("refs/bale/{id}/wip:f")), "two\n");
+}
+
 #[test]
 fn user_locked_tree_is_skipped_untouched() {
     let fx = Fixture::new();
@@ -146,7 +184,7 @@ fn user_locked_tree_is_skipped_untouched() {
     );
     assert_eq!(
         cold(&fx.home(), &id).unwrap(),
-        Outcome::Skipped("locked: mine".into())
+        Outcome::Skipped(SkipReason::new(SkipCode::WorktreeLocked, "locked: mine"))
     );
     assert!(wt.join("build/out.bin").exists());
     assert_eq!(fs::read_to_string(wt.join("f")).unwrap(), "modified\n");
@@ -171,6 +209,9 @@ fn cold_refuses_main_checkout() {
         last_activity: SystemTime::now(),
         note: None,
         trash: Vec::new(),
+        origin: None,
+        pinned: false,
+        scope: None,
     };
     Registry::open(fx.home()).put(&rec).unwrap();
     let err = cold(&fx.home(), &id).unwrap_err();
@@ -460,6 +501,30 @@ fn busy_tree_is_not_removed() {
     assert_ne!(level(&fx, &id), Level::Cold);
     // Left Baled, and Baled trees carry no git lock.
     assert_eq!(linked(&fx).locked, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_ignoring_skips_listed_holder() {
+    let fx = Fixture::new();
+    let wt = dirty_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let child = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let pid = child.0.id();
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(&out, Outcome::Busy(h) if h.iter().any(|x| x.pid == pid)),
+        "{out:?}"
+    );
+    let out = cold_ignoring(&fx.home(), &id, &[pid]).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold));
 }
 
 /// `git init` + one commit at `dir`.
@@ -1178,7 +1243,10 @@ fn cold_if_clean_skips_dirty_tree_untouched() {
     let id = register(&fx.home(), &wt).unwrap().id;
 
     let out = cold_if_clean(&fx.home(), &id).unwrap();
-    assert_eq!(out, Outcome::Skipped("dirty".into()));
+    assert_eq!(
+        out,
+        Outcome::Skipped(SkipReason::new(SkipCode::Dirty, "dirty"))
+    );
     assert_eq!(level(&fx, &id), Level::Hot);
     assert!(wt.join("build/out.bin").exists());
     assert_eq!(git(&fx.repo, &["for-each-ref", "refs/bale/"]), "");
@@ -1355,4 +1423,55 @@ fn resolve_refuses_a_gitfile_pointing_at_the_main_repo() {
     let out = cold(&fx.home(), &before.id).unwrap();
     assert!(matches!(&out, Outcome::Skipped(_)), "{out:?}");
     assert!(!wip_resolves(&fx, &before.id));
+}
+
+/// An Xcode worktree whose ignored `build/dd` is a DerivedData root holding
+/// an SPM checkout (a git clone).
+fn xcode_derived_data_worktree(fx: &Fixture) -> PathBuf {
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "build/\nvendor-ignored/\n").unwrap();
+    fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+    let dd = wt.join("build/dd");
+    fs::create_dir_all(dd.join("Build")).unwrap();
+    write_plist(&dd, Some(&wt.join("App.xcodeproj")));
+    // An ignored file beside `dd`: it is not regenerable and must survive.
+    fs::write(wt.join("build/notes.log"), "keep me").unwrap();
+    nested_repo(&dd.join("SourcePackages/checkouts/pkg"));
+    wt
+}
+
+#[test]
+fn cold_removes_derived_data_with_spm_checkouts() {
+    let fx = Fixture::new();
+    let wt = xcode_derived_data_worktree(&fx);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert_eq!(out, Outcome::Done(Level::Cold), "{out:?}");
+    assert!(!wt.exists());
+
+    let report = bale_core::ops::open::open(&fx.home(), &id).unwrap();
+    assert_eq!(report.outcome, Outcome::Done(Level::Hot));
+    assert!(wt.join("App.xcodeproj").is_dir());
+    assert!(!wt.join("build/dd").exists());
+    assert_eq!(
+        fs::read_to_string(wt.join("build/notes.log")).unwrap(),
+        "keep me"
+    );
+}
+
+#[test]
+fn cold_still_refuses_user_repo_beside_derived_data() {
+    let fx = Fixture::new();
+    let wt = xcode_derived_data_worktree(&fx);
+    nested_repo(&wt.join("vendor-ignored/lib"));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = cold(&fx.home(), &id).unwrap();
+    assert!(
+        matches!(
+            &out,
+            Outcome::Skipped(r) if r.contains("nested repository") && !r.contains("build/dd")
+        ),
+        "{out:?}"
+    );
+    assert!(wt.join("vendor-ignored/lib/.git").is_dir());
 }

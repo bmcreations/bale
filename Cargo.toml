@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bale-core", "crates/bale-cli"]
+members = ["crates/bale-core", "crates/bale-hooks", "crates/bale-cli"]
 
 [workspace.package]
 version = "0.1.0"

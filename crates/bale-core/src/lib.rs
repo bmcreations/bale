@@ -6,8 +6,10 @@ pub mod git;
 pub mod idle;
 pub mod lock;
 pub mod ops;
+pub mod par;
 pub mod paths;
 pub mod registry;
+pub mod trace;
 
 use std::path::PathBuf;
 
@@ -37,7 +39,7 @@ impl BaleHome {
         match std::env::var_os("BALE_HOME") {
             Some(p) if !p.is_empty() => BaleHome(PathBuf::from(p)),
             _ => BaleHome(
-                dirs::home_dir()
+                crate::paths::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".bale"),
             ),
@@ -54,6 +56,11 @@ impl BaleHome {
 
     pub fn saved_dir(&self, id: &str) -> PathBuf {
         self.0.join(id)
+    }
+
+    /// Where the local usage trace is kept (see [`trace`]).
+    pub fn trace_dir(&self) -> PathBuf {
+        self.0.join("trace")
     }
 }
 
