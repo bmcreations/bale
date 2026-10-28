@@ -30,23 +30,7 @@ pub fn new_workspace(
     if branch.starts_with('-') {
         bail!("branch {branch:?} must not start with '-'");
     }
-    let main = main_checkout(repo)?;
-    let repo_name = main
-        .file_name()
-        .with_context(|| format!("{} has no directory name", main.display()))?
-        .to_os_string();
-    let cfg = load_config(home, Some(&main))?;
-    let root = match cfg.worktree_root {
-        // A relative root is relative to the main checkout, never the cwd.
-        Some(r) => main.join(r).join(&repo_name),
-        None => {
-            let mut dir = repo_name.clone();
-            dir.push("-worktrees");
-            main.parent()
-                .with_context(|| format!("{} has no parent directory", main.display()))?
-                .join(dir)
-        }
-    };
+    let (main, root) = workspace_root(home, repo)?;
     let path = root.join(name);
 
     if fs::symlink_metadata(&path).is_ok() {
@@ -81,6 +65,35 @@ pub fn new_workspace(
     }
     register(home, &path)
         .with_context(|| format!("{} was created but could not be registered", path.display()))
+}
+
+/// Where `new_workspace` would put a worktree named `name` for `repo`,
+/// without creating anything.
+pub fn workspace_path(home: &BaleHome, repo: &Path, name: &str) -> Result<PathBuf> {
+    check_name(name)?;
+    Ok(workspace_root(home, repo)?.1.join(name))
+}
+
+/// The main checkout and the dir new worktrees of it go in.
+fn workspace_root(home: &BaleHome, repo: &Path) -> Result<(PathBuf, PathBuf)> {
+    let main = main_checkout(repo)?;
+    let repo_name = main
+        .file_name()
+        .with_context(|| format!("{} has no directory name", main.display()))?
+        .to_os_string();
+    let cfg = load_config(home, Some(&main))?;
+    let root = match cfg.worktree_root {
+        // A relative root is relative to the main checkout, never the cwd.
+        Some(r) => main.join(r).join(&repo_name),
+        None => {
+            let mut dir = repo_name.clone();
+            dir.push("-worktrees");
+            main.parent()
+                .with_context(|| format!("{} has no parent directory", main.display()))?
+                .join(dir)
+        }
+    };
+    Ok((main, root))
 }
 
 /// Accepts only a single plain path component (no `.`, `..`, separator or

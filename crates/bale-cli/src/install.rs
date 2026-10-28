@@ -16,6 +16,8 @@ use crate::hook::display_path;
 /// First line after the shebang of the git hook bale writes; marks it as ours.
 const GIT_HOOK_MARKER: &str = "# Installed by `bale install --git-hook`.";
 const LAUNCHD_LABEL: &str = "dev.bale.sweep";
+const REFORMAT_NOTE: &str = "note: settings.json is reformatted (2-space JSON); \
+                             settings.json.bak-bale keeps the original";
 
 /// One effect of an install.
 enum Step {
@@ -34,10 +36,14 @@ enum Step {
         path: PathBuf,
         before: Option<String>,
         after: String,
+        /// The original file's permissions, restored after the rewrite.
+        mode: Option<fs::Permissions>,
     },
     Run {
         args: Vec<String>,
         ignore_failure: bool,
+        /// Total tries, 500 ms apart, before a failure counts.
+        attempts: u32,
     },
     Note(String),
 }
@@ -64,18 +70,25 @@ impl Plan {
                     path,
                     before,
                     after,
+                    ..
                 } => {
                     println!("update {}:", display_path(path));
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
+                    if before.is_some() {
+                        println!("{REFORMAT_NOTE}");
+                    }
                 }
                 Step::Run {
                     args,
                     ignore_failure,
+                    attempts,
                 } => {
                     let tail = if *ignore_failure {
-                        "  (failure ignored)"
+                        "  (failure ignored)".to_string()
+                    } else if *attempts > 1 {
+                        format!("  (up to {attempts} tries)")
                     } else {
-                        ""
+                        String::new()
                     };
                     println!("run: {}{tail}", shell_words(args));
                 }
@@ -112,24 +125,42 @@ impl Plan {
                     path,
                     before,
                     after,
+                    mode,
                 } => {
                     print!("{}", diff(before.as_deref().unwrap_or(""), after));
+                    if before.is_some() {
+                        println!("{REFORMAT_NOTE}");
+                    }
                     let backup = path.with_file_name("settings.json.bak-bale");
                     if before.is_some() && fs::symlink_metadata(&backup).is_err() {
                         fs::copy(path, &backup)
                             .with_context(|| format!("backing up {}", path.display()))?;
                     }
                     write_atomic(path, after)?;
+                    if let Some(mode) = mode {
+                        fs::set_permissions(path, mode.clone())
+                            .with_context(|| format!("restoring the mode of {}", path.display()))?;
+                    }
                     println!("updated {}", display_path(path));
                 }
                 Step::Run {
                     args,
                     ignore_failure,
+                    attempts,
                 } => {
-                    let out = Command::new(&args[0])
-                        .args(&args[1..])
-                        .output()
-                        .with_context(|| format!("running {}", shell_words(args)))?;
+                    let mut tries = 0;
+                    let out = loop {
+                        tries += 1;
+                        let out = Command::new(&args[0])
+                            .args(&args[1..])
+                            .output()
+                            .with_context(|| format!("running {}", shell_words(args)))?;
+                        if out.status.success() || tries >= *attempts {
+                            break out;
+                        }
+                        // launchd can still be tearing down the job bootout removed.
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    };
                     if !out.status.success() && !ignore_failure {
                         bail!(
                             "{} failed: {}",
@@ -168,16 +199,42 @@ pub fn plan(claude_hooks: bool, git_hook: Option<&Path>) -> Result<Plan> {
     Ok(plan)
 }
 
-/// The running binary's absolute path; schedulers have a minimal PATH.
+/// The running binary's absolute path as invoked (not canonicalized, so a
+/// package manager's stable symlink such as `/opt/homebrew/bin/bale` is kept);
+/// schedulers have a minimal PATH. Warns when it looks like a build or
+/// versioned directory that will move.
 fn bale_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("locating the bale binary")?;
-    let exe = fs::canonicalize(&exe).unwrap_or(exe);
-    Ok(PathBuf::from(display_path(&exe)))
+    let exe = PathBuf::from(display_path(&exe));
+    if is_unstable_location(&exe) {
+        eprintln!(
+            "warning: {} is a build or versioned path; hooks and the schedule written now \
+             stop working when it moves. Install from a stable path such as the one on PATH.",
+            exe.display()
+        );
+    }
+    Ok(exe)
 }
 
-/// `HOME`, else `USERPROFILE` (Windows), so tests can redirect it.
+/// Under a cargo `target/` dir, or a Homebrew `Cellar/<formula>/<version>` dir.
+fn is_unstable_location(exe: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = exe.parent().map(|p| p.iter().collect()).unwrap_or_default();
+    parts.iter().any(|p| *p == "target")
+        || parts
+            .iter()
+            .position(|p| *p == "Cellar")
+            .is_some_and(|i| parts.len() > i + 2)
+}
+
+/// The home dir, from `HOME` or `USERPROFILE` (the latter first on Windows),
+/// so tests can redirect it.
 fn home_dir() -> Result<PathBuf> {
-    ["HOME", "USERPROFILE"]
+    let order = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    order
         .iter()
         .filter_map(std::env::var_os)
         .find(|v| !v.is_empty())
@@ -185,8 +242,23 @@ fn home_dir() -> Result<PathBuf> {
         .context("neither HOME nor USERPROFILE is set")
 }
 
+/// `PATH`, and `BALE_HOME` when set, captured at install time so the
+/// scheduled sweep sees the same environment.
+fn schedule_env() -> Vec<(&'static str, String)> {
+    ["PATH", "BALE_HOME"]
+        .into_iter()
+        .filter_map(|k| {
+            std::env::var(k)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| (k, v))
+        })
+        .collect()
+}
+
 fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
     let exe_s = display_path(exe);
+    let env = schedule_env();
     let mut steps = Vec::new();
     if cfg!(target_os = "macos") {
         let agents = home.join("Library").join("LaunchAgents");
@@ -197,7 +269,7 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
         steps.push(Step::Mkdir(logs.clone()));
         steps.push(Step::Write {
             path: plist.clone(),
-            content: launchd_plist(&exe_s, &display_path(&logs.join("sweep.log"))),
+            content: launchd_plist(&exe_s, &display_path(&logs.join("sweep.log")), &env),
             executable: false,
         });
         steps.push(Step::Run {
@@ -207,6 +279,7 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
                 format!("gui/{uid}/{LAUNCHD_LABEL}"),
             ],
             ignore_failure: true,
+            attempts: 1,
         });
         steps.push(Step::Run {
             args: vec![
@@ -216,6 +289,7 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
                 display_path(&plist),
             ],
             ignore_failure: false,
+            attempts: 5,
         });
     } else if cfg!(windows) {
         steps.push(Step::Run {
@@ -235,6 +309,7 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
             .chain([format!("\"{exe_s}\" sweep"), "/F".to_string()])
             .collect(),
             ignore_failure: false,
+            attempts: 1,
         });
     } else {
         let units = home.join(".config").join("systemd").join("user");
@@ -242,7 +317,13 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
         steps.push(Step::Write {
             path: units.join("bale-sweep.service"),
             content: format!(
-                "[Unit]\nDescription=bale sweep\n\n[Service]\nType=oneshot\nExecStart={} sweep\n",
+                "[Unit]\nDescription=bale sweep\n\n[Service]\nType=oneshot\n{}ExecStart={} sweep\n",
+                env.iter()
+                    .map(|(k, v)| format!(
+                        "Environment={}\n",
+                        systemd_env_quote(&format!("{k}={v}"))
+                    ))
+                    .collect::<String>(),
                 systemd_quote(&exe_s)
             ),
             executable: false,
@@ -261,6 +342,7 @@ fn schedule_plan(home: &Path, exe: &Path) -> Result<Plan> {
             steps.push(Step::Run {
                 args: args.iter().map(|s| s.to_string()).collect(),
                 ignore_failure: false,
+                attempts: 1,
             });
         }
     }
@@ -278,7 +360,22 @@ fn current_uid() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn launchd_plist(exe: &str, log: &str) -> String {
+fn launchd_plist(exe: &str, log: &str, env: &[(&str, String)]) -> String {
+    let env_dict = if env.is_empty() {
+        String::new()
+    } else {
+        let entries: String = env
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "    <key>{}</key>\n    <string>{}</string>\n",
+                    xml_escape(k),
+                    xml_escape(v)
+                )
+            })
+            .collect();
+        format!("  <key>EnvironmentVariables</key>\n  <dict>\n{entries}  </dict>\n")
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -297,12 +394,13 @@ fn launchd_plist(exe: &str, log: &str) -> String {
   <string>{}</string>
   <key>StandardErrorPath</key>
   <string>{}</string>
-</dict>
+{}</dict>
 </plist>
 "#,
         xml_escape(exe),
         xml_escape(log),
-        xml_escape(log)
+        xml_escape(log),
+        env_dict
     )
 }
 
@@ -322,13 +420,44 @@ fn systemd_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// A systemd `Environment=` assignment: double-quoted, `\`, `"` and `%` escaped.
+fn systemd_env_quote(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+/// `s` single-quoted for sh, which Claude Code runs command hooks with.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The command line a Claude Code hook entry runs.
 fn hook_command(exe: &Path, kind: &str) -> String {
-    format!("\"{}\" hook {kind}", display_path(exe).replace('\\', "/"))
+    format!(
+        "{} hook {kind}",
+        sh_quote(&display_path(exe).replace('\\', "/"))
+    )
 }
 
 fn claude_hooks_plan(home: &Path, exe: &Path) -> Result<Plan> {
     let path = home.join(".claude").join("settings.json");
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "{} is a symlink; bale will not replace it with a regular file. Add the \
+             WorktreeCreate and WorktreeRemove hooks to the file it points at by hand \
+             (see `bale install --claude-hooks --print-only`), or replace the link with a copy.",
+            path.display()
+        );
+    }
+    let mode = meta.map(|m| m.permissions());
     let before = match fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -359,13 +488,27 @@ fn claude_hooks_plan(home: &Path, exe: &Path) -> Result<Plan> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .with_context(|| format!("hooks.{event} in {} is not an array", path.display()))?;
-        let commands: Vec<&str> = groups
-            .iter()
-            .filter_map(|g| g["hooks"].as_array())
+        let want = hook_command(exe, kind);
+        let marker = format!("hook {kind}");
+        let mut ours = false;
+        for h in groups
+            .iter_mut()
+            .filter_map(|g| g["hooks"].as_array_mut())
             .flatten()
-            .filter_map(|h| h["command"].as_str())
-            .collect();
-        if commands.iter().any(|c| c.contains(&format!("hook {kind}"))) {
+        {
+            let Some(cmd) = h["command"].as_str() else {
+                continue;
+            };
+            if cmd.ends_with(&marker) {
+                ours = true;
+                if cmd != want {
+                    // bale's own entry from another binary path: point it here.
+                    h["command"] = Value::String(want.clone());
+                    changed = true;
+                }
+            }
+        }
+        if ours {
             continue;
         }
         if !groups.is_empty() {
@@ -377,7 +520,7 @@ fn claude_hooks_plan(home: &Path, exe: &Path) -> Result<Plan> {
             );
         }
         groups.push(json!({
-            "hooks": [{ "type": "command", "command": hook_command(exe, kind) }]
+            "hooks": [{ "type": "command", "command": want }]
         }));
         changed = true;
     }
@@ -399,6 +542,7 @@ fn claude_hooks_plan(home: &Path, exe: &Path) -> Result<Plan> {
             path,
             before,
             after,
+            mode,
         },
     ]))
 }
@@ -426,10 +570,12 @@ fn git_hook_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     let g = Git::at(repo);
     let dir = g.run(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?;
     let dir = PathBuf::from(dir.trim_end_matches(['\n', '\r']));
-    let configured = g
-        .run(&["config", "--get", "core.hooksPath"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    // `<scope>\t<value>`, e.g. `global\t~/.githooks`.
+    let scope = g
+        .run(&["config", "--show-scope", "--get", "core.hooksPath"])
+        .ok()
+        .and_then(|s| s.split_once('\t').map(|(scope, _)| scope.to_string()));
+    let configured = scope.is_some();
     if configured {
         if let Ok(top) = g.run(&["rev-parse", "--show-toplevel"]) {
             let top = canon_lenient(Path::new(top.trim_end_matches(['\n', '\r'])));
@@ -449,6 +595,14 @@ fn git_hook_plan(repo: &Path, exe: &Path) -> Result<Plan> {
     let prev = dir.join("post-checkout.pre-bale");
     let script = git_hook_script(exe);
     let mut steps = vec![Step::Mkdir(dir.clone())];
+    if let Some(scope @ ("global" | "system")) = scope.as_deref() {
+        steps.push(Step::Note(format!(
+            "note: core.hooksPath comes from your {scope} git config, so this hook in {} \
+             applies to every repo that uses it, not only {}",
+            display_path(&dir),
+            display_path(repo)
+        )));
+    }
     match fs::read(&hook) {
         Ok(bytes) => {
             let current = String::from_utf8_lossy(&bytes);

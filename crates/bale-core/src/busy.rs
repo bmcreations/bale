@@ -2,6 +2,28 @@
 use anyhow::Context;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Pids that `busy_holders*` ignore for the rest of this process.
+static EXCLUDED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Makes every later busy check in this process ignore `pids`. A hook uses
+/// it for the processes that invoked it (its shell and Claude Code), which
+/// hold the tree only because they are waiting on the hook.
+pub fn exclude_pids(pids: &[u32]) {
+    let mut excluded = EXCLUDED.lock().unwrap_or_else(|e| e.into_inner());
+    excluded.extend_from_slice(pids);
+}
+
+fn without_excluded(mut lists: Vec<Vec<Holder>>) -> Vec<Vec<Holder>> {
+    let excluded = EXCLUDED.lock().unwrap_or_else(|e| e.into_inner());
+    if !excluded.is_empty() {
+        for list in &mut lists {
+            list.retain(|h| !excluded.contains(&h.pid));
+        }
+    }
+    lists
+}
 
 /// A process that has its cwd or an open file under the probed root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,17 +53,12 @@ pub fn busy_holders(root: &Path) -> Result<Vec<Holder>> {
 /// given). Errs only when the scan fails.
 pub fn busy_holders_many(roots: &[PathBuf]) -> Result<Vec<Vec<Holder>>> {
     #[cfg(target_os = "linux")]
-    {
-        linux::holders(roots)
-    }
+    let lists = linux::holders(roots)?;
     #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        lsof::holders(roots)
-    }
+    let lists = lsof::holders(roots)?;
     #[cfg(not(unix))]
-    {
-        Ok(vec![Vec::new(); roots.len()])
-    }
+    let lists = vec![Vec::new(); roots.len()];
+    Ok(without_excluded(lists))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -218,5 +235,23 @@ mod linux {
             targets.push(target.canonicalize().unwrap_or(target));
         }
         Ok(targets)
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+
+    #[test]
+    fn excluded_pids_are_dropped_from_every_list() {
+        // A pid no real process has, so other tests in this binary are unaffected.
+        exclude_pids(&[u32::MAX - 7]);
+        let h = |pid| Holder {
+            pid,
+            command: "x".into(),
+            path: PathBuf::from("/r"),
+        };
+        let lists = without_excluded(vec![vec![h(u32::MAX - 7), h(10)], vec![h(u32::MAX - 7)]]);
+        assert_eq!(lists, vec![vec![h(10)], vec![]]);
     }
 }

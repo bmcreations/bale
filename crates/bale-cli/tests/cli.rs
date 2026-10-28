@@ -52,7 +52,11 @@ impl Env {
             .env("BALE_HOME", self.bale_home())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home().join(".gitconfig"))
-            .env("LC_ALL", "C");
+            .env("LC_ALL", "C")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR");
     }
 
     fn git_out(&self, dir: &Path, args: &[&str]) -> Output {
@@ -180,6 +184,11 @@ fn create_hook_prints_only_path() {
     assert!(path.is_dir(), "{}", path.display());
     assert_eq!(path.file_name().unwrap(), "feature-auth");
     assert!(env.is_registered(&path));
+    let list = env.git(&env.repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        list.contains("branch refs/heads/worktree-feature-auth"),
+        "{list}"
+    );
 }
 
 #[test]
@@ -192,8 +201,10 @@ fn create_hook_falls_back_to_git_when_bale_fails() {
         .join("my repo é-worktrees")
         .join("feature-auth");
     fs::create_dir_all(&taken).unwrap();
-    let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
-    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    // From inside a linked worktree, the fallback still roots at the main checkout.
+    let linked = env.add_worktree("linked");
+    let input = payload("worktree_create.json", &[("cwd", &linked)]);
+    let out = env.bale(&linked, &["hook", "claude-worktree-create"], Some(&input));
     assert!(out.status.success(), "{}", stderr(&out));
     let path = single_path(&out);
     assert_eq!(
@@ -499,8 +510,21 @@ fn print_only_shows_schedule_and_changes_nothing() {
     let out = env.bale(&env.repo, &["install", "--print-only"], None);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    let exe = canon(Path::new(env!("CARGO_BIN_EXE_bale")));
-    assert!(text.contains(exe.to_str().unwrap()), "{text}");
+    // The exe path is used as run, not canonicalized.
+    let exe = env!("CARGO_BIN_EXE_bale");
+    assert!(text.contains(exe), "{text}");
+    // A cargo build dir is not a stable install location.
+    assert!(stderr(&out).contains("warning"), "{}", stderr(&out));
+    if !cfg!(windows) {
+        assert!(text.contains("BALE_HOME"), "{text}");
+        assert!(text.contains(env.bale_home().to_str().unwrap()), "{text}");
+        assert!(text.contains("PATH"), "{text}");
+    }
+    if cfg!(target_os = "macos") {
+        assert!(text.contains("<key>EnvironmentVariables</key>"), "{text}");
+    } else if !cfg!(windows) {
+        assert!(text.contains("Environment="), "{text}");
+    }
     if cfg!(target_os = "macos") {
         assert!(text.contains("dev.bale.sweep.plist"), "{text}");
         assert!(text.contains("<integer>1800</integer>"), "{text}");
@@ -538,4 +562,222 @@ fn print_only_shows_schedule_and_changes_nothing() {
     assert_eq!(listing(&env.home()), before);
     assert_eq!(fs::read_to_string(&path).unwrap(), SETTINGS);
     assert_eq!(listing(&hooks_dir(&env)), hooks_before);
+}
+
+#[test]
+fn create_hook_reuses_worktree_bale_already_made() {
+    let env = Env::new();
+    // Hold the workspace lock so `register` fails after `git worktree add`.
+    let target = env
+        .tmp
+        .path()
+        .join("my repo é-worktrees")
+        .join("feature-auth");
+    let home = bale_core::BaleHome(env.bale_home());
+    let id = bale_core::registry::workspace_id(&target);
+    let _lock = bale_core::lock::WorkspaceLock::try_acquire(&home, &id)
+        .unwrap()
+        .expect("lock");
+    let input = payload("worktree_create.json", &[("cwd", &env.repo)]);
+    let out = env.bale(&env.repo, &["hook", "claude-worktree-create"], Some(&input));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = single_path(&out);
+    assert_eq!(canon(&path), canon(&target));
+    let list = env.git(&env.repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(list.matches("worktree ").count(), 2, "{list}");
+    assert!(!env.repo.join(".claude").exists());
+}
+
+/// Runs the remove hook from `sh -c 'cd <wt> && <cmd>'`, so its parent
+/// shell has its cwd in the worktree, as when Claude Code runs it there.
+#[cfg(unix)]
+fn remove_via_shell(env: &Env, wt: &Path, extra: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let input = payload("worktree_remove.json", &[("worktree_path", wt)]);
+    let script = format!(
+        "cd \"$WT\" || exit 9\n{extra}\n\"$BALE\" hook claude-worktree-remove\nstatus=$?\nexit $status\n"
+    );
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(script)
+        .env("WT", wt)
+        .env("BALE", env!("CARGO_BIN_EXE_bale"))
+        .current_dir(&env.repo);
+    env.isolate(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_hook_ignores_its_own_parent_shell() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    let out = remove_via_shell(&env, &wt, "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(fs::symlink_metadata(&wt).is_err(), "dir still exists");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_hook_still_sees_non_ancestor_holders() {
+    let env = Env::new();
+    let wt = env.add_worktree("wt");
+    // A background child of the same shell, like a dev server Claude Code started.
+    let out = remove_via_shell(
+        &env,
+        &wt,
+        "sleep 30 &\nBG=$!\ntrap 'kill $BG' EXIT\nsleep 0.3",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("busy") && err.contains("sleep"), "{err}");
+    assert!(wt.join("f").is_file());
+}
+
+#[test]
+fn claude_hooks_install_creates_missing_settings_without_backup() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(v["hooks"]["WorktreeCreate"].is_array(), "{v}");
+    assert!(!path.with_file_name("settings.json.bak-bale").exists());
+}
+
+#[test]
+fn claude_hooks_install_refuses_other_worktree_hook() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let other = r#"{"hooks":{"WorktreeCreate":[{"hooks":[{"type":"command","command":"my-tool create"}]}]}}"#;
+    fs::write(&path, other).unwrap();
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&path).unwrap(), other);
+    assert!(!path.with_file_name("settings.json.bak-bale").exists());
+}
+
+#[test]
+fn claude_hooks_install_refuses_non_object_and_trailing_data() {
+    for text in [
+        "[]",
+        "{} {}",
+        "{\"a\": 1}\n// trailing comment\n",
+        "{ /* c */ \"a\": 1 }",
+    ] {
+        let env = Env::new();
+        let path = settings_path(&env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+        assert!(!out.status.success(), "accepted {text:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+}
+
+#[test]
+fn claude_hooks_install_rewrites_stale_bale_entries() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let stale = r#"{"hooks":{
+      "WorktreeCreate":[{"hooks":[{"type":"command","command":"'/old/Cellar/bale/0.1/bin/bale' hook claude-worktree-create"}]}],
+      "WorktreeRemove":[{"hooks":[{"type":"command","command":"'/old/Cellar/bale/0.1/bin/bale' hook claude-worktree-remove"}]}]}}"#;
+    fs::write(&path, stale).unwrap();
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for event in ["WorktreeCreate", "WorktreeRemove"] {
+        let groups = v["hooks"][event].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{v}");
+        let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(!cmd.contains("/old/"), "{cmd}");
+        assert!(cmd.contains("bale"), "{cmd}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_hooks_install_refuses_symlinked_settings() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let real = env.tmp.path().join("dotfiles-settings.json");
+    fs::write(&real, SETTINGS).unwrap();
+    std::os::unix::fs::symlink(&real, &path).unwrap();
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("symlink"), "{}", stderr(&out));
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&real).unwrap(), SETTINGS);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_hooks_install_keeps_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, SETTINGS).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = env.bale(&env.repo, &["install", "--claude-hooks"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("reformatted"), "{}", stdout(&out));
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644);
+}
+
+#[test]
+fn git_hook_install_rewrites_stale_bale_path() {
+    let env = Env::new();
+    let hook = hooks_dir(&env).join("post-checkout");
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let current = fs::read_to_string(&hook).unwrap();
+    let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
+    assert!(current.contains(&exe), "{current}");
+    fs::write(&hook, current.replace(&exe, "/old/bin/bale")).unwrap();
+
+    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rewritten = fs::read_to_string(&hook).unwrap();
+    assert!(rewritten.contains(&exe) && !rewritten.contains("/old/bin/bale"));
+    assert!(!hooks_dir(&env).join("post-checkout.pre-bale").exists());
+}
+
+#[test]
+fn git_hook_notes_global_hooks_path() {
+    let env = Env::new();
+    let shared = env.tmp.path().join("user hooks");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(
+        env.home().join(".gitconfig"),
+        format!("[core]\n\thooksPath = {}\n", sh_path(&shared)),
+    )
+    .unwrap();
+    let repo = env.repo.to_str().unwrap();
+    let out = env.bale(&env.repo, &["install", "--git-hook", repo], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let all = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(all.contains("global git config"), "{all}");
+    assert!(shared.join("post-checkout").is_file());
 }

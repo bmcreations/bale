@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
 use bale_core::ops::cold::cold;
-use bale_core::ops::new::new_workspace;
+use bale_core::ops::new::{new_workspace, workspace_path};
 use bale_core::ops::up::{register, resolve, Outcome};
 use bale_core::BaleHome;
 use serde_json::Value;
@@ -55,18 +55,30 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
-/// WorktreeCreate: creates the worktree with `bale new`, or with plain git
-/// where Claude Code would have put it when bale fails, and prints only its
-/// absolute path on stdout.
+/// WorktreeCreate: creates the worktree with `bale new` on Claude Code's
+/// branch name `worktree-<name>`, or with plain git where Claude Code would
+/// have put it when bale fails, and prints only its absolute path on stdout.
 pub fn claude_worktree_create(home: &BaleHome) -> Result<ExitCode> {
     let payload = read_payload()?;
     let name = field(&payload, "name")?;
     let cwd = PathBuf::from(field(&payload, "cwd")?);
-    let path = match new_workspace(home, &cwd, name, None) {
+    let branch = format!("worktree-{name}");
+    let path = match new_workspace(home, &cwd, name, Some(&branch)) {
         Ok(record) => record.path,
         Err(e) => {
-            eprintln!("bale: {e:#}; falling back to git worktree add");
-            let path = git_fallback(&cwd, name)?;
+            eprintln!("bale: {e:#}");
+            let candidates = [
+                workspace_path(home, &cwd, name).ok(),
+                fallback_path(&cwd, name).ok(),
+            ];
+            let path = match existing_worktree(&cwd, candidates.iter().flatten()) {
+                // bale (or an earlier fallback) already made it; never add a second one.
+                Some(path) => path,
+                None => {
+                    eprintln!("bale: falling back to git worktree add");
+                    git_fallback(&cwd, name, &branch)?
+                }
+            };
             if let Err(e) = register(home, &path) {
                 eprintln!("bale: not registered: {e:#}");
             }
@@ -77,9 +89,26 @@ pub fn claude_worktree_create(home: &BaleHome) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git worktree add` at `<repo root>/.claude/worktrees/<name>` on branch
-/// `worktree-<name>`, as Claude Code does without a WorktreeCreate hook.
-fn git_fallback(cwd: &Path, name: &str) -> Result<PathBuf> {
+/// The first of `candidates` that is a linked worktree of `cwd`'s repo.
+fn existing_worktree<'a>(
+    cwd: &Path,
+    candidates: impl Iterator<Item = &'a PathBuf>,
+) -> Option<PathBuf> {
+    let listed: Vec<PathBuf> = git::worktrees(cwd)
+        .ok()?
+        .into_iter()
+        .filter(|w| !w.is_main)
+        .map(|w| fs::canonicalize(&w.path).unwrap_or(w.path))
+        .collect();
+    candidates
+        .filter_map(|c| fs::canonicalize(c).ok())
+        .find(|c| listed.contains(c))
+}
+
+/// `<main checkout>/.claude/worktrees/<name>`, the main checkout being the
+/// parent of the common git dir, so a cwd in a linked worktree still roots
+/// at the main checkout as Claude Code does.
+fn fallback_path(cwd: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty()
         || name.starts_with('-')
         || name.contains(['/', '\\'])
@@ -88,14 +117,21 @@ fn git_fallback(cwd: &Path, name: &str) -> Result<PathBuf> {
     {
         bail!("worktree name {name:?} must be a single directory name");
     }
-    let top = Git::at(cwd).run(&["rev-parse", "--show-toplevel"])?;
-    let top = fs::canonicalize(top.trim_end_matches(['\n', '\r']))
-        .context("resolving the repository root")?;
-    let dir = top.join(".claude").join("worktrees");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(name);
-    let branch = format!("worktree-{name}");
-    let g = Git::at(&top);
+    let common = git::common_dir(cwd)?;
+    let main = common
+        .parent()
+        .with_context(|| format!("{} has no parent", common.display()))?;
+    let main = fs::canonicalize(main).context("resolving the main checkout")?;
+    Ok(main.join(".claude").join("worktrees").join(name))
+}
+
+/// `git worktree add` at [`fallback_path`] on `branch`, as Claude Code does
+/// without a WorktreeCreate hook.
+fn git_fallback(cwd: &Path, name: &str, branch: &str) -> Result<PathBuf> {
+    let path = fallback_path(cwd, name)?;
+    let dir = path.parent().expect("fallback path has a parent");
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let g = Git::at(dir.parent().and_then(Path::parent).expect("main checkout"));
     let p = path.to_string_lossy();
     let exists = g
         .run(&[
@@ -106,11 +142,69 @@ fn git_fallback(cwd: &Path, name: &str) -> Result<PathBuf> {
         ])
         .is_ok();
     if exists {
-        g.run(&["worktree", "add", "--", &p, &branch])?;
+        g.run(&["worktree", "add", "--", &p, branch])?;
     } else {
-        g.run(&["worktree", "add", "-b", &branch, "--", &p])?;
+        g.run(&["worktree", "add", "-b", branch, "--", &p])?;
     }
     Ok(fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// The pids whose hold on the tree comes from running this hook: this
+/// process, its parent shell, and the nearest ancestor that is Claude Code,
+/// or the grandparent when no ancestor looks like Claude Code. Nothing above
+/// that (such as the user's shell that started Claude Code) is included.
+/// `info` gives a pid's parent pid and process name or exe.
+pub(crate) fn invoking_pids(own: u32, info: impl Fn(u32) -> Option<(u32, String)>) -> Vec<u32> {
+    const SEARCH_DEPTH: usize = 8;
+    let mut pids = vec![own];
+    let Some((parent, _)) = info(own) else {
+        return pids;
+    };
+    if parent <= 1 {
+        return pids;
+    }
+    pids.push(parent);
+    let Some((grandparent, parent_name)) = info(parent) else {
+        return pids;
+    };
+    if is_claude(&parent_name) || grandparent <= 1 {
+        return pids;
+    }
+    let mut cur = grandparent;
+    for _ in 0..SEARCH_DEPTH {
+        let Some((next, name)) = info(cur) else { break };
+        if is_claude(&name) {
+            pids.push(cur);
+            return pids;
+        }
+        if next <= 1 {
+            break;
+        }
+        cur = next;
+    }
+    pids.push(grandparent);
+    pids
+}
+
+fn is_claude(name: &str) -> bool {
+    name.to_lowercase().contains("claude")
+}
+
+/// `(parent pid, command)` for `pid` from `ps`; `None` where unavailable.
+fn process_info(pid: u32) -> Option<(u32, String)> {
+    if cfg!(windows) {
+        return None;
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (ppid, comm) = text.trim().split_once(char::is_whitespace)?;
+    Some((ppid.trim().parse().ok()?, comm.trim().to_string()))
 }
 
 /// WorktreeRemove: colds the worktree (saving any uncommitted work), so
@@ -121,14 +215,20 @@ pub fn claude_worktree_remove(home: &BaleHome) -> Result<ExitCode> {
     if fs::symlink_metadata(&path).is_err() {
         return Ok(ExitCode::SUCCESS);
     }
-    // Keep this process's cwd out of the tree so it is not a busy holder.
+    // Keep this process's cwd out of the tree, and ignore the processes
+    // that are only waiting on this hook.
     if let Some(parent) = path.parent() {
         let _ = std::env::set_current_dir(parent);
     }
+    bale_core::busy::exclude_pids(&invoking_pids(std::process::id(), process_info));
     let code = match resolve(home, &path.to_string_lossy()).and_then(|id| cold(home, &id)) {
         Ok(Outcome::Done(_)) => ExitCode::SUCCESS,
         Ok(Outcome::Busy(holders)) => {
-            eprintln!("bale: {} is busy, left untouched", path.display());
+            eprintln!(
+                "bale: {} is busy, left untouched; these processes hold it \
+                 (Claude Code's background tasks and servers count):",
+                path.display()
+            );
             for h in holders {
                 eprintln!("  pid {} {} {}", h.pid, h.command, h.path.display());
             }
@@ -171,4 +271,66 @@ pub fn git_post_checkout(home: &BaleHome, prev: &str, flag: &str) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn table(rows: &[(u32, u32, &str)]) -> impl Fn(u32) -> Option<(u32, String)> {
+        let map: HashMap<u32, (u32, String)> = rows
+            .iter()
+            .map(|(pid, ppid, name)| (*pid, (*ppid, name.to_string())))
+            .collect();
+        move |pid| map.get(&pid).cloned()
+    }
+
+    #[test]
+    fn stops_at_claude_and_never_reaches_the_users_shell() {
+        // zsh(10) -> claude(20) -> sh(30) -> bale(40)
+        let info = table(&[
+            (10, 1, "-zsh"),
+            (20, 10, "/Users/me/.local/bin/claude"),
+            (30, 20, "/bin/sh"),
+            (40, 30, "bale"),
+        ]);
+        assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);
+    }
+
+    #[test]
+    fn finds_claude_above_a_wrapper() {
+        // zsh(10) -> claude(20) -> bash(25) -> sh(30) -> bale(40)
+        let info = table(&[
+            (10, 1, "zsh"),
+            (20, 10, "claude"),
+            (25, 20, "bash"),
+            (30, 25, "sh"),
+            (40, 30, "bale"),
+        ]);
+        assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);
+    }
+
+    #[test]
+    fn falls_back_to_the_grandparent() {
+        // zsh(10) -> node(20) -> sh(30) -> bale(40)
+        let info = table(&[
+            (10, 1, "zsh"),
+            (20, 10, "node"),
+            (30, 20, "sh"),
+            (40, 30, "bale"),
+        ]);
+        assert_eq!(invoking_pids(40, info), vec![40, 30, 20]);
+    }
+
+    #[test]
+    fn parent_that_is_claude_ends_the_chain() {
+        let info = table(&[(10, 1, "zsh"), (20, 10, "claude"), (40, 20, "bale")]);
+        assert_eq!(invoking_pids(40, info), vec![40, 20]);
+    }
+
+    #[test]
+    fn unknown_process_table_excludes_only_self() {
+        assert_eq!(invoking_pids(40, |_| None), vec![40]);
+    }
 }
