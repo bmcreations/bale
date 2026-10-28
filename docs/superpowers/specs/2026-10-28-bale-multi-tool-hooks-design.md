@@ -90,8 +90,9 @@ bale install --hooks git --repo <REPO>  # as today
 
   The non-Claude lists are a guess until checked against the running tool.
 - **claude create** calls core `new`. No other tool lets a command replace worktree creation.
-- **install** edits keep the commands already in the file and run bale's after them, for setup, or before
-  them, for archive. It prints the diff first, and `--print-only` writes nothing. Conductor and Cursor
+- **install** edits keep the commands already in the file and run bale's after them, for setup and for
+  archive. The user's archive runs first, then bale: cold deletes the directory, and the user's cleanup
+  may need it (Task 5 ruling F2). It prints the diff first, and `--print-only` writes nothing. Conductor and Cursor
   files are usually committed, so the output says so. Claude Code runs an event's matching hooks in
   parallel (code.claude.com/docs/en/hooks), so settings.json order sets no order between bale's
   `WorktreeRemove` entry and a user's; install notes such a hook, and bale exits 3 while that hook's
