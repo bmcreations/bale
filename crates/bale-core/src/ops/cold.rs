@@ -154,6 +154,9 @@ fn refusal(root: &Path, ex: &Exclusions) -> Result<Option<String>> {
     if let Some(reason) = info.foreign_lock() {
         return Ok(Some(reason));
     }
+    if let Some(reason) = case_variant_git(root, ex) {
+        return Ok(Some(reason));
+    }
 
     let g = Git::at(root);
     let sparse = g.run(&[
@@ -364,6 +367,10 @@ fn finish(
     // Until the marker is written, a crash leaves an unmarked trash, which
     // `recover` checks again before deleting it.
     let checked = (|| -> Result<Option<Outcome>> {
+        // Git fails on such a path on some platforms and skips it on others.
+        if let Some(reason) = case_variant_git(&trash, &ex) {
+            return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+        }
         let wip = wip_commit(&trash, &id)?;
         // The same exclusions as the save: the trash is checked against
         // exactly what was captured.
@@ -528,6 +535,9 @@ fn recover(home: &BaleHome, registry: &Registry, mut record: Record) -> Result<O
             // does not, or can't be checked, it goes back to the recorded
             // path as a `Baled` tree; nothing is deleted.
             let checked = exclusions(home, &trash).and_then(|ex| {
+                if let Some(reason) = case_variant_git(&trash, &ex) {
+                    return Ok(Some(Outcome::Skipped(not_restorable(&reason))));
+                }
                 let wip = wip_sha.trim();
                 if verify_in(&trash, wip, &dest, &ex, Place::Moved)?.is_some() {
                     return Ok(Some(Outcome::Busy(Vec::new())));
@@ -1149,6 +1159,49 @@ fn scan_ignored_with(
         }
     }
     Ok(scan)
+}
+
+/// The skip reason for entries under `dir` named like `.git` in another
+/// case (`.GIT`, `.Git`, ...). Git refuses such a path on every platform,
+/// so the save could not hold it and open could not put it back. Exact
+/// `.git` entries are left to the submodule and nested-repo checks, and
+/// regenerable dirs `up` removes are not searched.
+fn case_variant_git(dir: &Path, ex: &Exclusions) -> Option<String> {
+    let regen: Vec<PathBuf> = ex.regen.iter().map(|r| dir.join(r)).collect();
+    let mut found = Vec::new();
+    let mut it = WalkDir::new(dir)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter();
+    while let Some(item) = it.next() {
+        // An unreadable entry is reported by the checks that read it.
+        let Ok(item) = item else { continue };
+        if item.depth() == 0 {
+            continue;
+        }
+        let name = item.file_name();
+        if name == ".git" || regen.iter().any(|r| r == item.path()) {
+            if item.file_type().is_dir() {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+        if name.eq_ignore_ascii_case(".git") {
+            if let Ok(rel) = item.path().strip_prefix(dir) {
+                found.push(rel.to_path_buf());
+            }
+            if item.file_type().is_dir() {
+                it.skip_current_dir();
+            }
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "git cannot store a path named like .git in another case: {}",
+        join_paths(&found)
+    ))
 }
 
 fn join_paths(paths: &[PathBuf]) -> String {
@@ -2453,11 +2506,51 @@ mod tests {
         let out = cold(&home, &id).unwrap();
         drop(seam);
 
-        assert!(matches!(&out, Outcome::Skipped(r) if r.contains("d would not be restored")));
+        let named = Path::new("d").join(".GIT").display().to_string();
+        assert!(
+            matches!(&out, Outcome::Skipped(r) if r.contains(&named)),
+            "{out:?}"
+        );
         assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
         assert_eq!(record.level, Level::Baled);
+    }
+
+    /// Git refuses any case variant of `.git` as a path, so open could not
+    /// restore one. Cold refuses before `up` removes anything or the tree
+    /// moves, on every platform.
+    #[test]
+    fn case_variant_git_dir_is_refused_before_anything_changes() {
+        let (tmp, repo) = repo();
+        let wt = tmp.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        fs::write(wt.join(".gitignore"), ".env\nbuild/\n").unwrap();
+        fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+        fs::create_dir_all(wt.join("build")).unwrap();
+        fs::write(wt.join("build/out.bin"), "o").unwrap();
+        fs::create_dir_all(wt.join("d/.Git")).unwrap();
+        fs::write(wt.join("d/.Git/keep"), "k").unwrap();
+        let home = BaleHome(tmp.path().join("home"));
+        let id = crate::ops::up::register(&home, &wt).unwrap().id;
+
+        let seam = set_seam(&BEFORE_RENAME, |_: &Path| panic!("reached the rename"));
+        let out = cold(&home, &id).unwrap();
+        drop(seam);
+
+        let named = Path::new("d").join(".Git").display().to_string();
+        assert!(
+            matches!(&out, Outcome::Skipped(r) if r.contains(&named)),
+            "{out:?}"
+        );
+        assert_eq!(fs::read_to_string(wt.join("d/.Git/keep")).unwrap(), "k");
+        assert!(wt.join("build/out.bin").is_file());
+        assert!(trash_siblings(&wt).unwrap().is_empty());
+        let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+        assert_ne!(record.level, Level::Cooling);
     }
 
     /// Recovery checks an unmarked trash with the same restore comparison.
@@ -2482,7 +2575,11 @@ mod tests {
         assert!(crashed.is_err());
 
         let out = cold(&home, &id).unwrap();
-        assert!(matches!(&out, Outcome::Skipped(r) if r.contains("d would not be restored")));
+        let named = Path::new("d").join(".GIT").display().to_string();
+        assert!(
+            matches!(&out, Outcome::Skipped(r) if r.contains(&named)),
+            "{out:?}"
+        );
         assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
         assert!(trash_siblings(&wt).unwrap().is_empty());
         let record = Registry::open(home.clone()).get(&id).unwrap().unwrap();

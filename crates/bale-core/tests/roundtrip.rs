@@ -49,6 +49,19 @@ fn assert_refused(fx: &Fixture, wt: &Path, id: &str, path: &str) {
     assert_eq!(level(fx, id), Level::Baled);
 }
 
+/// Cold must refuse before it changes anything: the tree stays, the record
+/// keeps its level, and the skip reason names `path`.
+fn assert_refused_untouched(fx: &Fixture, wt: &Path, id: &str, path: &str) {
+    let before = level(fx, id);
+    let out = cold(&fx.home(), id).unwrap();
+    let Outcome::Skipped(reason) = &out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(reason.contains(path), "{reason}");
+    assert!(wt.is_dir(), "the tree was deleted");
+    assert_eq!(level(fx, id), before);
+}
+
 #[cfg(unix)]
 fn mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -234,7 +247,8 @@ fn crlf_files_under_autocrlf_true_round_trip() {
     assert_eq!(fs::read(wt.join("new.txt")).unwrap(), b"n\r\n");
 }
 
-/// git never adds a `.git` dir in any case, so `add -A` drops `.GIT`.
+/// Git refuses a `.git` in any case as a path: depending on the platform
+/// `add -A` drops `.GIT` or fails on it. Cold refuses before `up` runs.
 #[test]
 fn case_variant_git_dir_in_untracked_dir_is_refused() {
     let fx = Fixture::new();
@@ -246,7 +260,8 @@ fn case_variant_git_dir_in_untracked_dir_is_refused() {
             fs::write(wt.join("d/.GIT/keep"), "k").unwrap();
         },
     );
-    assert_refused(&fx, &wt, &id, "d would not be restored");
+    let named = Path::new("d").join(".GIT").display().to_string();
+    assert_refused_untouched(&fx, &wt, &id, &named);
     assert_eq!(fs::read_to_string(wt.join("d/.GIT/keep")).unwrap(), "k");
 }
 
@@ -265,7 +280,8 @@ fn case_variant_git_dir_in_tracked_dir_is_refused() {
             fs::write(wt.join("src/.GIT/keep"), "k").unwrap();
         },
     );
-    assert_refused(&fx, &wt, &id, "src/.GIT");
+    let named = Path::new("src").join(".GIT").display().to_string();
+    assert_refused_untouched(&fx, &wt, &id, &named);
     assert_eq!(fs::read_to_string(wt.join("src/.GIT/keep")).unwrap(), "k");
 }
 
