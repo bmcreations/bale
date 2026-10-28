@@ -27,6 +27,13 @@ pub struct Manifest {
     /// Dirs with nothing in them that open writes; git keeps no dirs.
     #[serde(default)]
     pub dirs: Vec<PathBuf>,
+    /// Permission bits of every dir open writes (unix only). Checkout and
+    /// the manifest copy create dirs with the umask's mode.
+    #[serde(default)]
+    pub dir_modes: Vec<SavedMode>,
+    /// Permission bits of the tree's root dir (unix only).
+    #[serde(default)]
+    pub root_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,12 +136,21 @@ pub(crate) fn denied(rel: &Path, regen: &[PathBuf], deny: &[String]) -> bool {
             .any(|d| rel.starts_with(d.trim_end_matches('/')))
 }
 
-/// The modes of the regular files and the empty dirs of the tree at `root`,
-/// as the walk under `skip` sees it. A dir counts as empty when nothing the
-/// walk keeps is inside it.
-pub(crate) fn record_tree(root: &Path, skip: &Skip) -> Result<(Vec<SavedMode>, Vec<PathBuf>)> {
+/// What the manifest records about the tree at `root` beside the saved
+/// files: as the walk under `skip` sees it, the modes of the regular files
+/// and the dirs (and the root), and the empty dirs. A dir counts as empty
+/// when nothing the walk keeps is inside it.
+pub(crate) struct TreeRecord {
+    pub modes: Vec<SavedMode>,
+    pub dirs: Vec<PathBuf>,
+    pub dir_modes: Vec<SavedMode>,
+    pub root_mode: Option<u32>,
+}
+
+pub(crate) fn record_tree(root: &Path, skip: &Skip) -> Result<TreeRecord> {
     let mut modes = Vec::new();
     let mut dirs = Vec::new();
+    let mut dir_modes = Vec::new();
     let mut parents = BTreeSet::new();
     let mut it = WalkDir::new(root)
         .min_depth(1)
@@ -160,6 +176,12 @@ pub(crate) fn record_tree(root: &Path, skip: &Skip) -> Result<(Vec<SavedMode>, V
             parents.insert(parent.to_path_buf());
         }
         if ft.is_dir() {
+            if let Some(mode) = file_mode(&item.metadata()?) {
+                dir_modes.push(SavedMode {
+                    rel: rel.clone(),
+                    mode,
+                });
+            }
             if skip.gitlinks.contains(&rel) {
                 it.skip_current_dir();
             } else {
@@ -172,7 +194,13 @@ pub(crate) fn record_tree(root: &Path, skip: &Skip) -> Result<(Vec<SavedMode>, V
         }
     }
     dirs.retain(|d| !parents.contains(d));
-    Ok((modes, dirs))
+    let root_mode = file_mode(&fs::symlink_metadata(root)?);
+    Ok(TreeRecord {
+        modes,
+        dirs,
+        dir_modes,
+        root_mode,
+    })
 }
 
 #[cfg(unix)]
@@ -189,7 +217,9 @@ pub(crate) fn file_mode(_meta: &fs::Metadata) -> Option<u32> {
 /// Writes the manifest's part of a restore into `root`, after git checked
 /// out the wip tree: the saved files from `files_dir` (one already present,
 /// from an interrupted open, is left for the caller's check), the empty
-/// dirs, then each recorded file mode.
+/// dirs, then each recorded file mode, then the dir modes from the deepest
+/// up (a dir without write or search permission set first would block what
+/// goes under it).
 pub(crate) fn apply_manifest(root: &Path, manifest: &Manifest, files_dir: &Path) -> Result<()> {
     for f in &manifest.files {
         let to = root.join(&f.rel);
@@ -220,7 +250,50 @@ pub(crate) fn apply_manifest(root: &Path, manifest: &Manifest, files_dir: &Path)
                 .with_context(|| format!("setting the mode of {}", path.display()))?;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dir_modes: Vec<&SavedMode> = manifest.dir_modes.iter().collect();
+        dir_modes.sort_by(|a, b| b.rel.cmp(&a.rel));
+        let root_mode = manifest.root_mode.map(|mode| (Path::new(""), mode));
+        for (rel, mode) in dir_modes
+            .iter()
+            .map(|m| (m.rel.as_path(), m.mode))
+            .chain(root_mode)
+        {
+            let path = root.join(rel);
+            if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("setting the mode of {}", path.display()))?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Gives the owner full access to every dir under `root` (and `root`), so a
+/// check dir that copied a read-only dir mode can be removed.
+fn loosen(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut todo = vec![root.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            let Ok(meta) = fs::symlink_metadata(&dir) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let mode = meta.permissions().mode() | 0o700;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(mode));
+            if let Ok(rd) = fs::read_dir(&dir) {
+                todo.extend(rd.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
 }
 
 /// Creates `rel` under `root` one component at a time, refusing to pass
@@ -396,16 +469,45 @@ pub(crate) fn restore_check(
         .with_context(|| format!("creating a check dir in {}", parent.display()))?;
     let work = tmp.path().join("tree");
     fs::create_dir(&work).with_context(|| format!("creating {}", work.display()))?;
+    let verdict = check_in(tree, wip, dest, &manifest, &git_dir, tmp.path(), &work, skip);
+    loosen(&work);
+    verdict
+}
+
+/// [`restore_check`]'s restore into `work` (with its index in `tmp`) and
+/// compare.
+#[allow(clippy::too_many_arguments)]
+fn check_in(
+    tree: &Path,
+    wip: &str,
+    dest: &Path,
+    manifest: &Manifest,
+    git_dir: &Path,
+    tmp: &Path,
+    work: &Path,
+    skip: Skip,
+) -> Result<Verdict> {
     // A private index: the tree's own git dir is shared with the real one.
-    Git::at(&work)
+    Git::at(work)
         .env("GIT_DIR", git_dir.as_os_str())
         .env("GIT_WORK_TREE", work.as_os_str())
-        .env("GIT_INDEX_FILE", tmp.path().join("index").as_os_str())
+        .env("GIT_INDEX_FILE", tmp.join("index").as_os_str())
         .run(&["read-tree", "-u", "--reset", wip])?;
-    apply_manifest(&work, &manifest, &dest.join(FILES))?;
-    let root = stamp(&fs::symlink_metadata(tree)?);
+    apply_manifest(work, manifest, &dest.join(FILES))?;
+    let root_meta = fs::symlink_metadata(tree)?;
+    let root = stamp(&root_meta);
     let seen = entries(tree, &skip)?;
-    if let Some(reason) = compare(tree, &work, &skip, &seen)? {
+    if let (Some(x), Some(y)) = (
+        file_mode(&root_meta),
+        file_mode(&fs::symlink_metadata(work)?),
+    ) {
+        if x != y {
+            return Ok(Verdict::Differs(format!(
+                "the tree's root would be restored with mode {y:o}, not {x:o}"
+            )));
+        }
+    }
+    if let Some(reason) = compare(tree, work, &skip, &seen)? {
         return Ok(Verdict::Differs(reason));
     }
     Ok(Verdict::Same(Snapshot {
@@ -499,6 +601,17 @@ fn compare(
                     )));
                 }
             }
+            Kind::Dir => {
+                let (ma, mb) = (fs::symlink_metadata(&a)?, fs::symlink_metadata(&b)?);
+                if let (Some(x), Some(y)) = (file_mode(&ma), file_mode(&mb)) {
+                    if x != y {
+                        return Ok(Some(format!(
+                            "{} would be restored with mode {y:o}, not {x:o}",
+                            rel.display()
+                        )));
+                    }
+                }
+            }
             Kind::File => {
                 let (ma, mb) = (fs::symlink_metadata(&a)?, fs::symlink_metadata(&b)?);
                 if let (Some(x), Some(y)) = (file_mode(&ma), file_mode(&mb)) {
@@ -516,7 +629,7 @@ fn compare(
                     )));
                 }
             }
-            Kind::Dir | Kind::Other => {}
+            Kind::Other => {}
         }
     }
     Ok(None)

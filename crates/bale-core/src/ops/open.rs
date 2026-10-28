@@ -167,7 +167,13 @@ fn check_preconditions(home: &BaleHome, record: &Record) -> Result<Saved> {
 
     let dest = home.saved_dir(id);
     let manifest = read_manifest(&dest).context("reading the manifest")?;
-    for rel in manifest.modes.iter().map(|m| &m.rel).chain(&manifest.dirs) {
+    for rel in manifest
+        .modes
+        .iter()
+        .chain(&manifest.dir_modes)
+        .map(|m| &m.rel)
+        .chain(&manifest.dirs)
+    {
         if !is_plain_relative(rel) {
             bail!("manifest entry {} is not a relative path", rel.display());
         }
@@ -396,6 +402,25 @@ fn verify_restore(record: &Record, saved: &Saved) -> Result<()> {
                 m.rel.display(),
                 file_mode(&meta).unwrap_or(0),
                 m.mode
+            );
+        }
+    }
+    let root_mode = saved.manifest.root_mode.map(|mode| (Path::new(""), mode));
+    for (rel, mode) in saved
+        .manifest
+        .dir_modes
+        .iter()
+        .map(|m| (m.rel.as_path(), m.mode))
+        .chain(root_mode)
+    {
+        let meta = fs::symlink_metadata(record.path.join(rel))
+            .with_context(|| format!("restored dir {} is missing", rel.display()))?;
+        if file_mode(&meta).is_some_and(|m| m != mode) {
+            bail!(
+                "restored dir {} has mode {:o}, not {:o}",
+                rel.display(),
+                file_mode(&meta).unwrap_or(0),
+                mode
             );
         }
     }

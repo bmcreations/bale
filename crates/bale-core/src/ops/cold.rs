@@ -878,13 +878,15 @@ pub fn save_ignored(dir: &Path, dest: &Path, ex: &Exclusions) -> Result<Vec<Save
             .collect(),
         tracked: disk::with_ancestors(listed.split('\0')),
     };
-    let (modes, dirs) = record_tree(dir, &skip)?;
+    let tree = record_tree(dir, &skip)?;
     write_manifest(
         dest,
         &Manifest {
             files: saved.clone(),
-            modes,
-            dirs,
+            modes: tree.modes,
+            dirs: tree.dirs,
+            dir_modes: tree.dir_modes,
+            root_mode: tree.root_mode,
         },
     )?;
     Ok(saved)

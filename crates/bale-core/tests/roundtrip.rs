@@ -332,3 +332,21 @@ fn tracked_file_in_node_modules_under_lossy_filter_is_refused() {
         "a   \n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn private_dir_keeps_its_mode() {
+    let fx = Fixture::new();
+    let (wt, id) = worktree(
+        &fx,
+        |_| {},
+        |wt| {
+            fs::create_dir_all(wt.join("priv")).unwrap();
+            fs::write(wt.join("priv/s.txt"), "s\n").unwrap();
+            chmod(&wt.join("priv"), 0o700);
+        },
+    );
+    round_trip(&fx, &wt, &id);
+    assert_eq!(fs::read_to_string(wt.join("priv/s.txt")).unwrap(), "s\n");
+    assert_eq!(mode(&wt.join("priv")), 0o700);
+}
