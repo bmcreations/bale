@@ -164,7 +164,10 @@ fn up_keeps_trash_it_did_not_make() {
     let out = up(&fx.home(), &rec.id).unwrap();
     assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
     assert!(!wt.join("app/build").exists());
-    assert_eq!(fs::read_to_string(wt.join(".bale-trash-notes")).unwrap(), "mine");
+    assert_eq!(
+        fs::read_to_string(wt.join(".bale-trash-notes")).unwrap(),
+        "mine"
+    );
     assert_eq!(fs::read_to_string(other.join("work.txt")).unwrap(), "work");
 }
 
