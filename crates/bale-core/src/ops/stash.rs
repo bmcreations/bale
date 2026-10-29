@@ -139,6 +139,7 @@ fn stash_inner(
         registry: &registry,
         record,
         root,
+        roots: Vec::new(),
         dirs,
         ignore_pids,
         start,
@@ -166,6 +167,9 @@ struct Run<'a> {
     registry: &'a Registry,
     record: Record,
     root: PathBuf,
+    /// Index 0 is `root`; the rest are the DerivedData folders outside it
+    /// that `dirs` lie in. Set by `fresh`.
+    roots: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
     ignore_pids: &'a [u32],
     start: Instant,
@@ -176,12 +180,34 @@ struct Run<'a> {
 
 /// A file picked for stashing, with the stat it was hashed at.
 struct Candidate {
-    rel: PathBuf,
+    item: Item,
     hash: Hash,
     size: u64,
     mtime_ns: i128,
     ino: u64,
     mode: u32,
+}
+
+/// A file under one of the manifest's roots.
+#[derive(Clone)]
+struct Item {
+    /// Index into the roots.
+    root: u16,
+    /// Relative to that root.
+    rel: PathBuf,
+    full: PathBuf,
+}
+
+impl Item {
+    /// The key in the tree's index: `rel` for the tree itself (as before
+    /// roots existed), the absolute path for a file outside it.
+    fn key(&self) -> &Path {
+        if self.root == 0 {
+            &self.rel
+        } else {
+            &self.full
+        }
+    }
 }
 
 impl Candidate {
@@ -209,17 +235,28 @@ impl Run<'_> {
         opts: &StashOpts,
     ) -> Result<StashOutcome> {
         // A dir inside a nested repo or submodule is out: the root's git
-        // can't say which of its files are tracked.
-        self.dirs.retain(|d| {
-            d.strip_prefix(&self.root)
-                .is_ok_and(|rel| !super::up::in_nested_repo(&self.root, rel))
+        // can't say which of its files are tracked. Dirs outside the tree
+        // (shared DerivedData) have no repo to judge them.
+        self.dirs.retain(|d| match d.strip_prefix(&self.root) {
+            Ok(rel) => !super::up::in_nested_repo(&self.root, rel),
+            Err(_) => d.parent().is_some_and(|p| p.to_str().is_some()),
         });
+        // Each dir outside the tree is a DerivedData folder's `Build/`; the
+        // folder is the root its files are relative to.
+        self.roots = vec![self.root.clone()];
+        for d in &self.dirs {
+            if let Some(p) = d.parent().filter(|_| !d.starts_with(&self.root)) {
+                if !self.roots.iter().any(|r| r == p) {
+                    self.roots.push(p.to_path_buf());
+                }
+            }
+        }
         let seen_by_git = git_visible(&self.root, &self.dirs)?;
-        let mut rels = candidates(&self.root, &self.dirs, cfg.stash_min_bytes);
-        let before = rels.len();
-        rels.retain(|r| !seen_by_git.contains(r));
-        let git_visible = before - rels.len();
-        if rels.is_empty() {
+        let mut items = candidates(&self.roots, &self.dirs, cfg.stash_min_bytes);
+        let before = items.len();
+        items.retain(|i| i.root != 0 || !seen_by_git.contains(&i.rel));
+        let git_visible = before - items.len();
+        if items.is_empty() {
             return Ok(StashOutcome::Skipped("nothing to stash".into()));
         }
 
@@ -228,16 +265,21 @@ impl Run<'_> {
         let bases: HashMap<PathBuf, Hash> = prev
             .as_ref()
             .and_then(|s| self.store.read_manifest(&s.commitment).ok())
-            .map(|m| m.entries.into_iter().map(|e| (e.rel, e.hash)).collect())
+            .map(|m| {
+                m.entries
+                    .iter()
+                    .map(|e| (m.path_of(e, &self.root), e.hash.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let index = Mutex::new(Index::load(self.store, id)?);
         let lock = self.lock;
-        let mut found: Vec<Candidate> = par_map(&rels, |rel| {
+        let mut found: Vec<Candidate> = par_map(&items, |item| {
             if lock.requested() {
                 return Ok(None);
             }
-            hash_one(&self.root, rel, &index)
+            hash_one(item, &index)
         })
         .into_iter()
         .collect::<Result<Vec<_>>>()?
@@ -245,7 +287,7 @@ impl Run<'_> {
         .flatten()
         .collect();
         let mut index = index.into_inner().unwrap_or_else(|e| e.into_inner());
-        let keep: BTreeSet<PathBuf> = rels.iter().cloned().collect();
+        let keep: BTreeSet<PathBuf> = items.iter().map(|i| i.key().to_path_buf()).collect();
         index.forget_missing(&keep);
         index.save(self.store, id)?;
         if lock.requested() {
@@ -257,7 +299,7 @@ impl Run<'_> {
         let mut seen = BTreeSet::new();
         for c in &found {
             if seen.insert(c.hash.clone()) {
-                sources.push((c.hash.clone(), c.rel.clone()));
+                sources.push((c.hash.clone(), c.item.full.clone()));
             }
         }
         let present: BTreeSet<Hash> = sources
@@ -266,31 +308,30 @@ impl Run<'_> {
             .map(|(h, _)| h.clone())
             .collect();
         let stats: HashMap<&PathBuf, (u64, i128, u64)> =
-            found.iter().map(|c| (&c.rel, c.stat())).collect();
+            found.iter().map(|c| (&c.item.full, c.stat())).collect();
         let budget = ByteBudget::new(BASE_BUDGET);
-        let puts = par_map(&sources, |(hash, rel)| -> Result<Option<u64>> {
+        let puts = par_map(&sources, |(hash, full)| -> Result<Option<u64>> {
             if present.contains(hash) {
                 return Ok(Some(0));
             }
             if lock.requested() {
                 return Ok(None);
             }
-            let base = bases.get(rel).filter(|b| *b != hash);
+            let base = bases.get(full).filter(|b| *b != hash);
             let hold = base
                 .filter(|b| self.store.has(b))
                 .and_then(|b| self.store.meta(b).ok())
                 .map_or(0, |m| 2 * m.size);
-            let full = self.root.join(rel);
             let put = {
                 let _held = budget.acquire(hold);
-                self.store.put(&full, hash, base, cfg.patch_max_depth)
+                self.store.put(full, hash, base, cfg.patch_max_depth)
             };
             // A file that changed since it was hashed is left out: `put`
             // refuses content that no longer matches the hash, and a change
             // after `put` read it shows up in the stat. The blob, if any,
             // stays: another tree's stash may have just reused it.
-            let now = fs::symlink_metadata(&full).map(|m| stat_of(&m)).ok();
-            if now != Some(stats[rel]) {
+            let now = fs::symlink_metadata(full).map(|m| stat_of(&m)).ok();
+            if now != Some(stats[full]) {
                 return Ok(None);
             }
             Ok(Some(put?.stored))
@@ -321,10 +362,12 @@ impl Run<'_> {
         let manifest = StashManifest {
             tree_id: id.to_string(),
             created_unix: now_unix(),
+            roots: self.roots.clone(),
             entries: found
                 .into_iter()
                 .map(|c| Entry {
-                    rel: c.rel,
+                    rel: c.item.rel,
+                    root: c.item.root,
                     hash: c.hash,
                     size: c.size,
                     mode: c.mode,
@@ -409,8 +452,14 @@ impl Run<'_> {
             bytes: 0,
             changed: Vec::new(),
         };
+        let owned = owned_roots(&manifest, &self.root);
         for (i, e) in manifest.entries.iter().enumerate() {
-            match stub(&self.root.join(&e.rel), e) {
+            // A folder that is no longer this tree's is never written to.
+            if !owned[usize::from(e.root)] {
+                done.changed.push(i);
+                continue;
+            }
+            match stub(&manifest.path_of(e, &self.root), e) {
                 Stub::Truncated => {
                     done.files += 1;
                     done.bytes += e.size;
@@ -480,12 +529,41 @@ fn git_visible(root: &Path, dirs: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
     Ok(out)
 }
 
+/// Which of the manifest's roots (by index, at least one) may be written
+/// to: the tree root always, any other only while it is still a DerivedData
+/// folder built from the tree at `tree_root`. A manifest that names a root
+/// that is not absolute never gets one.
+pub(super) fn owned_roots(m: &StashManifest, tree_root: &Path) -> Vec<bool> {
+    let mut owned: Vec<bool> = m
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            i == 0 || (r.is_absolute() && crate::derived_data::belongs_to_tree(r, tree_root))
+        })
+        .collect();
+    if owned.is_empty() {
+        owned.push(true);
+    }
+    owned
+}
+
 /// Regular files with a single link, at least `min` bytes, under `dirs`,
-/// as paths relative to `root`. Paths that are not valid UTF-8 are left out:
-/// the manifest can't store them.
-fn candidates(root: &Path, dirs: &[PathBuf], min: u64) -> Vec<PathBuf> {
+/// each under the root in `roots` that holds its dir (an in-tree dir is
+/// under root 0, any other under its parent). Paths that are not valid UTF-8
+/// are left out: the manifest can't store them.
+fn candidates(roots: &[PathBuf], dirs: &[PathBuf], min: u64) -> Vec<Item> {
     let mut out = Vec::new();
     for dir in dirs {
+        let idx = if dir.starts_with(&roots[0]) {
+            Some(0)
+        } else {
+            dir.parent().and_then(|p| roots.iter().position(|r| r == p))
+        };
+        let Some(idx) = idx.and_then(|i| u16::try_from(i).ok()) else {
+            continue;
+        };
+        let base = &roots[usize::from(idx)];
         let walk = WalkDir::new(dir)
             .follow_links(false)
             .into_iter()
@@ -504,24 +582,29 @@ fn candidates(root: &Path, dirs: &[PathBuf], min: u64) -> Vec<PathBuf> {
             if meta.len() < min || nlink(&meta) != 1 {
                 continue;
             }
-            let Ok(rel) = entry.path().strip_prefix(root) else {
+            let Ok(rel) = entry.path().strip_prefix(base) else {
                 continue;
             };
             if rel.to_str().is_some() {
-                out.push(rel.to_path_buf());
+                out.push(Item {
+                    root: idx,
+                    rel: rel.to_path_buf(),
+                    full: entry.path().to_path_buf(),
+                });
             }
         }
     }
-    out.sort();
+    out.sort_by(|a, b| (a.root, &a.rel).cmp(&(b.root, &b.rel)));
     out
 }
 
-/// Hashes `root/rel` through the shared index, hashing outside the lock. A
+/// Hashes `item` through the shared index, hashing outside the lock. A
 /// file that is gone, unreadable, no longer a single-link regular file, or
 /// changed while it was read is left out.
-fn hash_one(root: &Path, rel: &Path, index: &Mutex<Index>) -> Result<Option<Candidate>> {
-    let full = root.join(rel);
-    let Ok(before) = fs::symlink_metadata(&full) else {
+fn hash_one(item: &Item, index: &Mutex<Index>) -> Result<Option<Candidate>> {
+    let full = &item.full;
+    let key = item.key();
+    let Ok(before) = fs::symlink_metadata(full) else {
         return Ok(None);
     };
     if !before.file_type().is_file() || nlink(&before) != 1 {
@@ -530,21 +613,21 @@ fn hash_one(root: &Path, rel: &Path, index: &Mutex<Index>) -> Result<Option<Cand
     let (size, mtime_ns, ino) = stat_of(&before);
     let lock = || index.lock().unwrap_or_else(|e| e.into_inner());
     let cached = lock()
-        .get(rel)
+        .get(key)
         .filter(|e| e.size == size && e.mtime_ns == mtime_ns && e.ino == ino)
         .map(|e| e.hash.clone());
     let hash = match cached {
         Some(h) => h,
         None => {
-            let Ok(h) = sha256_file(&full) else {
+            let Ok(h) = sha256_file(full) else {
                 return Ok(None);
             };
-            match fs::symlink_metadata(&full) {
+            match fs::symlink_metadata(full) {
                 Ok(after) if stat_of(&after) == (size, mtime_ns, ino) => {}
                 _ => return Ok(None),
             }
             lock().insert(
-                rel.to_path_buf(),
+                key.to_path_buf(),
                 IndexEntry {
                     size,
                     mtime_ns,
@@ -556,7 +639,7 @@ fn hash_one(root: &Path, rel: &Path, index: &Mutex<Index>) -> Result<Option<Cand
         }
     };
     Ok(Some(Candidate {
-        rel: rel.to_path_buf(),
+        item: item.clone(),
         hash,
         size,
         mtime_ns,

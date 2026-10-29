@@ -1,7 +1,7 @@
 //! Build-system detection and the regenerable directories each one produces.
 
 use crate::config::Config;
-use crate::derived_data::is_derived_data_root;
+use crate::derived_data::{global_for, is_derived_data_root};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -113,7 +113,9 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
 /// root (not `SourcePackages/` or the module caches, which hold inputs); for
 /// Gradle each `build/` dir (not `.gradle/`, `.kotlin/` or `.cxx/`).
 /// `regenerable_extra` dirs are left out: bale can't tell what they hold.
-/// Symlinked dirs are left out too.
+/// Symlinked dirs are left out too. On macOS the `Build/` of each DerivedData
+/// folder in Xcode's shared DerivedData built from this tree comes last, as a
+/// canonical path outside `root`.
 pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
     let gradle = systems.contains(&BuildSystem::Gradle);
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
@@ -129,6 +131,21 @@ pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<Pat
             }
         } else if gradle && dir.file_name().is_some_and(|n| n == "build") {
             out.push(dir);
+        }
+    }
+    if cfg!(target_os = "macos") {
+        for dd in global_for(root) {
+            let build = dd.join("Build");
+            if !real_dir(&dd) || !real_dir(&build) {
+                continue;
+            }
+            // Canonical, so a symlinked HOME doesn't hide the folder from
+            // the later ownership check.
+            if let Ok(build) = crate::paths::canonicalize(&build) {
+                if !out.contains(&build) {
+                    out.push(build);
+                }
+            }
         }
     }
     out

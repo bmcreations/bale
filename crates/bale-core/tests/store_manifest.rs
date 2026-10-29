@@ -11,6 +11,7 @@ use bale_core::BaleHome;
 fn entry(rel: &str, n: u8) -> Entry {
     Entry {
         rel: PathBuf::from(rel),
+        root: 0,
         hash: format!("{n:02x}").repeat(32),
         size: 2_000_000 + u64::from(n),
         mode: 0o100644,
@@ -23,6 +24,7 @@ fn manifest() -> StashManifest {
     StashManifest {
         tree_id: "tree1".into(),
         created_unix: 1_700_000_000,
+        roots: vec![],
         entries: vec![entry("a/x.o", 1), entry("b/y.o", 2), entry("c/z.o", 3)],
     }
 }

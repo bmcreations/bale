@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use filetime::{set_file_mtime, FileTime};
 
-use super::stash::{mode_of, owner_writable, set_mode};
+use super::stash::{mode_of, owned_roots, owner_writable, set_mode};
 use crate::lock::WorkspaceLock;
 use crate::par::{par_map, ByteBudget};
 use crate::registry::{Level, Record, Registry};
@@ -133,6 +133,17 @@ pub fn unstash_with(
     let store = Store::open(home)?;
     let mut manifest = store.read_manifest(&state.commitment)?;
 
+    // A folder outside the tree is written to only while it is still a
+    // DerivedData folder built from this tree; the rest of its entries are
+    // lost (the build regenerates them).
+    let owned = owned_roots(&manifest, &root);
+    // The roots alone, to resolve paths while `manifest.entries` changes.
+    let layout = StashManifest {
+        tree_id: String::new(),
+        created_unix: 0,
+        roots: manifest.roots.clone(),
+        entries: Vec::new(),
+    };
     let mut pruned = 0;
     if !was_restoring {
         // Once `restoring` is set, a non-empty file at an entry's inode reads
@@ -143,7 +154,9 @@ pub fn unstash_with(
         // truncating); that one is not counted as newer.
         manifest
             .entries
-            .retain(|e| match look(&root.join(&e.rel), e) {
+            .retain(|e| match look(&layout.path_of(e, &root), e) {
+                // Left for `restore` to report if its folder moved.
+                _ if !owned[usize::from(e.root)] => true,
                 Look::Stub | Look::Missing => true,
                 Look::NeverStubbed => false,
                 Look::Rewritten => {
@@ -168,12 +181,14 @@ pub fn unstash_with(
         let job = Job {
             store: &store,
             root: &root,
+            layout: &layout,
+            owned: &owned,
             budget: &budget,
             was_restoring,
             fail,
         };
         job.restore(e)
-            .with_context(|| format!("restoring {}", root.join(&e.rel).display()))
+            .with_context(|| format!("restoring {}", layout.path_of(e, &root).display()))
     });
 
     let mut report = UnstashReport {
@@ -206,7 +221,15 @@ pub fn unstash_with(
     // and leaves the manifest.
     let lost_paths: Vec<String> = lost
         .iter()
-        .map(|(i, err)| format!("{}: {err:#}", manifest.entries[*i].rel.display()))
+        .map(|(i, err)| {
+            let e = &manifest.entries[*i];
+            let shown = if e.root == 0 {
+                e.rel.clone()
+            } else {
+                layout.path_of(e, &root)
+            };
+            format!("{}: {err:#}", shown.display())
+        })
         .collect();
     if !lost.is_empty() {
         let gone: BTreeSet<usize> = lost.iter().map(|(i, _)| *i).collect();
@@ -339,6 +362,10 @@ struct StreamError {
 struct Job<'a> {
     store: &'a Store,
     root: &'a Path,
+    /// The manifest's roots, to find each entry's own.
+    layout: &'a StashManifest,
+    /// Which of those roots may be written to; see [`owned_roots`].
+    owned: &'a [bool],
     budget: &'a ByteBudget,
     /// An earlier run stopped mid-restore: a non-empty file at the entry's
     /// inode may be half written.
@@ -349,7 +376,13 @@ struct Job<'a> {
 
 impl Job<'_> {
     fn restore(&self, e: &Entry) -> Result<Outcome> {
-        let path = self.root.join(&e.rel);
+        let path = self.layout.path_of(e, self.root);
+        if !self.owned[usize::from(e.root)] {
+            return Ok(Outcome::Lost(anyhow::anyhow!(
+                "{} is no longer a DerivedData folder built from this tree",
+                self.layout.root_of(e, self.root).display()
+            )));
+        }
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return self.recreate(&path, e),
@@ -455,7 +488,8 @@ impl Job<'_> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         // A dir swapped for a symlink must not lead the write out of the tree.
         let real = crate::paths::canonicalize(parent)?;
-        if !real.starts_with(self.root) {
+        let own_root = self.layout.root_of(e, self.root);
+        if !real.starts_with(own_root) {
             bail!("{} resolves outside the tree", parent.display());
         }
         let tmp = tempfile::Builder::new()

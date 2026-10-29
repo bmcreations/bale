@@ -26,6 +26,18 @@ pub(crate) struct DdDir {
 }
 
 impl DdDir {
+    fn read(dir: PathBuf) -> DdDir {
+        let workspace = workspace_path(&dir.join("info.plist"));
+        let canonical = workspace
+            .as_ref()
+            .and_then(|wp| crate::paths::canonicalize(wp).ok());
+        DdDir {
+            dir,
+            workspace,
+            canonical,
+        }
+    }
+
     /// True when the project this folder was built from lies inside the
     /// tree whose [`workspace_key`] is `ws`.
     pub(crate) fn built_from(&self, ws: &Path) -> bool {
@@ -50,17 +62,7 @@ pub(crate) fn index(dd_root: &Path) -> Vec<DdDir> {
     let mut out: Vec<DdDir> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| {
-            let workspace = workspace_path(&e.path().join("info.plist"));
-            let canonical = workspace
-                .as_ref()
-                .and_then(|wp| crate::paths::canonicalize(wp).ok());
-            DdDir {
-                dir: e.path(),
-                workspace,
-                canonical,
-            }
-        })
+        .map(|e| DdDir::read(e.path()))
         .collect();
     out.sort_by(|a, b| a.dir.cmp(&b.dir));
     out
@@ -87,6 +89,15 @@ pub(crate) fn is_derived_data_root(dir: &Path) -> bool {
     fs::symlink_metadata(&plist).is_ok_and(|m| m.file_type().is_file())
         && fs::symlink_metadata(dir.join("Build")).is_ok_and(|m| m.file_type().is_dir())
         && workspace_path(&plist).is_some()
+}
+
+/// True when `dir` is a regular directory (not a symlink) whose `info.plist`
+/// `WorkspacePath` lies inside the tree at `root`. Unlike
+/// [`is_derived_data_root`] it does not need `Build` to exist.
+pub(crate) fn belongs_to_tree(dir: &Path, root: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        && fs::symlink_metadata(dir.join("info.plist")).is_ok_and(|m| m.file_type().is_file())
+        && DdDir::read(dir.to_path_buf()).built_from(&workspace_key(root))
 }
 
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.

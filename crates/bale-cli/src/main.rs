@@ -107,7 +107,8 @@ enum Command {
         #[command(subcommand)]
         kind: HookKind,
     },
-    /// Install the 30-minute sweep schedule, or with --hooks only those tools' hooks.
+    /// Install the sweep schedule (every 5 minutes on macOS, 30 elsewhere), or with --hooks
+    /// only those tools' hooks.
     Install {
         /// Comma-separated tools to hook: claude, git, conductor, cursor, codex, t3.
         #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]

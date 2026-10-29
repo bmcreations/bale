@@ -74,11 +74,13 @@ fn manifest(tree: &str, hashes: &[&Hash]) -> StashManifest {
     StashManifest {
         tree_id: tree.into(),
         created_unix: 0,
+        roots: vec![],
         entries: hashes
             .iter()
             .enumerate()
             .map(|(i, h)| Entry {
                 rel: PathBuf::from(format!("f{i}")),
+                root: 0,
                 hash: (*h).clone(),
                 size: 1,
                 mode: 0o644,

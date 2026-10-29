@@ -5,7 +5,7 @@
 //! edited or swapped from the one the stash wrote.
 
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,8 +17,11 @@ use super::hex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Path relative to the tree root.
+    /// Path relative to the entry's root (see [`StashManifest::roots`]).
     pub rel: PathBuf,
+    /// Index into [`StashManifest::roots`]; 0 is the tree root.
+    #[serde(default)]
+    pub root: u16,
     pub hash: Hash,
     pub size: u64,
     /// Full `st_mode` bits.
@@ -34,24 +37,60 @@ pub struct Entry {
 pub struct StashManifest {
     pub tree_id: String,
     pub created_unix: i64,
+    /// Absolute, canonical dirs the entries' `rel` paths are relative to.
+    /// Index 0 is the tree root; the others are Xcode DerivedData folders
+    /// outside the tree. Empty (a manifest from before roots existed) means
+    /// just the tree root.
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
     pub entries: Vec<Entry>,
 }
 
 impl StashManifest {
-    /// SHA-256 over the entries sorted by `rel`, each as
-    /// `rel\0hash\0size\0mode\0mtime_ns\n`.
+    /// The dir `e.rel` is relative to: the tree root for root 0 (or when
+    /// `roots` is empty), else the manifest's own root.
+    pub fn root_of<'a>(&'a self, e: &Entry, tree_root: &'a Path) -> &'a Path {
+        match e.root {
+            0 => tree_root,
+            n => self.roots.get(usize::from(n)).map_or(tree_root, |r| r),
+        }
+    }
+
+    /// Where the entry's file lives: `rel` under its own root.
+    pub fn path_of(&self, e: &Entry, tree_root: &Path) -> PathBuf {
+        self.root_of(e, tree_root).join(&e.rel)
+    }
+
+    /// SHA-256 over the roots (`root\n` each, in order), then the entries
+    /// sorted by `(root, rel)`, each as
+    /// `rel\0root\0hash\0size\0mode\0mtime_ns\n`. Covering the roots means a
+    /// swapped root path changes the commitment.
     pub fn commitment(&self) -> Hash {
         let mut entries: Vec<&Entry> = self.entries.iter().collect();
-        entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+        entries.sort_by(|a, b| (a.root, &a.rel).cmp(&(b.root, &b.rel)));
         let mut hasher = Sha256::new();
+        hasher.update(b"roots\n");
+        for r in &self.roots {
+            hasher.update(r.to_string_lossy().as_bytes());
+            hasher.update(b"\n");
+        }
         for e in entries {
             hasher.update(e.rel.to_string_lossy().as_bytes());
             hasher.update(format!(
-                "\0{}\0{}\0{}\0{}\n",
-                e.hash, e.size, e.mode, e.mtime_ns
+                "\0{}\0{}\0{}\0{}\0{}\n",
+                e.root, e.hash, e.size, e.mode, e.mtime_ns
             ));
         }
         hex(&hasher.finalize())
+    }
+
+    /// Errors if an entry names a root the manifest doesn't list.
+    fn check_roots(&self) -> Result<()> {
+        let n = self.roots.len().max(1);
+        if let Some(e) = self.entries.iter().find(|e| usize::from(e.root) >= n) {
+            bail!("entry {} names root {} of {n}", e.rel.display(), e.root);
+        }
+        Ok(())
     }
 }
 
@@ -88,6 +127,8 @@ impl Store {
         if m.commitment() != *c {
             bail!("manifest {c} is corrupt: commitment mismatch");
         }
+        m.check_roots()
+            .with_context(|| format!("manifest {c} is corrupt"))?;
         Ok(m)
     }
 
