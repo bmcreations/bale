@@ -405,3 +405,39 @@ fn sweep_removes_the_premade_folder_of_a_tree_that_is_gone() {
         .unwrap();
     assert!(rec.spm.is_empty());
 }
+
+#[test]
+fn up_without_a_premade_folder_leaves_no_note() {
+    let e = env();
+    let h = e.fx.home();
+    let wt = e.fx.add_worktree("wt", "f");
+    project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    up(&h, &id).unwrap();
+    let rec = bale_core::registry::Registry::open(h)
+        .get(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.note, None);
+}
+
+#[test]
+fn gc_removes_the_premade_folder_of_a_vanished_tree() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    let folder = dd_of(&e, &proj);
+    assert!(folder.exists());
+    support::git(
+        &e.fx.repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+
+    let report = bale_core::ops::gc::gc(&h, false).unwrap();
+    assert_eq!(report.removed, vec![id]);
+    assert!(fs::symlink_metadata(&folder).is_err());
+    assert!(shared(&h).join("marker").is_file());
+}

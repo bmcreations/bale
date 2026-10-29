@@ -242,6 +242,7 @@ fn adopt_missed(
 fn drop_stubs_of_missing_trees(home: &BaleHome, records: &[(String, Result<Record>)]) {
     let registry = Registry::open(home.clone());
     for record in records.iter().filter_map(|(_, r)| r.as_ref().ok()) {
+        let path = record.path.clone();
         let gone = fs::symlink_metadata(&record.path)
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         if !gone || record.spm.is_empty() {
@@ -250,7 +251,13 @@ fn drop_stubs_of_missing_trees(home: &BaleHome, records: &[(String, Result<Recor
         let Ok(Some(_lock)) = crate::lock::WorkspaceLock::try_acquire(home, &record.id) else {
             continue;
         };
-        let mut record = record.clone();
+        // The snapshot may be stale by now; act on what is recorded under the lock.
+        let Ok(Some(mut record)) = registry.get(&record.id) else {
+            continue;
+        };
+        if record.path != path || record.spm.is_empty() {
+            continue;
+        }
         if crate::spm_link::drop_stubs(&mut record) {
             let _ = registry.put(&record);
         }

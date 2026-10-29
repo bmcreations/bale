@@ -617,25 +617,30 @@ pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
 /// `remove_dir`, so a file Xcode adds in between makes the removal fail
 /// instead of deleting it, and the shared folder is never followed.
 pub(crate) fn remove_stub(dir: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Ok(false),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    }
-    let mut entries = fs::read_dir(dir)?;
-    let Some(only) = entries.next().transpose()? else {
-        return Ok(false);
-    };
-    if entries.next().is_some()
-        || only.file_name() != "SourcePackages"
-        || !fs::symlink_metadata(only.path())?.file_type().is_symlink()
-    {
+    if !is_stub(dir) {
         return Ok(false);
     }
-    fs::remove_file(only.path())?;
+    let link = dir.join("SourcePackages");
+    fs::remove_file(link)?;
     fs::remove_dir(dir)?;
     Ok(true)
+}
+
+/// Whether `dir` has the shape of a folder bale pre-made; see [`remove_stub`].
+/// A missing or unreadable `dir` is not one.
+pub(crate) fn is_stub(dir: &Path) -> bool {
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return false;
+    }
+    let Ok(mut entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let Some(Ok(only)) = entries.next() else {
+        return false;
+    };
+    entries.next().is_none()
+        && only.file_name() == "SourcePackages"
+        && fs::symlink_metadata(only.path()).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Removes DerivedData folders under `dd_root` built from this worktree and
@@ -666,6 +671,10 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
     // made while it was on still need cleaning up.
     for r in crate::spm::resolved_files(root) {
         let dir = dd_root.join(crate::derived_data::folder_name(&r.project));
+        // Most projects have no pre-made folder; don't probe those.
+        if !is_stub(&dir) {
+            continue;
+        }
         match busy_holders(&dir, ignore) {
             Ok(h) if !h.is_empty() => continue,
             Ok(_) => {}
