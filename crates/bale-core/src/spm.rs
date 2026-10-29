@@ -209,7 +209,9 @@ struct CheckoutState {
 /// is never finished. A missing file, bad JSON or a missing field is not
 /// finished. With zero pins the folder is finished once `workspace-state.json`
 /// parses. Assumes SPM records a pin only after its checkout completes; that is
-/// untested for an interrupted checkout.
+/// untested for an interrupted checkout. A pin without `state.revision` (a
+/// registry pin) makes the file fail to parse, so such a folder is never
+/// finished: a safe fallback, the tree just stays unshared.
 pub(crate) fn finished(dir: &Path, resolved: &Path) -> bool {
     finished_inner(dir, resolved).unwrap_or(false)
 }
@@ -259,7 +261,28 @@ pub(crate) fn seed(home: &crate::BaleHome, key: &str, from: &Path) -> io::Result
             ),
         ));
     }
+    if key.is_empty() || key == "." || key == ".." || key.contains(['/', '\\']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid key {key:?}"),
+        ));
+    }
     seed_checked(home, key, from)
+}
+
+/// The existing `dest` if it is a real directory, `None` if absent; anything
+/// else (symlink, dangling symlink, file) is an error.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn existing_dest(dest: &Path) -> io::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_dir() => Ok(Some(dest.to_path_buf())),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a directory", dest.display()),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -284,8 +307,8 @@ fn seed_checked(home: &crate::BaleHome, key: &str, from: &Path) -> io::Result<Pa
 
     let spm = home.spm_dir();
     let dest = spm.join(key);
-    if dest.exists() {
-        return Ok(dest);
+    if let Some(d) = existing_dest(&dest)? {
+        return Ok(d);
     }
     std::fs::create_dir_all(&spm)?;
     // The pid alone is shared by threads; the counter makes each call unique.
@@ -295,8 +318,10 @@ fn seed_checked(home: &crate::BaleHome, key: &str, from: &Path) -> io::Result<Pa
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let (from_c, tmp_c, dest_c) = (c(from)?, c(&tmp)?, c(&dest)?);
+    // CLONE_NOFOLLOW (<sys/clonefile.h>, 0x0001) is not exported by libc.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
     // SAFETY: all three are valid NUL-terminated paths that outlive the calls.
-    if unsafe { libc::clonefile(from_c.as_ptr(), tmp_c.as_ptr(), 0) } != 0 {
+    if unsafe { libc::clonefile(from_c.as_ptr(), tmp_c.as_ptr(), CLONE_NOFOLLOW) } != 0 {
         let err = io::Error::last_os_error();
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(err);
@@ -311,7 +336,7 @@ fn seed_checked(home: &crate::BaleHome, key: &str, from: &Path) -> io::Result<Pa
     let err = io::Error::last_os_error();
     let _ = std::fs::remove_dir_all(&tmp);
     if err.raw_os_error() == Some(libc::EEXIST) {
-        Ok(dest)
+        existing_dest(&dest)?.ok_or(err)
     } else {
         Err(err)
     }
@@ -756,15 +781,49 @@ mod tests {
         assert!(seed(&home, "abc", &f).is_err());
     }
 
+    #[test]
+    fn seed_rejects_bad_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let from = t.path().join("src");
+        fs::create_dir_all(&from).unwrap();
+        let home = crate::BaleHome(t.path().join("home"));
+        for k in ["", ".", "..", "a/b", "a\\b", "../x"] {
+            assert!(seed(&home, k, &from).is_err(), "{k:?}");
+        }
+        assert!(!home.spm_dir().exists());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn seed_failure_leaves_no_temp_dir() {
-        // Source on one path, spm/ parent is a file: create_dir_all fails.
+    fn seed_rejects_non_directory_dest() {
         let t = tempfile::tempdir().unwrap();
         let from = source(t.path());
         let home = crate::BaleHome(t.path().join("home"));
-        write(&home.spm_dir(), "a file");
-        assert!(seed(&home, "abc", &from).is_err());
+        fs::create_dir_all(home.spm_dir()).unwrap();
+        std::os::unix::fs::symlink(t.path().join("nowhere"), home.spm_dir().join("dangling"))
+            .unwrap();
+        std::os::unix::fs::symlink(&from, home.spm_dir().join("live")).unwrap();
+        write(&home.spm_dir().join("file"), "x");
+        for k in ["dangling", "live", "file"] {
+            assert!(seed(&home, k, &from).is_err(), "{k}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seed_clone_failure_leaves_no_temp_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // An unreadable subdirectory makes clonefile fail after spm/ exists.
+        let t = tempfile::tempdir().unwrap();
+        let from = source(t.path());
+        let locked = from.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let home = crate::BaleHome(t.path().join("home"));
+        let res = seed(&home, "abc", &from);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err(), "clonefile unexpectedly succeeded");
+        assert_eq!(fs::read_dir(home.spm_dir()).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "macos")]
