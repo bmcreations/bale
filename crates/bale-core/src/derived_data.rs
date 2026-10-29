@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use crate::BaleHome;
 
 /// DerivedData folders directly under `dd_root` whose `info.plist`
 /// `WorkspacePath` lies inside `workspace` (compared component-wise). A
@@ -100,6 +103,35 @@ pub(crate) fn belongs_to_tree(dir: &Path, root: &Path) -> bool {
         && DdDir::read(dir.to_path_buf()).built_from(&workspace_key(root))
 }
 
+/// Appends `root` to `<bale home>/dd-roots` unless a line already names it.
+/// Each line is a DerivedData root itself, the folder holding `info.plist`.
+pub fn learn_root(home: &BaleHome, root: &Path) -> io::Result<()> {
+    let line = root.to_string_lossy();
+    if line.contains('\n') || learned_roots(home).iter().any(|r| r == root) {
+        return Ok(());
+    }
+    fs::create_dir_all(&home.0)?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(home.dd_roots_file())?;
+    writeln!(file, "{line}")
+}
+
+/// The roots in `<bale home>/dd-roots`, deduplicated; none when the file is
+/// missing or unreadable.
+pub fn learned_roots(home: &BaleHome) -> Vec<PathBuf> {
+    let text = fs::read_to_string(home.dd_roots_file()).unwrap_or_default();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let root = PathBuf::from(line);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
 pub(crate) fn global_root() -> Option<PathBuf> {
     crate::paths::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
@@ -122,4 +154,35 @@ pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
         .collect();
     roots.extend(global_for(root));
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn learn_root_appends_once_per_path() {
+        let h = tempfile::tempdir().unwrap();
+        let home = BaleHome(h.path().join("bale"));
+        assert!(learned_roots(&home).is_empty());
+        learn_root(&home, Path::new("/tmp/a-dd")).unwrap();
+        learn_root(&home, Path::new("/tmp/b-dd")).unwrap();
+        learn_root(&home, Path::new("/tmp/a-dd")).unwrap();
+        assert_eq!(
+            fs::read_to_string(home.dd_roots_file()).unwrap(),
+            "/tmp/a-dd\n/tmp/b-dd\n"
+        );
+        assert_eq!(learned_roots(&home).len(), 2);
+    }
+
+    #[test]
+    fn learned_roots_skips_blank_and_repeated_lines() {
+        let h = tempfile::tempdir().unwrap();
+        let home = BaleHome(h.path().to_path_buf());
+        fs::write(home.dd_roots_file(), "/x\n\n/y\n/x\n").unwrap();
+        assert_eq!(
+            learned_roots(&home),
+            vec![PathBuf::from("/x"), PathBuf::from("/y")]
+        );
+    }
 }
