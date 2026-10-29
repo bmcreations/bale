@@ -469,15 +469,23 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
     let dirty = idle_for < cfg.idle_cold || git::is_dirty(&root)?;
     // Only a Baled tree past the baled threshold needs to know whether its
     // output regrew; the same filter as `up` keeps sweep from re-running up
-    // on a tree whose only regenerable-named dirs hold real content.
+    // on a tree whose only regenerable-named dirs hold real content. Xcode
+    // builds into its shared DerivedData, which `up` also removes on macOS.
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
-        && !bale_able_from(&root, regen)?.0.is_empty();
+        && (has_shared_derived_data(&root) || !bale_able_from(&root, regen)?.0.is_empty());
     let edited = (changed > UNIX_EPOCH).then_some(changed);
     Ok((
         decide(record.level, idle_for, dirty, has_regen, &cfg),
         edited,
     ))
+}
+
+/// Whether Xcode's shared DerivedData holds a folder built from `root`.
+/// Only macOS, the one place `up` removes those folders; elsewhere a `true`
+/// would re-run `up` on every sweep.
+fn has_shared_derived_data(root: &Path) -> bool {
+    cfg!(target_os = "macos") && !crate::derived_data::global_for(root).is_empty()
 }
 
 /// `now` minus the later of the two times; zero when that lies in the future.
