@@ -12,6 +12,7 @@ use crate::lock::WorkspaceLock;
 use crate::ops::disk;
 use crate::ops::open::{delete_saved, saved_refs};
 use crate::registry::{canonical_or_ancestor, is_workspace_id, Level, Record, Registry};
+use crate::store::{gc as store_gc, Store};
 use crate::BaleHome;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,6 +27,9 @@ pub struct GcReport {
     pub checks: Vec<(String, PathBuf)>,
     /// `(id, error)` for each record gc could not check or act on.
     pub errors: Vec<(String, String)>,
+    /// Bytes of store blobs, manifests and stat indexes removed (or that a
+    /// dry run would remove).
+    pub store_bytes_freed: u64,
 }
 
 /// Removes a `Hot` or `Baled` record when its dir is gone and git no longer
@@ -56,7 +60,34 @@ fn gc_untraced(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
             report.errors.push((stem, format!("{e:#}")));
         }
     }
+    collect_store(home, &registry, dry_run, &mut report);
     Ok(report)
+}
+
+/// Frees store blobs and manifests no record reaches. A record gc cannot
+/// read might hold a stash, so then it removes nothing; the per-record pass
+/// has already reported that record as an error.
+fn collect_store(home: &BaleHome, registry: &Registry, dry_run: bool, report: &mut GcReport) {
+    let result = (|| -> Result<Option<u64>> {
+        let mut commitments = Vec::new();
+        let mut ids = Vec::new();
+        for (stem, read) in registry.all_lenient()? {
+            let Ok(record) = read else {
+                return Ok(None);
+            };
+            commitments.extend(record.stash.map(|s| s.commitment));
+            ids.push(stem);
+        }
+        let store = Store::open(home)?;
+        let blobs = store_gc::collect(&store, &commitments, dry_run)?;
+        Ok(Some(
+            blobs + store_gc::collect_index(&store, &ids, dry_run)?,
+        ))
+    })();
+    match result {
+        Ok(n) => report.store_bytes_freed = n.unwrap_or(0),
+        Err(e) => report.errors.push(("store".to_string(), format!("{e:#}"))),
+    }
 }
 
 fn collect(

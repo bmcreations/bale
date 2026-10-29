@@ -84,6 +84,8 @@ fn new_fields_roundtrip() {
             subjects: vec!["s".into()],
             ..Scope::default()
         }),
+        stash: None,
+        restore_hook: false,
     };
     reg.put(&r).unwrap();
     assert_eq!(reg.get(&r.id).unwrap(), Some(r));

@@ -65,6 +65,17 @@ impl crate::trace::Traced for Touch {
 /// record gives [`Touch::Untracked`]; a tree whose lock is held is left
 /// alone rather than waited for.
 pub fn touch(home: &BaleHome, path: &Path) -> Result<Touch> {
+    touch_with(home, path, false)
+}
+
+/// [`touch`] for a hook that restores stashed files: also sets the record's
+/// `restore_hook`, which lets `sweep` stash the tree. Set in the same record
+/// write as `last_activity`, under the same lock.
+pub fn touch_restoring(home: &BaleHome, path: &Path) -> Result<Touch> {
+    touch_with(home, path, true)
+}
+
+fn touch_with(home: &BaleHome, path: &Path, restore_hook: bool) -> Result<Touch> {
     // Records are keyed by the canonical path `register` stores, so a tree
     // reached through a symlink still finds its record.
     let canonical = match crate::paths::canonicalize(path) {
@@ -86,6 +97,7 @@ pub fn touch(home: &BaleHome, path: &Path) -> Result<Touch> {
             return Ok(Touch::Untracked);
         };
         record.last_activity = SystemTime::now();
+        record.restore_hook |= restore_hook;
         registry.put(&record)?;
         Ok(Touch::Touched)
     })
@@ -113,6 +125,8 @@ mod tests {
             origin: None,
             pinned: false,
             scope: None,
+            stash: None,
+            restore_hook: false,
         }
     }
 

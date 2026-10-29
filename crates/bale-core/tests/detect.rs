@@ -1,7 +1,7 @@
 mod support;
 
 use bale_core::config::Config;
-use bale_core::detect::{detect, regenerable_dirs, BuildSystem};
+use bale_core::detect::{detect, regenerable_dirs, stash_dirs, BuildSystem};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,9 @@ fn cfg(extra: &[&str]) -> Config {
     Config {
         idle_baled: Duration::from_secs(4 * 3600),
         idle_cold: Duration::from_secs(7 * 86400),
+        idle_stash: Duration::from_secs(600),
+        stash_min_bytes: 1 << 20,
+        patch_max_depth: 4,
         regenerable_extra: extra.iter().map(|s| s.to_string()).collect(),
         ignored_denylist_extra: vec![],
         worktree_root: None,
@@ -217,4 +220,60 @@ fn symlinked_build_dir_is_not_a_root() {
     write_plist(&r.join("dd"), Some(Path::new("/src/App.xcworkspace")));
     std::os::unix::fs::symlink(o.path().join("Build"), r.join("dd/Build")).unwrap();
     assert!(regenerable_dirs(r, &detect(r), &cfg(&[])).is_empty());
+}
+
+#[test]
+fn stash_dirs_are_xcode_build_only() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    fs::create_dir_all(r.join("App.xcodeproj")).unwrap();
+    write_plist(&r.join(".dd"), Some(&r.join("App.xcodeproj")));
+    for f in [
+        ".dd/Build/Products/x",
+        ".dd/SourcePackages/checkouts/y",
+        ".dd/SDKExplicitPrecompiledModules/z",
+        ".dd/ModuleCache.noindex/w",
+        ".build/v",
+        "out/u",
+    ] {
+        touch(r, f);
+    }
+    let sys = detect(r);
+    let got = set(stash_dirs(r, &sys, &cfg(&["out"])));
+    assert_eq!(got, set(vec![r.join(".dd/Build")]));
+}
+
+#[test]
+fn stash_dirs_are_gradle_build_only() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    for f in [
+        "settings.gradle.kts",
+        "app/build/x",
+        "lib/feature/build/y",
+        ".gradle/z",
+        ".kotlin/k",
+        "lib/.cxx/c",
+        "src/build.rs",
+    ] {
+        touch(r, f);
+    }
+    let sys = detect(r);
+    let got = set(stash_dirs(r, &sys, &cfg(&[])));
+    assert_eq!(
+        got,
+        set(vec![r.join("app/build"), r.join("lib/feature/build")])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stash_dirs_skip_symlinked_build() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path();
+    let o = tempfile::tempdir().unwrap();
+    touch(r, "settings.gradle.kts");
+    fs::create_dir_all(r.join("app")).unwrap();
+    std::os::unix::fs::symlink(o.path(), r.join("app/build")).unwrap();
+    assert!(stash_dirs(r, &detect(r), &cfg(&[])).is_empty());
 }

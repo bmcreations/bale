@@ -468,6 +468,8 @@ fn finish(
     }
     // A failed removal leaves the record `Cooling`; the next run finishes it.
     remove_trash(&trash)?;
+    // The build dirs are gone; the blobs are left to GC.
+    record.stash = None;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
@@ -714,6 +716,8 @@ fn recover(
         }
         remove_trash(&trash)?;
     }
+    // The build dirs are gone; the blobs are left to GC.
+    record.stash = None;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
@@ -1363,6 +1367,9 @@ fn no_extras() -> Config {
     Config {
         idle_baled: Duration::ZERO,
         idle_cold: Duration::ZERO,
+        idle_stash: Duration::ZERO,
+        stash_min_bytes: 0,
+        patch_max_depth: 0,
         regenerable_extra: Vec::new(),
         ignored_denylist_extra: Vec::new(),
         worktree_root: None,

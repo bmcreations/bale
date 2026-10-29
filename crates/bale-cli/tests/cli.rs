@@ -635,7 +635,7 @@ fn print_only_shows_schedule_and_changes_nothing() {
     }
     if cfg!(target_os = "macos") {
         assert!(text.contains("dev.bale.sweep.plist"), "{text}");
-        assert!(text.contains("<integer>1800</integer>"), "{text}");
+        assert!(text.contains("<integer>300</integer>"), "{text}");
         assert!(text.contains("launchctl bootstrap gui/"), "{text}");
     } else if cfg!(windows) {
         assert!(
@@ -1072,7 +1072,14 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
     fs::write(&path, wrapped).unwrap();
     let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(fs::read_to_string(&path).unwrap(), wrapped);
+    // The wrapped entries stay as they were; only the new events are added.
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let old: Value = serde_json::from_str(wrapped).unwrap();
+    assert_eq!(v["hooks"]["WorktreeCreate"], old["hooks"]["WorktreeCreate"]);
+    assert_eq!(v["hooks"]["WorktreeRemove"], old["hooks"]["WorktreeRemove"]);
+    for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
+        assert_eq!(v["hooks"][event].as_array().unwrap().len(), 1, "{event}");
+    }
     let text = stdout(&out);
     assert!(text.contains("left unchanged"), "{text}");
     assert!(text.contains("nice '/old/bale'"), "{text}");
@@ -1166,7 +1173,15 @@ fn install_hooks_claude_keeps_user_hooks() {
     let first = fs::read_to_string(&path).unwrap();
     let v: Value = serde_json::from_str(&first).unwrap();
     let user: Value = serde_json::from_str(USER_HOOKS).unwrap();
-    assert_eq!(v["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
+    // bale's entry (no matcher) is listed first; the user's stays as it was.
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{v}");
+    assert!(pre[0].get("matcher").is_none(), "{v}");
+    assert!(pre[0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude pre-tool"));
+    assert_eq!(pre[1], user["hooks"]["PreToolUse"][0]);
     // Claude Code runs matching hooks in parallel, so install says the
     // user's remove hook races bale's.
     assert!(
@@ -3272,4 +3287,630 @@ fn uninstall_conductor_keeps_file_when_backup_is_unreadable() {
         fs::set_permissions(b, fs::Permissions::from_mode(0o600)).unwrap();
     }
     assert!(path.is_file(), "{}", stdout(&out));
+}
+
+// Warm tier: `stash`, `unstash` and the Claude Code prompt, pre-tool and
+// stop hooks.
+
+const MIB: usize = 1 << 20;
+
+/// Deterministic, poorly compressible bytes.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+const BIG_A: &str = "build/a.bin";
+const BIG_B: &str = "build/b.bin";
+
+/// A registered Gradle worktree with two 2 MiB ignored files under `build/`.
+fn stash_tree(env: &Env) -> PathBuf {
+    let wt = env.add_worktree("warm");
+    fs::write(wt.join("settings.gradle"), "").unwrap();
+    fs::write(wt.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::create_dir_all(wt.join("sub")).unwrap();
+    fs::write(wt.join(BIG_A), noise(2 * MIB, 1)).unwrap();
+    fs::write(wt.join(BIG_B), noise(2 * MIB, 2)).unwrap();
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    wt
+}
+
+fn stash_it(env: &Env, wt: &Path) -> Output {
+    env.bale(&env.repo, &["stash", wt.to_str().unwrap()], None)
+}
+
+fn hook_json(cwd: &Path, event: &str) -> String {
+    serde_json::json!({
+        "session_id": "s",
+        "cwd": cwd,
+        "hook_event_name": event,
+        "unknown_field": [1, 2],
+    })
+    .to_string()
+}
+
+fn tree_id(wt: &Path) -> String {
+    bale_core::registry::workspace_id(&canon(wt))
+}
+
+fn bale_lock(env: &Env, wt: &Path) -> Option<bale_core::lock::WorkspaceLock> {
+    let home = bale_core::BaleHome(env.bale_home());
+    bale_core::lock::WorkspaceLock::try_acquire(&home, &tree_id(wt)).unwrap()
+}
+
+/// Polls until `done` holds; panics after 30 s.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Waits until no background restore for `wt` is running, so no detached
+/// process outlives the test (or its temp dir).
+fn wait_no_background(wt: &Path) {
+    wait_until("background unstash to exit", || !background_running(wt));
+}
+
+/// Whether a `bale unstash --background` for `wt` is running.
+fn background_running(wt: &Path) -> bool {
+    let pattern = format!("unstash --background {}", tree_id(wt));
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = Command::new("pgrep");
+        cmd.args(["-f", &pattern]);
+        cmd
+    };
+    // No pgrep on Windows; match on bale.exe so PowerShell's own command
+    // line (which holds the pattern) doesn't count.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "if (Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'bale.exe' -and $_.CommandLine -like '*{pattern}*' }}) {{ exit 0 }} else {{ exit 1 }}"
+            ),
+        ]);
+        cmd
+    };
+    cmd.output().unwrap().status.success()
+}
+
+fn prompt_hook(env: &Env, wt: &Path) -> Output {
+    env.bale(
+        &env.repo,
+        &["hook", "claude", "prompt"],
+        Some(&hook_json(wt, "UserPromptSubmit")),
+    )
+}
+
+fn pre_tool_hook(env: &Env, wt: &Path) -> Output {
+    env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&hook_json(wt, "PreToolUse")),
+    )
+}
+
+fn len_of(p: &Path) -> u64 {
+    fs::metadata(p).unwrap().len()
+}
+
+fn blobs(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            blobs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "zst") {
+            out.push(p);
+        }
+    }
+}
+
+#[test]
+fn stash_and_unstash_commands_round_trip() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let (a, b) = (
+        fs::read(wt.join(BIG_A)).unwrap(),
+        fs::read(wt.join(BIG_B)).unwrap(),
+    );
+
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("stashed 2 files, "), "{text:?}");
+    assert!(!text.contains("skipped"), "{text:?}");
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+
+    let out = env.bale(&env.repo, &["unstash", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("restored 2 files, "), "{text:?}");
+    assert_eq!(fs::read(wt.join(BIG_A)).unwrap(), a);
+    assert_eq!(fs::read(wt.join(BIG_B)).unwrap(), b);
+}
+
+#[test]
+fn stash_command_reports_skipped_files() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    // Tracked despite the ignore rule: stash leaves it alone and says so.
+    fs::write(wt.join("build/tracked.bin"), noise(2 * MIB, 3)).unwrap();
+    env.git(&wt, &["add", "-f", "build/tracked.bin"]);
+
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("stashed 2 files, "), "{text:?}");
+    assert!(
+        text.trim_end()
+            .ends_with("(1 files skipped: not ignored by git)"),
+        "{text:?}"
+    );
+    assert_eq!(len_of(&wt.join("build/tracked.bin")), (2 * MIB) as u64);
+}
+
+#[test]
+fn stash_command_says_why_it_skipped() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "not stashed: already stashed\n");
+}
+
+#[test]
+fn hook_prompt_unstashes_tree_at_cwd() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let a = fs::read(wt.join(BIG_A)).unwrap();
+    assert!(stash_it(&env, &wt).status.success());
+
+    let input = hook_json(&wt.join("sub"), "UserPromptSubmit");
+    let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(&input));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    // The restore runs in the background.
+    wait_until("files restored", || len_of(&wt.join(BIG_B)) > 0);
+    wait_no_background(&wt);
+    assert_eq!(fs::read(wt.join(BIG_A)).unwrap(), a);
+}
+
+#[test]
+fn prompt_returns_before_restore_finishes() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let a = fs::read(wt.join(BIG_A)).unwrap();
+    assert!(stash_it(&env, &wt).status.success());
+    // Holding the tree's lock stands in for a slow restore.
+    let held = bale_lock(&env, &wt).expect("lock is free");
+
+    let start = std::time::Instant::now();
+    let out = prompt_hook(&env, &wt);
+    assert!(start.elapsed().as_secs() < 5, "prompt waited");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        len_of(&wt.join(BIG_A)),
+        0,
+        "restored while the lock was held"
+    );
+
+    drop(held);
+    wait_until("files restored", || len_of(&wt.join(BIG_B)) > 0);
+    wait_no_background(&wt);
+    assert_eq!(fs::read(wt.join(BIG_A)).unwrap(), a);
+}
+
+#[test]
+fn pre_tool_waits_for_background_restore() {
+    use std::process::Stdio;
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let held = bale_lock(&env, &wt).expect("lock is free");
+    assert_eq!(prompt_hook(&env, &wt).status.code(), Some(0));
+
+    let mut cmd = Command::cargo_bin("bale").unwrap();
+    cmd.args(["hook", "claude", "pre-tool"])
+        .current_dir(&env.repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env.isolate(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(hook_json(&wt, "PreToolUse").as_bytes())
+            .unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "pre-tool did not wait");
+
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // It returns only once the files are back.
+    assert!(len_of(&wt.join(BIG_A)) > 0 && len_of(&wt.join(BIG_B)) > 0);
+    wait_no_background(&wt);
+}
+
+#[test]
+fn prompt_not_stashed_spawns_nothing() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let out = prompt_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), "");
+    assert!(!background_running(&wt), "a background restore was spawned");
+    assert!(!env.bale_home().join("restore-failed").exists());
+}
+
+#[test]
+fn pre_tool_not_stashed_is_fast() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let runs = 20;
+    let start = std::time::Instant::now();
+    for _ in 0..runs {
+        let out = pre_tool_hook(&env, &wt);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    }
+    let avg = start.elapsed() / runs;
+    eprintln!("pre-tool, not stashed: {avg:?} per call (process included)");
+    assert!(avg < std::time::Duration::from_millis(100), "{avg:?}");
+    // No store was opened for it.
+    assert!(!env.bale_home().join("store").exists());
+}
+
+#[test]
+fn hook_prompt_outside_any_tree_is_noop() {
+    let env = Env::new();
+    let _wt = stash_tree(&env);
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "prompt"],
+        Some(&hook_json(&env.home(), "UserPromptSubmit")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn hook_prompt_with_bad_payload_does_not_block() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    for input in [
+        "not json",
+        "{}",
+        r#"{"cwd": 7}"#,
+        r#"{"cwd": "/no/such/dir"}"#,
+    ] {
+        let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(input));
+        assert_eq!(out.status.code(), Some(0), "{input}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{input}");
+        assert_eq!(stderr(&out).trim_end().lines().count(), 1, "{input}");
+    }
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn background_failure_blocks_next_hook() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let originals = [
+        (BIG_A, fs::read(wt.join(BIG_A)).unwrap()),
+        (BIG_B, fs::read(wt.join(BIG_B)).unwrap()),
+    ];
+    assert!(stash_it(&env, &wt).status.success());
+    let mut found = Vec::new();
+    blobs(&env.bale_home().join("store"), &mut found);
+    found.sort();
+    assert_eq!(found.len(), 2, "{found:?}");
+    let mut bytes = fs::read(&found[0]).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    fs::write(&found[0], bytes).unwrap();
+
+    // The prompt itself does not see the failure.
+    let out = prompt_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    wait_until("background run to finish", || {
+        env.bale_home().join("restore-failed").exists()
+    });
+    wait_no_background(&wt);
+    let (lost, kept): (Vec<_>, Vec<_>) = originals
+        .iter()
+        .partition(|(rel, _)| len_of(&wt.join(rel)) == 0);
+    assert_eq!(lost.len(), 1, "exactly the corrupt file stays a stub");
+    assert_eq!(fs::read(wt.join(kept[0].0)).unwrap(), kept[0].1);
+
+    // The next hook reports it once, naming the file.
+    let out = pre_tool_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let lost_rel = lost[0].0.replace('/', std::path::MAIN_SEPARATOR_STR);
+    assert!(stderr(&out).contains(&lost_rel), "{}", stderr(&out));
+    let out = pre_tool_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn failure_marker_blocks_prompt_and_survives_a_later_restore() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let dir = env.bale_home().join("restore-failed");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{}.txt", tree_id(&wt))),
+        "boom: build/a.bin\n",
+    )
+    .unwrap();
+
+    // A successful synchronous restore leaves the marker for the user.
+    let out = env.bale(&env.repo, &["unstash", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(len_of(&wt.join(BIG_A)) > 0);
+
+    let out = prompt_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("boom: build/a.bin"),
+        "{}",
+        stderr(&out)
+    );
+    let out = prompt_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn hook_pre_tool_lock_timeout_exits_2() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let home = bale_core::BaleHome(env.bale_home());
+    let id = bale_core::registry::workspace_id(&canon(&wt));
+    let _held = bale_core::lock::WorkspaceLock::try_acquire(&home, &id)
+        .unwrap()
+        .expect("lock is free");
+
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool", "--lock-wait-ms", "300"],
+        Some(&hook_json(&wt, "PreToolUse")),
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(err.contains("still busy"), "{err}");
+    assert!(!err.contains("lock file"), "{err}");
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn hook_pre_tool_bumps_activity() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let before = ls_json_row(&env, &wt)["last_activity"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&hook_json(&wt.join("sub"), "PreToolUse")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_ne!(ls_json_row(&env, &wt)["last_activity"], before);
+}
+
+#[test]
+fn pre_tool_hook_lets_the_next_sweep_stash() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    fs::write(
+        env.bale_home().join("config.toml"),
+        "idle_stash_minutes = 0\n",
+    )
+    .unwrap();
+    let home = bale_core::BaleHome(env.bale_home());
+    let reg = bale_core::registry::Registry::open(home);
+    let id = tree_id(&wt);
+
+    // No restoring hook has run: the sweep leaves the build outputs alone.
+    assert!(!reg.get(&id).unwrap().unwrap().restore_hook);
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(len_of(&wt.join(BIG_A)), 2 * MIB as u64);
+    assert!(reg.get(&id).unwrap().unwrap().stash.is_none());
+
+    let out = pre_tool_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(reg.get(&id).unwrap().unwrap().restore_hook);
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+    let rec = reg.get(&id).unwrap().unwrap();
+    assert!(rec.stash.is_some() && rec.restore_hook);
+}
+
+#[test]
+fn hook_pre_tool_unstashes_tree() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&hook_json(&wt, "PreToolUse")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(len_of(&wt.join(BIG_A)) > 0);
+}
+
+#[test]
+fn hook_stop_only_touches_activity() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let store = env.bale_home().join("store");
+    let store_mtime = fs::metadata(&store).unwrap().modified().unwrap();
+    let before = ls_json_row(&env, &wt)["last_activity"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "stop"],
+        Some(&hook_json(&wt, "Stop")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_ne!(ls_json_row(&env, &wt)["last_activity"], before);
+    assert_eq!(
+        fs::metadata(&store).unwrap().modified().unwrap(),
+        store_mtime
+    );
+    // Stop restores nothing.
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn install_plan_sets_timeout() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo mine"}]}],
+            "PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"echo edit"}]}]}}"#,
+    )
+    .unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+    // User entries stay, without a timeout bale did not set.
+    let prompt = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+    assert_eq!(prompt.len(), 2, "{prompt:?}");
+    let ours = |groups: &[Value]| -> Value {
+        groups
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .find(|h| h["command"].as_str().unwrap().contains("bale"))
+            .unwrap()
+            .clone()
+    };
+    let user = prompt
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().unwrap())
+        .find(|h| h["command"] == "echo mine")
+        .unwrap();
+    assert!(user.get("timeout").is_none());
+    assert_eq!(ours(prompt)["timeout"], 90);
+    assert!(ours(prompt)["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude prompt"));
+
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{pre:?}");
+    let group = pre
+        .iter()
+        .find(|g| {
+            g["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("hook claude pre-tool")
+        })
+        .unwrap();
+    assert!(group.get("matcher").is_none(), "{group}");
+    assert_eq!(group["hooks"][0]["timeout"], 90);
+    assert_eq!(pre.iter().filter(|g| g["matcher"] == "Edit").count(), 1);
+
+    let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+    assert!(stop["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude stop"));
+    assert!(stop.get("timeout").is_none());
+
+    // Uninstall removes only bale's entries.
+    let out = env.bale(&env.repo, &["uninstall", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        "echo mine"
+    );
+    assert_eq!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+    assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Edit");
+    assert!(v["hooks"].get("Stop").is_none());
+    assert!(v["hooks"].get("WorktreeCreate").is_none());
+}
+
+#[test]
+fn reinstall_replaces_the_old_bash_matcher() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let exe = env!("CARGO_BIN_EXE_bale").replace('\\', "/");
+    let old = serde_json::json!({"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command",
+            "command": format!("'{exe}' hook claude pre-tool"), "timeout": 90}]},
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-guard check"}]}]}});
+    fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{v}");
+    assert!(pre[0].get("matcher").is_none(), "{v}");
+    assert_eq!(
+        pre[0]["hooks"][0]["command"],
+        format!("'{exe}' hook claude pre-tool")
+    );
+    // The user's own Bash entry is not touched.
+    assert_eq!(pre[1]["matcher"], "Bash");
+    assert_eq!(pre[1]["hooks"][0]["command"], "my-guard check");
+
+    // Installed again, nothing changes; uninstall leaves only the user's.
+    let again = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(
+        stdout(&again).contains("already installed"),
+        "{}",
+        stdout(&again)
+    );
+    let out = env.bale(&env.repo, &["uninstall", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "my-guard check"
+    );
 }

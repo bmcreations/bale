@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::store::Hash;
 use crate::BaleHome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,28 @@ pub struct Record {
     /// checkout, so a cold tree still describes itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<Scope>,
+    /// Set while the tree's large build files live in the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stash: Option<StashState>,
+    /// A hook that restores stashed files has run for this tree. `sweep`
+    /// stashes only such trees, since a stashed tree no hook restores would
+    /// build against empty files. Core never clears it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_hook: bool,
+}
+
+/// A tree's stash, as the record tracks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashState {
+    /// Commitment of the manifest in the store.
+    pub commitment: Hash,
+    pub at_unix: i64,
+    /// The files are back in the tree; the manifest is kept as the patch
+    /// base for the next stash.
+    pub restored: bool,
+    /// An unstash is in progress (or was interrupted).
+    #[serde(default)]
+    pub restoring: bool,
 }
 
 fn is_false(b: &bool) -> bool {

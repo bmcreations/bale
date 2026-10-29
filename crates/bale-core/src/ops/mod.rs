@@ -5,5 +5,7 @@ pub mod meta;
 pub mod migrate;
 pub mod new;
 pub mod open;
+pub mod stash;
 pub mod sweep;
+pub mod unstash;
 pub mod up;

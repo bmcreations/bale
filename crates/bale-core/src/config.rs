@@ -6,11 +6,17 @@ use std::time::Duration;
 
 const DEFAULT_IDLE_BALED_HOURS: u64 = 4;
 const DEFAULT_IDLE_COLD_DAYS: u64 = 7;
+const DEFAULT_IDLE_STASH_MINUTES: u64 = 10;
+const DEFAULT_STASH_MIN_BYTES: u64 = 1 << 20;
+const DEFAULT_PATCH_MAX_DEPTH: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub idle_baled: Duration,
     pub idle_cold: Duration,
+    pub idle_stash: Duration,
+    pub stash_min_bytes: u64,
+    pub patch_max_depth: u32,
     pub regenerable_extra: Vec<String>,
     pub ignored_denylist_extra: Vec<String>,
     pub worktree_root: Option<PathBuf>,
@@ -21,6 +27,9 @@ pub struct Config {
 struct RawConfig {
     idle_baled_hours: Option<u64>,
     idle_cold_days: Option<u64>,
+    idle_stash_minutes: Option<u64>,
+    stash_min_bytes: Option<u64>,
+    patch_max_depth: Option<u32>,
     regenerable: Option<Vec<String>>,
     ignored_denylist: Option<Vec<String>>,
     worktree_root: Option<PathBuf>,
@@ -51,9 +60,22 @@ pub fn load_config(home: &BaleHome, repo_root: Option<&Path>) -> Result<Config> 
         .idle_cold_days
         .or(machine.idle_cold_days)
         .unwrap_or(DEFAULT_IDLE_COLD_DAYS);
+    let minutes = repo
+        .idle_stash_minutes
+        .or(machine.idle_stash_minutes)
+        .unwrap_or(DEFAULT_IDLE_STASH_MINUTES);
     Ok(Config {
         idle_baled: Duration::from_secs(hours * 3600),
         idle_cold: Duration::from_secs(days * 86400),
+        idle_stash: Duration::from_secs(minutes * 60),
+        stash_min_bytes: repo
+            .stash_min_bytes
+            .or(machine.stash_min_bytes)
+            .unwrap_or(DEFAULT_STASH_MIN_BYTES),
+        patch_max_depth: repo
+            .patch_max_depth
+            .or(machine.patch_max_depth)
+            .unwrap_or(DEFAULT_PATCH_MAX_DEPTH),
         regenerable_extra: repo.regenerable.or(machine.regenerable).unwrap_or_default(),
         ignored_denylist_extra: repo
             .ignored_denylist

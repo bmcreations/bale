@@ -11,7 +11,9 @@ use bale_core::ops::meta::set_pinned;
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
+use bale_core::ops::stash::{stash, StashOutcome};
 use bale_core::ops::sweep::{sweep, Action};
+use bale_core::ops::unstash::{unstash, write_failure_marker, UnstashReport};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
 use bale_core::par::par_map;
 use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
@@ -40,6 +42,24 @@ enum Command {
         /// Do not treat this process as holding the tree (repeatable).
         #[arg(long = "ignore-pid", value_name = "PID")]
         ignore_pid: Vec<u32>,
+    },
+    /// Compress a worktree's large build-output files into the store, leaving empty stubs.
+    Stash {
+        /// Worktree path or workspace id.
+        target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
+    },
+    /// Refill a worktree's stashed files from the store.
+    Unstash {
+        /// Worktree path or workspace id.
+        target: String,
+        /// Run for the prompt hook: `target` is the workspace id, nothing is
+        /// printed, and a failure is left as a marker for the next hook to
+        /// report instead of an exit code.
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Restore a cold worktree at its path, then remove its saved state.
     Open {
@@ -92,7 +112,8 @@ enum Command {
         #[command(subcommand)]
         kind: HookKind,
     },
-    /// Install the 30-minute sweep schedule, or with --hooks only those tools' hooks.
+    /// Install the sweep schedule (every 5 minutes on macOS, 30 elsewhere), or with --hooks
+    /// only those tools' hooks.
     Install {
         /// Comma-separated tools to hook: claude, git, conductor, cursor, codex, t3.
         #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
@@ -199,6 +220,17 @@ enum ClaudeHook {
     Create,
     /// WorktreeRemove: JSON on stdin, colds the worktree.
     Remove,
+    /// UserPromptSubmit: JSON on stdin, starts restoring the stashed tree at
+    /// its cwd in the background.
+    Prompt,
+    /// PreToolUse (any tool): JSON on stdin, waits for the tree's restore.
+    PreTool {
+        /// Milliseconds to wait for the tree's lock; default 60000.
+        #[arg(long, hide = true, value_name = "MS")]
+        lock_wait_ms: Option<u64>,
+    },
+    /// Stop: JSON on stdin, records the turn end for the tree at its cwd.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -266,6 +298,22 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
         }),
         Command::Cold { target, ignore_pid } => resolve(&home, &target)
             .and_then(|id| Ok(report_cold(&id, cold_ignoring(&home, &id, &ignore_pid)?))),
+        Command::Stash { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| stash(&home, &id, &ignore_pid))
+            .map(|outcome| {
+                println!("{}", stash_line(&outcome));
+                ExitCode::SUCCESS
+            }),
+        Command::Unstash {
+            target,
+            background: true,
+        } => Ok(unstash_background(&home, &target)),
+        Command::Unstash { target, .. } => resolve(&home, &target)
+            .and_then(|id| unstash(&home, &id))
+            .map(|report| {
+                println!("{}", unstash_line(report.as_ref()));
+                ExitCode::SUCCESS
+            }),
         Command::Open { target } => resolve(&home, &target).and_then(|id| {
             let opened = open(&home, &id)?;
             let code = report(&id, opened.outcome);
@@ -317,6 +365,15 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             HookKind::Claude {
                 event: ClaudeHook::Remove,
             } => bale_hooks::claude::remove(&home),
+            HookKind::Claude {
+                event: ClaudeHook::Prompt,
+            } => Ok(bale_hooks::claude::prompt(&home)),
+            HookKind::Claude {
+                event: ClaudeHook::PreTool { lock_wait_ms },
+            } => Ok(bale_hooks::claude::pre_tool(&home, lock_wait_ms)),
+            HookKind::Claude {
+                event: ClaudeHook::Stop,
+            } => Ok(bale_hooks::claude::stop(&home)),
             HookKind::Git {
                 event: GitHook::PostCheckout { prev, new, flag },
             } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
@@ -362,6 +419,68 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// The one line `bale stash` prints.
+fn stash_line(outcome: &StashOutcome) -> String {
+    match outcome {
+        StashOutcome::Stashed(r) => {
+            let mut line = format!(
+                "stashed {} files, {} -> {} in {:.1} s",
+                r.files,
+                human(r.bytes),
+                human(r.stored_bytes),
+                r.secs
+            );
+            if r.git_visible > 0 {
+                line.push_str(&format!(
+                    " ({} files skipped: not ignored by git)",
+                    r.git_visible
+                ));
+            }
+            line
+        }
+        StashOutcome::Skipped(reason) => format!("not stashed: {reason}"),
+    }
+}
+
+/// `bale unstash --background <id>`, as the prompt hook starts it: restores,
+/// and on any error leaves the text for the next hook (see
+/// `bale_core::ops::unstash::write_failure_marker`). Silent and always exit 0;
+/// nobody is reading its stdio.
+fn unstash_background(home: &BaleHome, id: &str) -> ExitCode {
+    if let Err(e) = unstash(home, id) {
+        if let Err(w) = write_failure_marker(home, id, &format!("{e:#}")) {
+            eprintln!("bale: could not record the restore failure: {w:#}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    // A stash the prompt interrupted may have swallowed the prompt's own
+    // activity record; the tree is in use, so say so again.
+    if let Ok(Some(record)) = Registry::open(home.clone()).get(id) {
+        let _ = bale_core::ops::meta::touch(home, &record.path);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The one line `bale unstash` prints.
+fn unstash_line(report: Option<&UnstashReport>) -> String {
+    let Some(r) = report else {
+        return "nothing to restore".into();
+    };
+    let mut line = format!(
+        "restored {} files, {} in {:.1} s",
+        r.files,
+        human(r.bytes),
+        r.secs
+    );
+    if r.cloned_files > 0 {
+        line.push_str(&format!(" ({} cloned)", human(r.cloned_bytes)));
+    }
+    if r.kept_newer > 0 {
+        line.push_str(&format!(" ({} kept newer)", r.kept_newer));
+    }
+    line
 }
 
 /// Prints `plan` with `print_only`, else applies it.
@@ -445,6 +564,7 @@ fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
         Action::Keep => "keep",
         Action::Up => "up",
         Action::Cold => "cold",
+        Action::Stash => "stash",
         Action::Report(_) => "report",
     };
     let line = format!("{id}  {name}  {result}");
@@ -483,6 +603,12 @@ fn gc_lines(report: &GcReport, dry_run: bool) -> Vec<(bool, String)> {
     }
     for (id, err) in &report.errors {
         lines.push((true, format!("bale: {id}: {}", action_cell(err))));
+    }
+    if report.store_bytes_freed > 0 {
+        lines.push((
+            false,
+            format!("store: {} bytes {would}freed", report.store_bytes_freed),
+        ));
     }
     lines
 }
@@ -817,6 +943,8 @@ mod tests {
             origin: Some(origin("")),
             pinned: false,
             scope: None,
+            stash: None,
+            restore_hook: false,
         };
         assert!(show_text(&r, None).contains("origin:   cursor\n"));
         r.origin = Some(origin("s1"));
@@ -946,6 +1074,7 @@ mod tests {
             cleaned: vec!["b".into()],
             checks: vec![("d".into(), PathBuf::from("/w/.bale-check-d-a1B2c3"))],
             errors: vec![("c".into(), "boom\nmore".into())],
+            store_bytes_freed: 2048,
         };
         assert_eq!(
             gc_lines(&report, false),
@@ -958,6 +1087,7 @@ mod tests {
                     "d: check dir /w/.bale-check-d-a1B2c3 removed".to_string()
                 ),
                 (true, "bale: c: boom more".to_string()),
+                (false, "store: 2048 bytes freed".to_string()),
             ]
         );
         assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");

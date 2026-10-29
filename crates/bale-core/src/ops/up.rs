@@ -204,6 +204,8 @@ pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> 
                 origin: None,
                 pinned: false,
                 scope: None,
+                stash: None,
+                restore_hook: false,
             }
         }
     };
@@ -354,6 +356,9 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
         }
     }
 
+    // The stubs went with the dirs; a later unstash must not refill them.
+    // The blobs are left to GC.
+    record.stash = None;
     record.level = Level::Baled;
     registry.put(&record)?;
     Ok(UpReport {
@@ -459,7 +464,7 @@ pub(crate) fn bale_able_from(
 
 /// Whether a dir between `root` (exclusive) and `root/rel` (inclusive) has a
 /// `.git` entry of any kind.
-fn in_nested_repo(root: &Path, rel: &Path) -> bool {
+pub(crate) fn in_nested_repo(root: &Path, rel: &Path) -> bool {
     let mut dir = root.to_path_buf();
     rel.components().any(|c| {
         dir.push(c);
@@ -468,7 +473,7 @@ fn in_nested_repo(root: &Path, rel: &Path) -> bool {
 }
 
 /// `rel` with `/` between components, as git pathspecs want.
-fn slashed(rel: &Path) -> String {
+pub(crate) fn slashed(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()

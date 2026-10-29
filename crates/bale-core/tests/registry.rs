@@ -20,6 +20,8 @@ fn record(id: &str) -> Record {
         origin: None,
         pinned: false,
         scope: None,
+        stash: None,
+        restore_hook: false,
     }
 }
 
@@ -35,6 +37,18 @@ fn put_get_roundtrip() {
     reg.remove("abc").unwrap();
     assert_eq!(reg.get("abc").unwrap(), None);
     reg.remove("abc").unwrap();
+}
+
+#[test]
+fn record_without_restore_hook_field_parses_as_false() {
+    let mut v = serde_json::to_value(record("abc")).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("restore_hook").is_none());
+    let r: Record = serde_json::from_value(v).unwrap();
+    assert!(!r.restore_hook);
+    let mut r = record("abc");
+    r.restore_hook = true;
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["restore_hook"], true);
 }
 
 #[test]

@@ -14,6 +14,7 @@ use crate::detect::{detect, regenerable_dirs};
 use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
+use crate::ops::stash::{stash, StashOutcome};
 use crate::ops::up::{bale_able_from, up_report, Outcome};
 use crate::par::par_map;
 use crate::registry::{Level, Record, Registry};
@@ -29,17 +30,24 @@ pub enum Action {
     Keep,
     Up,
     Cold,
+    /// Truncate the large build files to stubs, keeping them in the store.
+    Stash,
     Report(String),
 }
 
 /// The idle policy. `dirty` must be `true` whenever cleanliness is unknown.
 /// `has_regen` says whether a `Baled` tree has regrown output `up` would
-/// remove; it is ignored for other levels.
+/// remove; it is ignored for other levels. `stashed` says the tree's files
+/// are stubs now (a stash not yet restored); such a tree is not stashed
+/// again, but still goes `Up` and `Cold` on schedule. `stash_ok` says a
+/// restoring hook has run for the tree; without it `Stash` is never returned.
 pub fn decide(
     level: Level,
     idle_for: Duration,
     dirty: bool,
     has_regen: bool,
+    stashed: bool,
+    stash_ok: bool,
     cfg: &Config,
 ) -> Action {
     if let Some(action) = level_action(level) {
@@ -54,6 +62,12 @@ pub fn decide(
         Action::Cold
     } else if up_due && idle_for >= cfg.idle_baled {
         Action::Up
+    } else if matches!(level, Level::Hot | Level::Baled)
+        && stash_ok
+        && !stashed
+        && idle_for >= cfg.idle_stash
+    {
+        Action::Stash
     } else {
         Action::Keep
     }
@@ -108,7 +122,7 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
         match record {
             Ok(record) => {
                 let (action, result, edited) = sweep_one(home, &record, dry_run);
-                trace_tree(home, &record, &action, edited, &m);
+                trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
                 rows.push((record.id, action, result));
@@ -316,6 +330,7 @@ fn trace_tree(
     home: &BaleHome,
     record: &Record,
     action: &Action,
+    result: &str,
     edited: Option<SystemTime>,
     m: &Measured,
 ) {
@@ -324,6 +339,7 @@ fn trace_tree(
         Action::Keep => ("keep", None),
         Action::Up => ("up", None),
         Action::Cold => ("cold", None),
+        Action::Stash => ("stash", result.strip_prefix("skipped: ").map(skip_reason)),
         // Probe errors name paths inside the tree; the trace keeps none.
         Action::Report(text) if text == "missing" || text.starts_with("interrupted") => {
             ("report", Some(text.replace("<id>", &record.id)))
@@ -373,6 +389,15 @@ fn trace_tree(
         f.insert("reason".into(), crate::trace::clip(&reason).into());
     }
     crate::trace::emit(home, "tree", f);
+}
+
+/// The category of a stash skip, without the process names or paths its
+/// text can carry: `busy: node (12)` gives `busy`.
+fn skip_reason(text: &str) -> String {
+    if text.contains("is not the worktree's checkout") {
+        return "not the worktree's checkout".into();
+    }
+    text.split(':').next().unwrap_or(text).trim().to_string()
 }
 
 fn millis(d: Duration) -> u64 {
@@ -428,6 +453,7 @@ fn sweep_one(
             other => outcome_text(other.map(|r| r.outcome)),
         },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
+        Action::Stash => stash_text(stash(home, &record.id, &[])),
     };
     (action, result, edited)
 }
@@ -476,7 +502,15 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
         && (has_shared_derived_data(&root) || !bale_able_from(&root, regen)?.0.is_empty());
     let edited = (changed > UNIX_EPOCH).then_some(changed);
     Ok((
-        decide(record.level, idle_for, dirty, has_regen, &cfg),
+        decide(
+            record.level,
+            idle_for,
+            dirty,
+            has_regen,
+            record.stash.as_ref().is_some_and(|s| !s.restored),
+            record.restore_hook,
+            &cfg,
+        ),
         edited,
     ))
 }
@@ -492,6 +526,19 @@ fn has_shared_derived_data(root: &Path) -> bool {
 fn idle_between(now: SystemTime, last_change: SystemTime, last_activity: SystemTime) -> Duration {
     now.duration_since(last_change.max(last_activity))
         .unwrap_or(Duration::ZERO)
+}
+
+/// A stash that skips (busy, a prompt waiting, nothing to do) is not an
+/// error: the next sweep tries again.
+fn stash_text(outcome: Result<StashOutcome>) -> String {
+    match outcome {
+        Ok(StashOutcome::Stashed(r)) => format!(
+            "stashed {} files, {} bytes -> {} bytes",
+            r.files, r.bytes, r.stored_bytes
+        ),
+        Ok(StashOutcome::Skipped(reason)) => format!("skipped: {reason}"),
+        Err(e) => format!("error: {e:#}"),
+    }
 }
 
 fn outcome_text(outcome: Result<Outcome>) -> String {
@@ -517,6 +564,9 @@ mod tests {
         Config {
             idle_baled: Duration::from_secs(4 * 3600),
             idle_cold: Duration::from_secs(7 * 86400),
+            idle_stash: Duration::from_secs(600),
+            stash_min_bytes: 1 << 20,
+            patch_max_depth: 4,
             regenerable_extra: Vec::new(),
             ignored_denylist_extra: Vec::new(),
             worktree_root: None,
@@ -645,34 +695,49 @@ mod tests {
 
     #[test]
     fn hot_idle_5h_goes_up() {
-        assert_eq!(decide(Level::Hot, h(5), false, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Hot, h(5), false, true, true, true, &cfg()),
+            Action::Up
+        );
     }
 
     #[test]
     fn hot_idle_3h_keeps() {
-        assert_eq!(decide(Level::Hot, h(3), false, true, &cfg()), Action::Keep);
+        assert_eq!(
+            decide(Level::Hot, h(3), false, true, true, true, &cfg()),
+            Action::Keep
+        );
     }
 
     #[test]
     fn hot_at_threshold_goes_up() {
-        assert_eq!(decide(Level::Hot, h(4), false, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Hot, h(4), false, true, true, true, &cfg()),
+            Action::Up
+        );
     }
 
     #[test]
     fn baled_idle_with_regrown_output_goes_up() {
-        assert_eq!(decide(Level::Baled, h(5), false, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Baled, h(5), false, true, true, true, &cfg()),
+            Action::Up
+        );
         // up does not touch source, so a dirty tree qualifies too.
-        assert_eq!(decide(Level::Baled, h(5), true, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Baled, h(5), true, true, true, true, &cfg()),
+            Action::Up
+        );
     }
 
     #[test]
     fn baled_idle_without_regenerable_output_keeps() {
         assert_eq!(
-            decide(Level::Baled, h(5), false, false, &cfg()),
+            decide(Level::Baled, h(5), false, false, true, true, &cfg()),
             Action::Keep
         );
         assert_eq!(
-            decide(Level::Baled, d(8), true, false, &cfg()),
+            decide(Level::Baled, d(8), true, false, true, true, &cfg()),
             Action::Keep
         );
     }
@@ -680,20 +745,23 @@ mod tests {
     #[test]
     fn baled_not_idle_keeps() {
         assert_eq!(
-            decide(Level::Baled, h(3), false, true, &cfg()),
+            decide(Level::Baled, h(3), false, true, true, true, &cfg()),
             Action::Keep
         );
-        assert_eq!(decide(Level::Baled, h(3), true, true, &cfg()), Action::Keep);
+        assert_eq!(
+            decide(Level::Baled, h(3), true, true, true, true, &cfg()),
+            Action::Keep
+        );
     }
 
     #[test]
     fn baled_idle_past_cold_threshold_and_clean_goes_cold() {
         assert_eq!(
-            decide(Level::Baled, d(8), false, true, &cfg()),
+            decide(Level::Baled, d(8), false, true, true, true, &cfg()),
             Action::Cold
         );
         assert_eq!(
-            decide(Level::Baled, d(8), false, false, &cfg()),
+            decide(Level::Baled, d(8), false, false, true, true, &cfg()),
             Action::Cold
         );
     }
@@ -701,32 +769,47 @@ mod tests {
     #[test]
     fn clean_8d_goes_cold() {
         assert_eq!(
-            decide(Level::Baled, d(8), false, true, &cfg()),
+            decide(Level::Baled, d(8), false, true, true, true, &cfg()),
             Action::Cold
         );
-        assert_eq!(decide(Level::Hot, d(8), false, true, &cfg()), Action::Cold);
+        assert_eq!(
+            decide(Level::Hot, d(8), false, true, true, true, &cfg()),
+            Action::Cold
+        );
     }
 
     #[test]
     fn dirty_8d_never_cold() {
-        assert_ne!(decide(Level::Baled, d(8), true, true, &cfg()), Action::Cold);
-        assert_eq!(decide(Level::Baled, d(8), true, true, &cfg()), Action::Up);
+        assert_ne!(
+            decide(Level::Baled, d(8), true, true, true, true, &cfg()),
+            Action::Cold
+        );
         assert_eq!(
-            decide(Level::Baled, d(8), true, false, &cfg()),
+            decide(Level::Baled, d(8), true, true, true, true, &cfg()),
+            Action::Up
+        );
+        assert_eq!(
+            decide(Level::Baled, d(8), true, false, true, true, &cfg()),
             Action::Keep
         );
-        assert_eq!(decide(Level::Hot, d(8), true, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Hot, d(8), true, true, true, true, &cfg()),
+            Action::Up
+        );
     }
 
     #[test]
     fn interrupted_resumes() {
-        assert_eq!(decide(Level::Baling, h(0), false, true, &cfg()), Action::Up);
+        assert_eq!(
+            decide(Level::Baling, h(0), false, true, true, true, &cfg()),
+            Action::Up
+        );
     }
 
     #[test]
     fn cooling_resumes_cold_even_when_dirty() {
         assert_eq!(
-            decide(Level::Cooling, h(0), true, true, &cfg()),
+            decide(Level::Cooling, h(0), true, true, true, true, &cfg()),
             Action::Cold
         );
     }
@@ -734,7 +817,7 @@ mod tests {
     #[test]
     fn opening_is_reported_not_restored() {
         assert_eq!(
-            decide(Level::Opening, d(30), false, true, &cfg()),
+            decide(Level::Opening, d(30), false, true, true, true, &cfg()),
             Action::Report("interrupted open: run `bale open <id>`".into())
         );
     }
@@ -742,7 +825,7 @@ mod tests {
     #[test]
     fn cold_keeps() {
         assert_eq!(
-            decide(Level::Cold, d(30), false, true, &cfg()),
+            decide(Level::Cold, d(30), false, true, true, true, &cfg()),
             Action::Keep
         );
     }
@@ -754,7 +837,10 @@ mod tests {
             idle_cold: d(1),
             ..cfg()
         };
-        assert_eq!(decide(Level::Hot, h(30), false, true, &c), Action::Cold);
+        assert_eq!(
+            decide(Level::Hot, h(30), false, true, true, true, &c),
+            Action::Cold
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ The binary is `target/release/bale`. `bale <command> --help` lists the exact fla
 
 ## Install and uninstall
 
-`bale install` with no flags installs the sweep schedule: `bale sweep` every 30 minutes, through launchd,
+`bale install` with no flags installs the sweep schedule: `bale sweep` every 5 minutes through launchd on macOS, or every 30 minutes through
 a systemd user timer or Task Scheduler. It does not touch any tool's configuration.
 
 `bale install --hooks <LIST>` installs only the hooks of the tools in the comma-separated list, and not the
@@ -48,7 +48,7 @@ remove hook, the sweep covers its idle trees.
 
 | Tool | What `bale install --hooks` does | What the hook does | Status |
 |---|---|---|---|
-| Claude Code | Adds `WorktreeCreate` and `WorktreeRemove` entries to `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that is set), keeping other hooks. Refuses when you already have a `WorktreeCreate` hook of your own. A `WorktreeRemove` hook of your own stays; Claude Code runs it in parallel with bale's, so it may find the tree already gone. | `create` makes the worktree with `bale new` and prints its path (it falls back to plain `git worktree add` when bale fails), and records the session. `remove` takes the worktree cold instead of deleting it. | Verified by tests |
+| Claude Code | Adds `WorktreeCreate`, `WorktreeRemove`, `UserPromptSubmit`, `PreToolUse` (every tool, no matcher) and `Stop` entries to `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that is set), keeping other hooks. Refuses when you already have a `WorktreeCreate` hook of your own. A `WorktreeRemove` hook of your own stays; Claude Code runs it in parallel with bale's, so it may find the tree already gone. | `create` makes the worktree with `bale new` and prints its path (it falls back to plain `git worktree add` when bale fails), and records the session. `remove` takes the worktree cold instead of deleting it. `prompt` records the activity and, when the tree is stashed, starts restoring it in a detached `bale unstash --background` and returns at once, so the prompt does not wait for the disk writes. `pre-tool` runs before every tool call and waits for that restore to finish (it does the restore itself if it gets there first); a tree that is not stashed costs about 20 ms. A background restore that fails leaves its error under `$BALE_HOME/restore-failed/`, and the next prompt or tool call shows it once and exits 2. `stop` records the turn's end. | Verified by tests |
 | git | Writes `post-checkout` in the repo's hooks dir (honouring `core.hooksPath`). An existing hook is moved to `post-checkout.pre-bale` and called by bale's. | `post-checkout` registers a linked worktree that `git worktree add` just created. | Verified by tests |
 | Conductor | Chains bale after your `setup` script and after your `archive` script in `<repo>/.conductor/settings.toml`. Your scripts and other keys stay. | `setup` registers the workspace. `archive` takes it cold; it exits 3 when something holds the tree and 4 when bale skipped it. | Unverified: not run against Conductor |
 | Cursor | Appends bale's command to the setup command list in `<repo>/.cursor/worktrees.json`. Refuses when the setup entry is a script path. | `setup` registers the worktree. Cursor has no remove hook. | Unverified: not run against Cursor |
@@ -87,6 +87,7 @@ Codex and T3 Code trees record the tool as their origin with no session or title
 
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
+The sweep's stash step only stashes trees where Claude Code's restore hook (`prompt` or `pre-tool`) has run, because no other tool restores stashed files; `bale stash` by hand works on any tree.
 
 Known limitations:
 

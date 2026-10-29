@@ -1,0 +1,765 @@
+//! Moves a tree's large build-output files into the store and leaves each as
+//! an empty stub at the same inode.
+//!
+//! The stub keeps its inode because Xcode relinks anything whose inode
+//! changed (about 45 s on a large app), so a stashed path is truncated in
+//! place and never deleted, renamed over or cloned into. Nothing is truncated
+//! until its blob and the manifest are durable and the record points at the
+//! manifest; a crash before that leaves full files, and a crash after it is
+//! finished by the next `stash`.
+
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+use walkdir::WalkDir;
+
+use crate::busy::busy_holders_many;
+use crate::config::{load_config, Config};
+use crate::detect::{detect, stash_dirs};
+use crate::lock::WorkspaceLock;
+use crate::par::{par_map, ByteBudget};
+use crate::registry::{Level, Record, Registry, StashState};
+use crate::store::index::{stat_of, Index, IndexEntry};
+use crate::store::manifest::{Entry, StashManifest};
+use crate::store::{sha256_file, Hash, Store};
+use crate::BaleHome;
+
+/// Memory the parallel `put`s may hold for patch bases at once.
+const BASE_BUDGET: u64 = 2 << 30;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StashReport {
+    /// Files truncated to stubs by this run.
+    pub files: usize,
+    /// Their bytes before truncation.
+    pub bytes: u64,
+    /// Compressed bytes this run added to the store.
+    pub stored_bytes: u64,
+    /// Files whose blob was already in the store.
+    pub reused: usize,
+    /// Candidate files left in place because git tracks them or sees them as
+    /// untracked and not ignored.
+    pub git_visible: usize,
+    pub secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StashOutcome {
+    Stashed(StashReport),
+    Skipped(String),
+}
+
+/// Test hooks for [`stash_with`].
+#[doc(hidden)]
+#[derive(Default)]
+pub struct StashOpts<'a> {
+    /// Fail once the record points at the new manifest, before any file is
+    /// truncated (a crash at that point).
+    pub fail_before_truncate: bool,
+    /// Called at the same point, just before truncation starts.
+    pub before_truncate: Option<&'a dyn Fn()>,
+    /// Called once the blobs are stored, before the manifest is written.
+    pub before_commit: Option<&'a dyn Fn()>,
+}
+
+/// Why a stash gave the lock up part way: a prompt asked for the tree.
+const PROMPT_WAITING: &str = "prompt waiting";
+
+/// Stashes the large files in the tree's build-output dirs (see
+/// [`stash_dirs`]). Processes in `ignore_pids` do not count as holding the
+/// tree. A stash left half done by a crash is finished instead.
+pub fn stash(home: &BaleHome, id: &str, ignore_pids: &[u32]) -> Result<StashOutcome> {
+    stash_with(home, id, ignore_pids, &StashOpts::default())
+}
+
+#[doc(hidden)]
+pub fn stash_with(
+    home: &BaleHome,
+    id: &str,
+    ignore_pids: &[u32],
+    opts: &StashOpts,
+) -> Result<StashOutcome> {
+    let out = stash_inner(home, id, ignore_pids, opts)?;
+    if let StashOutcome::Stashed(r) = &out {
+        let mut f = serde_json::Map::new();
+        f.insert("id".into(), id.into());
+        f.insert("files".into(), r.files.into());
+        f.insert("bytes".into(), r.bytes.into());
+        f.insert("stored_bytes".into(), r.stored_bytes.into());
+        f.insert("secs".into(), r.secs.into());
+        crate::trace::emit(home, "stash", f);
+    }
+    Ok(out)
+}
+
+fn stash_inner(
+    home: &BaleHome,
+    id: &str,
+    ignore_pids: &[u32],
+    opts: &StashOpts,
+) -> Result<StashOutcome> {
+    let start = Instant::now();
+    let skip = |s: &str| Ok(StashOutcome::Skipped(s.to_string()));
+    let Some(lock) = WorkspaceLock::try_acquire(home, id)? else {
+        return skip("locked");
+    };
+    let registry = Registry::open(home.clone());
+    let Some(record) = registry.get(id)? else {
+        bail!("no record for {id}; register the worktree first with `bale up <path>`");
+    };
+    if !matches!(record.level, Level::Hot | Level::Baled) {
+        return skip(record.level.name());
+    }
+    // Rerunning over an interrupted unstash would truncate files it already
+    // wrote back; unstash must finish first.
+    if record.stash.as_ref().is_some_and(|s| s.restoring) {
+        return skip("unstash in progress");
+    }
+    let root = crate::paths::canonicalize(&record.path)
+        .with_context(|| format!("resolving {}", record.path.display()))?;
+    if let Err(e) = super::disk::ensure_checkout(&root, &record.admin_dir) {
+        return skip(&format!(
+            "{} is not the worktree's checkout: {e:#}",
+            root.display()
+        ));
+    }
+    let cfg = load_config(home, Some(&root))?;
+    let dirs = stash_dirs(&root, &detect(&root), &cfg);
+    if let Some(busy) = busy(&dirs, ignore_pids)? {
+        return skip(&busy);
+    }
+
+    let store = Store::open(home)?;
+    let mut run = Run {
+        store: &store,
+        registry: &registry,
+        record,
+        root,
+        roots: Vec::new(),
+        dirs,
+        ignore_pids,
+        start,
+        lock: &lock,
+    };
+    match run.record.stash.clone() {
+        Some(s) if !s.restored => run.resume(&s.commitment),
+        prev => run.fresh(id, &cfg, prev, opts),
+    }
+}
+
+/// `"busy: cmd (pid), ..."` when a process other than those in `ignore`
+/// has its cwd or an open file under `dirs`.
+fn busy(dirs: &[PathBuf], ignore: &[u32]) -> Result<Option<String>> {
+    let holders: Vec<String> = busy_holders_many(dirs, ignore)?
+        .into_iter()
+        .flatten()
+        .map(|h| format!("{} ({})", h.command, h.pid))
+        .collect();
+    Ok((!holders.is_empty()).then(|| format!("busy: {}", holders.join(", "))))
+}
+
+struct Run<'a> {
+    store: &'a Store,
+    registry: &'a Registry,
+    record: Record,
+    root: PathBuf,
+    /// Index 0 is `root`; the rest are the DerivedData folders outside it
+    /// that `dirs` lie in. Set by `fresh`.
+    roots: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    ignore_pids: &'a [u32],
+    start: Instant,
+    /// Polled so a waiting prompt (unstash) stops the stash; see
+    /// [`WorkspaceLock::requested`].
+    lock: &'a WorkspaceLock,
+}
+
+/// A file picked for stashing, with the stat it was hashed at.
+struct Candidate {
+    item: Item,
+    hash: Hash,
+    size: u64,
+    mtime_ns: i128,
+    ino: u64,
+    mode: u32,
+}
+
+/// A file under one of the manifest's roots.
+#[derive(Clone)]
+struct Item {
+    /// Index into the roots.
+    root: u16,
+    /// Relative to that root.
+    rel: PathBuf,
+    full: PathBuf,
+}
+
+impl Item {
+    /// The key in the tree's index: `rel` for the tree itself (as before
+    /// roots existed), the absolute path for a file outside it.
+    fn key(&self) -> &Path {
+        if self.root == 0 {
+            &self.rel
+        } else {
+            &self.full
+        }
+    }
+}
+
+impl Candidate {
+    fn stat(&self) -> (u64, i128, u64) {
+        (self.size, self.mtime_ns, self.ino)
+    }
+}
+
+/// What truncation did with the manifest's entries.
+struct Truncated {
+    files: usize,
+    bytes: u64,
+    /// Entries left as they were because the file changed since it was
+    /// hashed; they come out of the manifest.
+    changed: Vec<usize>,
+}
+
+impl Run<'_> {
+    /// A stash from full files: hash, store, commit, then truncate.
+    fn fresh(
+        &mut self,
+        id: &str,
+        cfg: &Config,
+        prev: Option<StashState>,
+        opts: &StashOpts,
+    ) -> Result<StashOutcome> {
+        // A dir inside a nested repo or submodule is out: the root's git
+        // can't say which of its files are tracked. Dirs outside the tree
+        // (shared DerivedData) have no repo to judge them.
+        self.dirs.retain(|d| match d.strip_prefix(&self.root) {
+            Ok(rel) => !super::up::in_nested_repo(&self.root, rel),
+            Err(_) => d.parent().is_some_and(|p| p.to_str().is_some()),
+        });
+        // Each dir outside the tree is a DerivedData folder's `Build/`; the
+        // folder is the root its files are relative to.
+        self.roots = vec![self.root.clone()];
+        for d in &self.dirs {
+            if let Some(p) = d.parent().filter(|_| !d.starts_with(&self.root)) {
+                if !self.roots.iter().any(|r| r == p) {
+                    self.roots.push(p.to_path_buf());
+                }
+            }
+        }
+        let seen_by_git = git_visible(&self.root, &self.dirs)?;
+        let mut items = candidates(&self.roots, &self.dirs, cfg.stash_min_bytes);
+        let before = items.len();
+        items.retain(|i| i.root != 0 || !seen_by_git.contains(&i.rel));
+        let git_visible = before - items.len();
+        if items.is_empty() {
+            return Ok(StashOutcome::Skipped("nothing to stash".into()));
+        }
+
+        // The restored manifest's hash for a path is the patch base for it.
+        let prev = prev.filter(|s| s.restored);
+        let bases: HashMap<PathBuf, Hash> = prev
+            .as_ref()
+            .and_then(|s| self.store.read_manifest(&s.commitment).ok())
+            .map(|m| {
+                m.entries
+                    .iter()
+                    .map(|e| (m.path_of(e, &self.root), e.hash.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let index = Mutex::new(Index::load(self.store, id)?);
+        let lock = self.lock;
+        let mut found: Vec<Candidate> = par_map(&items, |item| {
+            if lock.requested() {
+                return Ok(None);
+            }
+            hash_one(item, &index)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut index = index.into_inner().unwrap_or_else(|e| e.into_inner());
+        let keep: BTreeSet<PathBuf> = items.iter().map(|i| i.key().to_path_buf()).collect();
+        index.forget_missing(&keep);
+        index.save(self.store, id)?;
+        if lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
+
+        // One put per distinct content, the first file holding it as source.
+        let mut sources: Vec<(Hash, PathBuf)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for c in &found {
+            if seen.insert(c.hash.clone()) {
+                sources.push((c.hash.clone(), c.item.full.clone()));
+            }
+        }
+        let present: BTreeSet<Hash> = sources
+            .iter()
+            .filter(|(h, _)| self.store.has(h))
+            .map(|(h, _)| h.clone())
+            .collect();
+        let stats: HashMap<&PathBuf, (u64, i128, u64)> =
+            found.iter().map(|c| (&c.item.full, c.stat())).collect();
+        let budget = ByteBudget::new(BASE_BUDGET);
+        let puts = par_map(&sources, |(hash, full)| -> Result<Option<u64>> {
+            if present.contains(hash) {
+                return Ok(Some(0));
+            }
+            if lock.requested() {
+                return Ok(None);
+            }
+            let base = bases.get(full).filter(|b| *b != hash);
+            let hold = base
+                .filter(|b| self.store.has(b))
+                .and_then(|b| self.store.meta(b).ok())
+                .map_or(0, |m| 2 * m.size);
+            let put = {
+                let _held = budget.acquire(hold);
+                self.store.put(full, hash, base, cfg.patch_max_depth)
+            };
+            // A file that changed since it was hashed is left out: `put`
+            // refuses content that no longer matches the hash, and a change
+            // after `put` read it shows up in the stat. The blob, if any,
+            // stays: another tree's stash may have just reused it.
+            let now = fs::symlink_metadata(full).map(|m| stat_of(&m)).ok();
+            if now != Some(stats[full]) {
+                return Ok(None);
+            }
+            Ok(Some(put?.stored))
+        });
+        let mut stored_bytes = 0;
+        let mut dropped = BTreeSet::new();
+        for ((hash, _), put) in sources.iter().zip(puts) {
+            match put? {
+                Some(n) => stored_bytes += n,
+                None => {
+                    dropped.insert(hash.clone());
+                }
+            }
+        }
+        found.retain(|c| !dropped.contains(&c.hash));
+        if let Some(f) = opts.before_commit {
+            f();
+        }
+        // Blobs already stored stay for the next stash (or GC).
+        if lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
+        if found.is_empty() {
+            return Ok(StashOutcome::Skipped("nothing to stash".into()));
+        }
+        let reused = found.iter().filter(|c| present.contains(&c.hash)).count();
+
+        let manifest = StashManifest {
+            tree_id: id.to_string(),
+            created_unix: now_unix(),
+            roots: self.roots.clone(),
+            entries: found
+                .into_iter()
+                .map(|c| Entry {
+                    rel: c.item.rel,
+                    root: c.item.root,
+                    hash: c.hash,
+                    size: c.size,
+                    mode: c.mode,
+                    mtime_ns: c.mtime_ns,
+                    ino: c.ino,
+                })
+                .collect(),
+        };
+        let commitment = self.store.write_manifest(&manifest)?;
+        self.record.stash = Some(StashState {
+            commitment: commitment.clone(),
+            at_unix: now_unix(),
+            restored: false,
+            restoring: false,
+        });
+        self.registry.put(&self.record)?;
+        // Nothing points at the restored manifest any more; its blobs stay
+        // until GC decides.
+        if let Some(p) = prev.filter(|p| p.commitment != commitment) {
+            self.store.remove_manifest(&p.commitment)?;
+        }
+
+        if opts.fail_before_truncate {
+            bail!("stash: injected failure before truncation");
+        }
+        if let Some(f) = opts.before_truncate {
+            f();
+        }
+        if self.lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
+        // Hashing and storing can take minutes; a build may have started
+        // since the first check. The record already points at the manifest,
+        // so the next `stash` finishes the job.
+        if let Some(busy) = busy(&self.dirs, self.ignore_pids)? {
+            return Ok(StashOutcome::Skipped(busy));
+        }
+        let done = self.truncate(manifest, commitment)?;
+        Ok(StashOutcome::Stashed(StashReport {
+            files: done.files,
+            bytes: done.bytes,
+            stored_bytes,
+            reused,
+            git_visible,
+            secs: self.start.elapsed().as_secs_f64(),
+        }))
+    }
+
+    /// Finishes a stash the record already points at: truncates the entries
+    /// still full size and unchanged. Files added to the tree since are left
+    /// for the next stash.
+    fn resume(&mut self, commitment: &Hash) -> Result<StashOutcome> {
+        let manifest = self.store.read_manifest(commitment)?;
+        if self.lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
+        // Checked again right before cutting, as in `fresh`.
+        if let Some(busy) = busy(&self.dirs, self.ignore_pids)? {
+            return Ok(StashOutcome::Skipped(busy));
+        }
+        let done = self.truncate(manifest, commitment.clone())?;
+        if done.files == 0 {
+            return Ok(StashOutcome::Skipped("already stashed".into()));
+        }
+        Ok(StashOutcome::Stashed(StashReport {
+            files: done.files,
+            bytes: done.bytes,
+            stored_bytes: 0,
+            reused: 0,
+            git_visible: 0,
+            secs: self.start.elapsed().as_secs_f64(),
+        }))
+    }
+
+    /// Truncates each entry's file that is still as it was hashed, then
+    /// drops the changed ones from the manifest: new manifest, record moved
+    /// to it, old manifest removed, in that order, so the record never
+    /// points at a missing manifest.
+    fn truncate(&mut self, manifest: StashManifest, commitment: Hash) -> Result<Truncated> {
+        let mut done = Truncated {
+            files: 0,
+            bytes: 0,
+            changed: Vec::new(),
+        };
+        let owned = owned_roots(&manifest, &self.root);
+        for (i, e) in manifest.entries.iter().enumerate() {
+            // A folder that is no longer this tree's is never written to.
+            if !owned[usize::from(e.root)] {
+                done.changed.push(i);
+                continue;
+            }
+            match stub(&manifest.path_of(e, &self.root), e) {
+                Stub::Truncated => {
+                    done.files += 1;
+                    done.bytes += e.size;
+                }
+                Stub::Already => {}
+                Stub::Changed => done.changed.push(i),
+            }
+        }
+        if done.changed.is_empty() {
+            return Ok(done);
+        }
+
+        let mut kept = manifest;
+        let mut i = 0;
+        kept.entries.retain(|_| {
+            let keep = !done.changed.contains(&i);
+            i += 1;
+            keep
+        });
+        if kept.entries.is_empty() {
+            self.record.stash = None;
+            self.registry.put(&self.record)?;
+        } else {
+            let c = self.store.write_manifest(&kept)?;
+            if let Some(s) = self.record.stash.as_mut() {
+                s.commitment = c.clone();
+            }
+            self.registry.put(&self.record)?;
+            if c == commitment {
+                return Ok(done);
+            }
+        }
+        self.store.remove_manifest(&commitment)?;
+        Ok(done)
+    }
+}
+
+/// Files under `dirs` that git tracks or sees as untracked and not ignored,
+/// relative to `root`, from one `git ls-files` per 100 dirs. Such a file is
+/// source as far as git is concerned, so stash never stubs it.
+fn git_visible(root: &Path, dirs: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    let mut out = BTreeSet::new();
+    let specs: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| d.strip_prefix(root).ok())
+        .map(|rel| format!(":(literal){}", super::up::slashed(rel)))
+        .collect();
+    for chunk in specs.chunks(100) {
+        let mut args = vec![
+            "--no-optional-locks",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let listed = crate::git::Git::at(root).run(&args)?;
+        out.extend(
+            listed
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    Ok(out)
+}
+
+/// Which of the manifest's roots (by index, at least one) may be written
+/// to: the tree root always, any other only while it is still a DerivedData
+/// folder built from the tree at `tree_root`. A manifest that names a root
+/// that is not absolute never gets one.
+pub(super) fn owned_roots(m: &StashManifest, tree_root: &Path) -> Vec<bool> {
+    let mut owned: Vec<bool> = m
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            i == 0 || (r.is_absolute() && crate::derived_data::belongs_to_tree(r, tree_root))
+        })
+        .collect();
+    if owned.is_empty() {
+        owned.push(true);
+    }
+    owned
+}
+
+/// Regular files with a single link, at least `min` bytes, under `dirs`,
+/// each under the root in `roots` that holds its dir (an in-tree dir is
+/// under root 0, any other under its parent). Paths that are not valid UTF-8
+/// are left out: the manifest can't store them.
+fn candidates(roots: &[PathBuf], dirs: &[PathBuf], min: u64) -> Vec<Item> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let idx = if dir.starts_with(&roots[0]) {
+            Some(0)
+        } else {
+            dir.parent().and_then(|p| roots.iter().position(|r| r == p))
+        };
+        let Some(idx) = idx.and_then(|i| u16::try_from(i).ok()) else {
+            continue;
+        };
+        let base = &roots[usize::from(idx)];
+        let walk = WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            // A nested repo below a stash dir: its files are not the root
+            // git's to judge, so leave them alone.
+            .filter_entry(|e| {
+                !(e.depth() > 0
+                    && e.file_type().is_dir()
+                    && fs::symlink_metadata(e.path().join(".git")).is_ok())
+            });
+        for entry in walk.flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() < min || nlink(&meta) != 1 {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(base) else {
+                continue;
+            };
+            if rel.to_str().is_some() {
+                out.push(Item {
+                    root: idx,
+                    rel: rel.to_path_buf(),
+                    full: entry.path().to_path_buf(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.root, &a.rel).cmp(&(b.root, &b.rel)));
+    out
+}
+
+/// Hashes `item` through the shared index, hashing outside the lock. A
+/// file that is gone, unreadable, no longer a single-link regular file, or
+/// changed while it was read is left out.
+fn hash_one(item: &Item, index: &Mutex<Index>) -> Result<Option<Candidate>> {
+    let full = &item.full;
+    let key = item.key();
+    let Ok(before) = fs::symlink_metadata(full) else {
+        return Ok(None);
+    };
+    if !before.file_type().is_file() || nlink(&before) != 1 {
+        return Ok(None);
+    }
+    let (size, mtime_ns, ino) = stat_of(&before);
+    let lock = || index.lock().unwrap_or_else(|e| e.into_inner());
+    let cached = lock()
+        .get(key)
+        .filter(|e| e.size == size && e.mtime_ns == mtime_ns && e.ino == ino)
+        .map(|e| e.hash.clone());
+    let hash = match cached {
+        Some(h) => h,
+        None => {
+            let Ok(h) = sha256_file(full) else {
+                return Ok(None);
+            };
+            match fs::symlink_metadata(full) {
+                Ok(after) if stat_of(&after) == (size, mtime_ns, ino) => {}
+                _ => return Ok(None),
+            }
+            lock().insert(
+                key.to_path_buf(),
+                IndexEntry {
+                    size,
+                    mtime_ns,
+                    ino,
+                    hash: h.clone(),
+                },
+            );
+            h
+        }
+    };
+    Ok(Some(Candidate {
+        item: item.clone(),
+        hash,
+        size,
+        mtime_ns,
+        ino,
+        mode: mode_of(&before),
+    }))
+}
+
+enum Stub {
+    Truncated,
+    /// Already a stub at the entry's inode.
+    Already,
+    /// Not as it was hashed (or gone, or could not be truncated); left alone.
+    Changed,
+}
+
+/// Truncates `path` to 0 bytes in place if it still has the entry's size,
+/// mtime and inode. Never creates, removes or renames: the inode stays.
+fn stub(path: &Path, e: &Entry) -> Stub {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Stub::Changed;
+    };
+    if !meta.file_type().is_file() {
+        return Stub::Changed;
+    }
+    let (size, mtime_ns, ino) = stat_of(&meta);
+    if size == 0 && ino == e.ino {
+        return Stub::Already;
+    }
+    if (size, mtime_ns, ino) != (e.size, e.mtime_ns, e.ino) {
+        return Stub::Changed;
+    }
+    let mode = mode_of(&meta);
+    let read_only = !owner_writable(&meta);
+    if read_only && set_mode(path, mode, true).is_err() {
+        return Stub::Changed;
+    }
+    let cut = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| {
+            // Same handle, same inode: check once more, then cut.
+            let now = stat_of(&f.metadata()?);
+            if now != (e.size, e.mtime_ns, e.ino) {
+                return Ok(false);
+            }
+            f.set_len(0)?;
+            Ok(true)
+        })
+        .unwrap_or(false);
+    if cut {
+        // The entry's mode, which also undoes a write bit added by a run
+        // that crashed before it could restore it.
+        if read_only || (mode & 0o7777) != (e.mode & 0o7777) {
+            let _ = set_mode(path, e.mode, false);
+        }
+    } else if read_only {
+        let _ = set_mode(path, mode, false);
+    }
+    if cut {
+        Stub::Truncated
+    } else {
+        Stub::Changed
+    }
+}
+
+/// Sets `mode`'s permission bits, plus the owner write bit if `writable`.
+#[cfg(unix)]
+pub(crate) fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let bits = mode & 0o7777;
+    let bits = if writable { bits | 0o200 } else { bits };
+    fs::set_permissions(path, fs::Permissions::from_mode(bits))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
+    let mut p = fs::metadata(path)?.permissions();
+    p.set_readonly(!writable && mode & 0o200 == 0);
+    fs::set_permissions(path, p)
+}
+
+#[cfg(unix)]
+pub(crate) fn owner_writable(meta: &fs::Metadata) -> bool {
+    mode_of(meta) & 0o200 != 0
+}
+
+#[cfg(not(unix))]
+pub(crate) fn owner_writable(meta: &fs::Metadata) -> bool {
+    !meta.permissions().readonly()
+}
+
+#[cfg(unix)]
+pub(crate) fn mode_of(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    meta.mode()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mode_of(meta: &fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+#[cfg(unix)]
+fn nlink(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn nlink(_meta: &fs::Metadata) -> u64 {
+    1
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
