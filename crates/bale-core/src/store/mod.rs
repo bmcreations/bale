@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod codec;
+pub mod index;
 pub mod manifest;
 
 use std::fs::File;
