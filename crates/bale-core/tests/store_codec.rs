@@ -78,8 +78,14 @@ fn undersized_hint_is_an_error() {
 
 fn stream_round_trip(data: &[u8], base: Option<&[u8]>) -> usize {
     let mut z = Vec::new();
-    let written =
-        codec::compress_stream(&mut Cursor::new(data), &mut z, base, codec::LEVEL).unwrap();
+    let written = codec::compress_stream(
+        &mut Cursor::new(data),
+        &mut z,
+        base,
+        data.len() as u64,
+        codec::LEVEL,
+    )
+    .unwrap();
     assert_eq!(written, z.len() as u64);
     let mut out = Vec::new();
     let n = codec::decompress_stream(&mut Cursor::new(&z), &mut out, base).unwrap();
@@ -106,4 +112,17 @@ fn stream_round_trip_100_mib_with_and_without_base() {
     let plain = stream_round_trip(&new, None);
     let patched = stream_round_trip(&new, Some(&base));
     assert!(patched * 20 < plain, "patch {patched} plain {plain}");
+}
+
+#[test]
+fn stream_patch_window_covers_a_grown_file() {
+    let base = sample(8 << 20, 21);
+    let mut new = base.clone();
+    new[1_000_000..1_000_100].fill(0xEE);
+    // The appended tail repeats the start of the base, so its matches sit
+    // further back than the base length.
+    new.extend_from_slice(&base[..4 << 20]);
+    let plain = stream_round_trip(&new, None);
+    let patched = stream_round_trip(&new, Some(&base));
+    assert!(patched * 10 < plain, "patch {patched} plain {plain}");
 }

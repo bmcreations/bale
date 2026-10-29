@@ -90,16 +90,21 @@ pub fn decompress(frame: &[u8], base: Option<&[u8]>, size_hint: u64) -> Result<V
     Ok(out)
 }
 
-/// Compresses `src` to `dst` in 1 MiB steps, holding only `base` in memory.
-/// Returns the compressed bytes written.
+/// Compresses `src` (exactly `src_len` bytes) to `dst` in 1 MiB steps, holding
+/// only `base` in memory. The base is dropped when `src_len` exceeds
+/// [`PATCH_MAX_BYTES`], as in [`compress_patch`]. A source of a different
+/// length is an error. Returns the compressed bytes written.
 pub fn compress_stream(
     src: &mut impl Read,
     dst: &mut impl Write,
     base: Option<&[u8]>,
+    src_len: u64,
     level: i32,
 ) -> Result<u64> {
-    // The source length is unknown, so the window is sized from the base alone.
-    let mut cctx = new_cctx(level, usable_base(base), 0)?;
+    let base = usable_base(base).filter(|_| src_len <= PATCH_MAX_BYTES);
+    let window = usize::try_from(src_len.min(PATCH_MAX_BYTES)).unwrap_or(usize::MAX);
+    let mut cctx = new_cctx(level, base, window)?;
+    cctx.set_pledged_src_size(Some(src_len)).map_err(zerr)?;
     let mut in_buf = vec![0u8; CHUNK];
     let mut out_buf = vec![0u8; CHUNK];
     let mut written = 0u64;
