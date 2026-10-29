@@ -61,6 +61,20 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
 }
 
+/// Hashes what it reads, so `put` can check the content it compressed.
+struct HashingReader<R: io::Read> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: io::Read> io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 pub(super) fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -139,8 +153,12 @@ impl Store {
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let mut tmp = NamedTempFile::new_in(&dir)?;
         let stored = {
-            let mut input =
-                BufReader::new(File::open(src).with_context(|| format!("open {}", src.display()))?);
+            let mut input = HashingReader {
+                inner: BufReader::new(
+                    File::open(src).with_context(|| format!("open {}", src.display()))?,
+                ),
+                hasher: Sha256::new(),
+            };
             let mut out = BufWriter::new(tmp.as_file_mut());
             let stored = if size <= BUFFER_MAX_BYTES {
                 let mut data = Vec::with_capacity(size as usize);
@@ -156,6 +174,13 @@ impl Store {
                 codec::compress_stream(&mut input, &mut out, base_bytes.as_deref(), size, LEVEL)?
             };
             out.flush()?;
+            drop(out);
+            // The file may have changed since the caller hashed it; a blob
+            // stored under the wrong name could be reused by another tree.
+            let read = hex(&input.hasher.finalize());
+            if read != *hash {
+                bail!("{} changed while it was stored", src.display());
+            }
             stored
         };
         tmp.as_file().sync_all()?;

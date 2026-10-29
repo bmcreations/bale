@@ -156,3 +156,18 @@ fn large_file_streams_with_and_without_base() {
     assert_eq!(store.read_to(&h2, &mut out).unwrap(), len as u64);
     assert!(out == data);
 }
+
+#[test]
+fn put_rejects_content_that_does_not_match_its_hash() {
+    let (dir, store) = open();
+    let (p, h) = write(dir.path(), "a", &sample(2 << 20, 1));
+    // The file changes after the caller hashed it.
+    fs::write(&p, sample(2 << 20, 2)).unwrap();
+    let err = store.put(&p, &h, None, 8).unwrap_err();
+    assert!(
+        err.to_string().contains("changed while it was stored"),
+        "{err}"
+    );
+    assert!(!store.has(&h));
+    assert_eq!(count(dir.path(), "zst"), 0);
+}

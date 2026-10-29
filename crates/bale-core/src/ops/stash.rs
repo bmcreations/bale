@@ -257,19 +257,19 @@ impl Run<'_> {
                 .and_then(|b| self.store.meta(b).ok())
                 .map_or(0, |m| 2 * m.size);
             let full = self.root.join(rel);
-            let meta = {
+            let put = {
                 let _held = budget.acquire(hold);
-                self.store.put(&full, hash, base, cfg.patch_max_depth)?
+                self.store.put(&full, hash, base, cfg.patch_max_depth)
             };
-            // `put` trusts the hash it is given; a file that changed while
-            // it was read may have left a blob whose bytes do not match its
-            // name. Its entry is dropped, but the blob stays: another tree's
-            // stash may have just found it and reused it. GC reclaims it.
+            // A file that changed since it was hashed is left out: `put`
+            // refuses content that no longer matches the hash, and a change
+            // after `put` read it shows up in the stat. The blob, if any,
+            // stays: another tree's stash may have just reused it.
             let now = fs::symlink_metadata(&full).map(|m| stat_of(&m)).ok();
             if now != Some(stats[rel]) {
                 return Ok(None);
             }
-            Ok(Some(meta.stored))
+            Ok(Some(put?.stored))
         });
         let mut stored_bytes = 0;
         let mut dropped = BTreeSet::new();
