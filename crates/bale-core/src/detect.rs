@@ -12,14 +12,14 @@ pub enum BuildSystem {
     SwiftPm,
 }
 
-const GRADLE_DIRS: &[&str] = &[
+pub(crate) const GRADLE_DIRS: &[&str] = &[
     "build",
     ".gradle",
     ".kotlin",
     ".cxx",
     ".externalNativeBuild",
 ];
-const SWIFT_DIRS: &[&str] = &[".build"];
+pub(crate) const SWIFT_DIRS: &[&str] = &[".build"];
 
 fn marker_system(name: &str) -> Option<BuildSystem> {
     match name {

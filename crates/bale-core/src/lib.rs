@@ -9,6 +9,7 @@ pub mod ops;
 pub mod par;
 pub mod paths;
 pub mod registry;
+pub mod spm;
 pub mod store;
 pub mod trace;
 
