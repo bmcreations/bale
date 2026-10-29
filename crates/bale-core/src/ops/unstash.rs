@@ -296,6 +296,55 @@ fn commit(
     Ok(())
 }
 
+/// Where a failed background restore of tree `id` leaves its error text:
+/// next to the registry, not in the tree.
+pub fn failure_marker_path(home: &BaleHome, id: &str) -> PathBuf {
+    home.0.join("restore-failed").join(format!("{id}.txt"))
+}
+
+/// Records why a background restore of `id` failed, for the next prompt or
+/// tool hook to show (see [`take_failure_marker`]). An earlier marker the
+/// user has not seen yet is kept above the new text. Written to a temp file
+/// and renamed, so a reader never sees half of it.
+pub fn write_failure_marker(home: &BaleHome, id: &str, text: &str) -> Result<()> {
+    let path = failure_marker_path(home, id);
+    let dir = path.parent().expect("marker path has a parent");
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut body = fs::read_to_string(&path).unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(text);
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let tmp = dir.join(format!("{id}.txt.tmp{}", std::process::id()));
+    fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))
+}
+
+/// The failure text a background restore of `id` left, removed so it is shown
+/// once. `None` when there is none (one `stat`, so cheap on every hook).
+pub fn take_failure_marker(home: &BaleHome, id: &str) -> Option<String> {
+    let path = failure_marker_path(home, id);
+    let text = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    Some(text)
+}
+
+/// Whether `id` has a stash still to restore, or another process holds its
+/// lock (a stash may be under way and about to move the record). Reads the
+/// record only: no lock is taken and the store is not opened.
+pub fn needs_restore(home: &BaleHome, id: &str) -> Result<bool> {
+    if let Some(record) = Registry::open(home.clone()).get(id)? {
+        let stashed = record.stash.as_ref().is_some_and(|s| !s.restored);
+        if stashed && matches!(record.level, Level::Hot | Level::Baled) {
+            return Ok(true);
+        }
+    }
+    WorkspaceLock::is_held(home, id)
+}
+
 /// The tree's lock stayed held (by a stash or sweep) for the whole wait.
 #[derive(Debug)]
 pub struct LockTimeout {

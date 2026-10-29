@@ -27,9 +27,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
+use bale_core::lock::WorkspaceLock;
 use bale_core::ops::meta::{set_origin, touch};
 use bale_core::ops::new::{new_workspace, workspace_path};
-use bale_core::ops::unstash::{tree_containing, unstash_with, LockTimeout, UnstashOpts};
+use bale_core::ops::unstash::{
+    needs_restore, take_failure_marker, tree_containing, unstash_with, LockTimeout, UnstashOpts,
+};
 use bale_core::ops::up::register;
 use bale_core::registry::Origin;
 use bale_core::BaleHome;
@@ -326,56 +329,164 @@ fn hook_cwd(event: &str) -> Option<PathBuf> {
     }
 }
 
-/// UserPromptSubmit: restores the stashed tree at the payload's `cwd`, then
-/// counts the prompt as activity. Prints nothing on success (stdout would
-/// become model context). Exit 2 blocks the prompt and shows stderr, so a
-/// restore that fails is never silent.
-pub fn prompt(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
+/// UserPromptSubmit: starts restoring the stashed tree at the payload's `cwd`
+/// in a detached `bale unstash --background` and returns without waiting, so
+/// the prompt is not held for the disk writes; the first [`pre_tool`] that
+/// could read build output waits for them. Activity is recorded first and an
+/// in-progress stash is asked to stop. Prints nothing on success (stdout
+/// would become model context). Exit 2 blocks the prompt and shows stderr:
+/// a background restore that failed earlier is reported once that way, so
+/// it is never silent.
+pub fn prompt(home: &BaleHome) -> ExitCode {
     crate::as_hook(Tool::Claude, || {
-        restore_and_touch(home, "prompt", lock_wait_ms)
-    })
-}
-
-/// PreToolUse on Bash: as [`prompt`], for a tree stashed while a permission
-/// prompt waited.
-pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
-    crate::as_hook(Tool::Claude, || {
-        restore_and_touch(home, "pre-tool", lock_wait_ms)
-    })
-}
-
-fn restore_and_touch(home: &BaleHome, event: &str, lock_wait_ms: Option<u64>) -> ExitCode {
-    let Some(cwd) = hook_cwd(event) else {
-        return ExitCode::SUCCESS;
-    };
-    let opts = UnstashOpts {
-        lock_wait: lock_wait_ms.map(Duration::from_millis),
-        ..UnstashOpts::default()
-    };
-    let tree = match tree_containing(home, &cwd) {
-        Ok(Some(tree)) => tree,
-        Ok(None) => return ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("bale: {e:#}");
+        let Some(cwd) = hook_cwd("prompt") else {
+            return ExitCode::SUCCESS;
+        };
+        let (path, id) = match tree_containing(home, &cwd) {
+            Ok(Some(tree)) => tree,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("bale: {e:#}");
+                return ExitCode::from(2);
+            }
+        };
+        if report_failure(home, &path, &id) {
             return ExitCode::from(2);
         }
-    };
-    let (path, id) = tree;
-    if let Err(e) = unstash_with(home, &id, &opts) {
-        if e.downcast_ref::<LockTimeout>().is_some() {
+        let pending = match needs_restore(home, &id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("bale: {e:#}");
+                return ExitCode::from(2);
+            }
+        };
+        // Before the restore starts, so a sweep cannot stash the tree again
+        // right after the prompt.
+        if let Err(e) = touch(home, &path) {
+            eprintln!("bale: not recorded as activity: {e:#}");
+        }
+        if !pending {
+            return ExitCode::SUCCESS;
+        }
+        if let Err(e) = WorkspaceLock::request(home, &id) {
             eprintln!(
-                "bale: still busy with {}; resend the prompt in a moment",
+                "bale: could not ask the holder of {} to stop: {e:#}",
                 display_path(&path)
             );
-        } else {
-            eprintln!("bale: could not restore {}: {e:#}", display_path(&path));
         }
-        return ExitCode::from(2);
+        if let Err(e) = spawn_background_unstash(&id) {
+            // Nothing detached to wait for: restore here, as pre-tool does.
+            eprintln!("bale: could not start a background restore ({e}); restoring now");
+            return restore(home, &path, &id, &UnstashOpts::default());
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// PreToolUse (every tool, since MCP build tools read build output too):
+/// waits for the tree's restore, the background one a prompt started or its
+/// own if it gets there first, then counts the call as activity. A tree that
+/// is not stashed costs a registry scan and a record read: no lock is taken
+/// and the store is not opened.
+pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
+    crate::as_hook(Tool::Claude, || {
+        let Some(cwd) = hook_cwd("pre-tool") else {
+            return ExitCode::SUCCESS;
+        };
+        let (path, id) = match tree_containing(home, &cwd) {
+            Ok(Some(tree)) => tree,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("bale: {e:#}");
+                return ExitCode::from(2);
+            }
+        };
+        if report_failure(home, &path, &id) {
+            return ExitCode::from(2);
+        }
+        match needs_restore(home, &id) {
+            Ok(false) => {}
+            Ok(true) => {
+                let opts = UnstashOpts {
+                    lock_wait: lock_wait_ms.map(Duration::from_millis),
+                    ..UnstashOpts::default()
+                };
+                if restore(home, &path, &id, &opts) != ExitCode::SUCCESS {
+                    return ExitCode::from(2);
+                }
+                // The background run that just finished may have failed.
+                if report_failure(home, &path, &id) {
+                    return ExitCode::from(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("bale: {e:#}");
+                return ExitCode::from(2);
+            }
+        }
+        if let Err(e) = touch(home, &path) {
+            eprintln!("bale: not recorded as activity: {e:#}");
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// Prints and removes the failure a background restore left for the tree;
+/// true when there was one.
+fn report_failure(home: &BaleHome, path: &Path, id: &str) -> bool {
+    let Some(text) = take_failure_marker(home, id) else {
+        return false;
+    };
+    eprintln!(
+        "bale: the background restore of {} failed:\n{}",
+        display_path(path),
+        text.trim_end()
+    );
+    true
+}
+
+/// Restores the tree here and waits for it; the exit code to hook with.
+fn restore(home: &BaleHome, path: &Path, id: &str, opts: &UnstashOpts) -> ExitCode {
+    match unstash_with(home, id, opts) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<LockTimeout>().is_some() => {
+            eprintln!(
+                "bale: still busy with {}; resend the prompt in a moment",
+                display_path(path)
+            );
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("bale: could not restore {}: {e:#}", display_path(path));
+            ExitCode::from(2)
+        }
     }
-    if let Err(e) = touch(home, &path) {
-        eprintln!("bale: not recorded as activity: {e:#}");
+}
+
+/// Starts `bale unstash --background <id>` detached from this hook: no
+/// stdio, and its own process group (a console-less new group on Windows), so
+/// Claude Code ending the hook does not take the restore down with it.
+fn spawn_background_unstash(id: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["unstash", "--background", id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
-    ExitCode::SUCCESS
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    // Not waited for: the hook exits and init reaps it.
+    cmd.spawn().map(drop)
 }
 
 /// Stop: records the turn's end as the tree's last activity. No hashing and
@@ -408,14 +519,9 @@ const HOOKS: [(&str, &str); 5] = [
 ];
 
 /// Seconds Claude Code lets the prompt and pre-tool hooks run: above
-/// unstash's 60 s wait for a tree's lock, so bale's own timeout answers first.
+/// unstash's 60 s wait for a tree's lock, so bale's own timeout answers first
+/// (pre-tool waits for a whole restore; prompt only starts one).
 const RESTORE_TIMEOUT_SECS: u64 = 90;
-
-/// The tool matcher bale's entry for `kind` carries, if any. Only Bash calls
-/// run builds, so only they wait for a restore.
-fn hook_matcher(kind: &str) -> Option<&'static str> {
-    (kind == "pre-tool").then_some("Bash")
-}
 
 /// The `timeout` (seconds) bale's entry for `kind` sets, if any.
 fn hook_timeout(kind: &str) -> Option<u64> {
@@ -518,16 +624,11 @@ fn hook_group(exe: &Path, kind: &str) -> Value {
     if let Some(secs) = hook_timeout(kind) {
         entry["timeout"] = json!(secs);
     }
-    let mut group = Map::new();
-    if let Some(matcher) = hook_matcher(kind) {
-        group.insert("matcher".into(), json!(matcher));
-    }
-    group.insert("hooks".into(), json!([entry]));
-    Value::Object(group)
+    json!({ "hooks": [entry] })
 }
 
 /// Adds bale's entries (WorktreeCreate, WorktreeRemove, UserPromptSubmit,
-/// PreToolUse on Bash, Stop) to
+/// PreToolUse on every tool, Stop) to
 /// Claude Code's user settings.json (see [`settings_location`]), keeping
 /// every other hook. A user WorktreeRemove hook stays and runs in parallel
 /// with bale's, which install notes. A user WorktreeCreate hook
@@ -586,6 +687,23 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
             .with_context(|| format!("hooks.{event} in {} is not an array", path.display()))?;
         let want = hook_command(exe, kind);
         let mut ours = false;
+        // bale's own pre-tool group used to match only Bash; it matches every
+        // tool now. A group holding anything else is the user's.
+        if kind == "pre-tool" {
+            for g in groups.iter_mut() {
+                let ours_alone = g["matcher"] == "Bash"
+                    && g["hooks"].as_array().is_some_and(|hs| {
+                        hs.len() == 1
+                            && hs[0]["command"]
+                                .as_str()
+                                .is_some_and(|c| bale_hook_path(c, kind).is_some())
+                    });
+                if ours_alone {
+                    g.as_object_mut().map(|o| o.remove("matcher"));
+                    changed = true;
+                }
+            }
+        }
         for h in groups
             .iter_mut()
             .filter_map(|g| g["hooks"].as_array_mut())

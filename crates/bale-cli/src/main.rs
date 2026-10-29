@@ -13,7 +13,7 @@ use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::stash::{stash, StashOutcome};
 use bale_core::ops::sweep::{sweep, Action};
-use bale_core::ops::unstash::{unstash, UnstashReport};
+use bale_core::ops::unstash::{unstash, write_failure_marker, UnstashReport};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
 use bale_core::par::par_map;
 use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
@@ -55,6 +55,11 @@ enum Command {
     Unstash {
         /// Worktree path or workspace id.
         target: String,
+        /// Run for the prompt hook: `target` is the workspace id, nothing is
+        /// printed, and a failure is left as a marker for the next hook to
+        /// report instead of an exit code.
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Restore a cold worktree at its path, then remove its saved state.
     Open {
@@ -215,14 +220,12 @@ enum ClaudeHook {
     Create,
     /// WorktreeRemove: JSON on stdin, colds the worktree.
     Remove,
-    /// UserPromptSubmit: JSON on stdin, restores the stashed tree at its cwd.
-    Prompt {
-        /// Milliseconds to wait for the tree's lock; default 60000.
-        #[arg(long, hide = true, value_name = "MS")]
-        lock_wait_ms: Option<u64>,
-    },
-    /// PreToolUse (Bash): JSON on stdin, restores the stashed tree at its cwd.
+    /// UserPromptSubmit: JSON on stdin, starts restoring the stashed tree at
+    /// its cwd in the background.
+    Prompt,
+    /// PreToolUse (any tool): JSON on stdin, waits for the tree's restore.
     PreTool {
+        /// Milliseconds to wait for the tree's lock; default 60000.
         #[arg(long, hide = true, value_name = "MS")]
         lock_wait_ms: Option<u64>,
     },
@@ -301,7 +304,11 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
                 println!("{}", stash_line(&outcome));
                 ExitCode::SUCCESS
             }),
-        Command::Unstash { target } => resolve(&home, &target)
+        Command::Unstash {
+            target,
+            background: true,
+        } => Ok(unstash_background(&home, &target)),
+        Command::Unstash { target, .. } => resolve(&home, &target)
             .and_then(|id| unstash(&home, &id))
             .map(|report| {
                 println!("{}", unstash_line(report.as_ref()));
@@ -359,8 +366,8 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
                 event: ClaudeHook::Remove,
             } => bale_hooks::claude::remove(&home),
             HookKind::Claude {
-                event: ClaudeHook::Prompt { lock_wait_ms },
-            } => Ok(bale_hooks::claude::prompt(&home, lock_wait_ms)),
+                event: ClaudeHook::Prompt,
+            } => Ok(bale_hooks::claude::prompt(&home)),
             HookKind::Claude {
                 event: ClaudeHook::PreTool { lock_wait_ms },
             } => Ok(bale_hooks::claude::pre_tool(&home, lock_wait_ms)),
@@ -435,6 +442,25 @@ fn stash_line(outcome: &StashOutcome) -> String {
         }
         StashOutcome::Skipped(reason) => format!("not stashed: {reason}"),
     }
+}
+
+/// `bale unstash --background <id>`, as the prompt hook starts it: restores,
+/// and on any error leaves the text for the next hook (see
+/// `bale_core::ops::unstash::write_failure_marker`). Silent and always exit 0;
+/// nobody is reading its stdio.
+fn unstash_background(home: &BaleHome, id: &str) -> ExitCode {
+    if let Err(e) = unstash(home, id) {
+        if let Err(w) = write_failure_marker(home, id, &format!("{e:#}")) {
+            eprintln!("bale: could not record the restore failure: {w:#}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    // A stash the prompt interrupted may have swallowed the prompt's own
+    // activity record; the tree is in use, so say so again.
+    if let Ok(Some(record)) = Registry::open(home.clone()).get(id) {
+        let _ = bale_core::ops::meta::touch(home, &record.path);
+    }
+    ExitCode::SUCCESS
 }
 
 /// The one line `bale unstash` prints.
