@@ -96,6 +96,16 @@ pub fn collect_with(
 
     let mut freed = 0;
     for b in blobs.iter().filter(|b| !keep.contains(&b.hash)) {
+        // A stash may have reused this blob (or patched against it) since
+        // the scan; `put` refreshes its mtime, so look again just before
+        // removing. This narrows the race to the stat; a blob lost in it
+        // restores as a stub the build regenerates.
+        let now = SystemTime::now();
+        if is_young(&store.json_path(&b.hash), now, opts.grace)
+            || is_young(&store.zst_path(&b.hash), now, opts.grace)
+        {
+            continue;
+        }
         freed += if dry_run {
             file_len(&store.json_path(&b.hash))? + file_len(&store.zst_path(&b.hash))?
         } else {
