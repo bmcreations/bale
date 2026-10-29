@@ -56,7 +56,7 @@ impl StashManifest {
 }
 
 impl Store {
-    fn manifest_path(&self, c: &str) -> Result<PathBuf> {
+    pub(super) fn manifest_path(&self, c: &str) -> Result<PathBuf> {
         if !is_hash(c) {
             bail!("not a sha256 hex digest: {c:?}");
         }

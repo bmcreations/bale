@@ -484,6 +484,12 @@ fn gc_lines(report: &GcReport, dry_run: bool) -> Vec<(bool, String)> {
     for (id, err) in &report.errors {
         lines.push((true, format!("bale: {id}: {}", action_cell(err))));
     }
+    if report.store_bytes_freed > 0 {
+        lines.push((
+            false,
+            format!("store: {} bytes {would}freed", report.store_bytes_freed),
+        ));
+    }
     lines
 }
 
@@ -947,6 +953,7 @@ mod tests {
             cleaned: vec!["b".into()],
             checks: vec![("d".into(), PathBuf::from("/w/.bale-check-d-a1B2c3"))],
             errors: vec![("c".into(), "boom\nmore".into())],
+            store_bytes_freed: 2048,
         };
         assert_eq!(
             gc_lines(&report, false),
@@ -959,6 +966,7 @@ mod tests {
                     "d: check dir /w/.bale-check-d-a1B2c3 removed".to_string()
                 ),
                 (true, "bale: c: boom more".to_string()),
+                (false, "store: 2048 bytes freed".to_string()),
             ]
         );
         assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");

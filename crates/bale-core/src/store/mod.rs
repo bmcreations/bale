@@ -2,6 +2,7 @@
 
 pub mod blob;
 pub mod codec;
+pub mod gc;
 pub mod index;
 pub mod manifest;
 

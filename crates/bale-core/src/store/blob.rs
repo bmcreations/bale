@@ -94,11 +94,11 @@ impl Store {
         self.root.join("objects").join(&hash[..2])
     }
 
-    fn zst_path(&self, hash: &str) -> PathBuf {
+    pub(super) fn zst_path(&self, hash: &str) -> PathBuf {
         self.dir_for(hash).join(format!("{hash}.zst"))
     }
 
-    fn json_path(&self, hash: &str) -> PathBuf {
+    pub(super) fn json_path(&self, hash: &str) -> PathBuf {
         self.dir_for(hash).join(format!("{hash}.json"))
     }
 
@@ -133,6 +133,8 @@ impl Store {
     ) -> Result<BlobMeta> {
         Self::check(hash)?;
         if self.has(hash) {
+            // Reused, so it must outlast any GC grace window a stash relies on.
+            self.touch(hash)?;
             return self.meta(hash);
         }
         let size = fs::metadata(src)
@@ -144,6 +146,7 @@ impl Store {
         if let Some(b) = base.filter(|b| self.has(b)) {
             let m = self.meta(b)?;
             if m.depth < max_depth && m.size <= PATCH_MAX_BYTES && size <= PATCH_MAX_BYTES {
+                self.touch(b)?;
                 base_bytes = Some(self.read(b)?);
                 base_meta = Some(m);
             }
@@ -202,6 +205,17 @@ impl Store {
         // Make both renames durable before anyone relies on the blob.
         File::open(&dir).and_then(|d| d.sync_all()).ok();
         Ok(meta)
+    }
+
+    /// Sets the mtime of the blob's files to now, so GC's grace period counts
+    /// from the last time a stash used it.
+    fn touch(&self, hash: &Hash) -> Result<()> {
+        let now = filetime::FileTime::now();
+        for path in [self.zst_path(hash), self.json_path(hash)] {
+            filetime::set_file_mtime(&path, now)
+                .with_context(|| format!("refresh mtime of {}", path.display()))?;
+        }
+        Ok(())
     }
 
     /// The full content of `hash`, base chain resolved and checksum verified.
