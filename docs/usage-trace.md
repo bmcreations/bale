@@ -13,12 +13,15 @@ replay it later. It records:
   checkout and its build output take on disk, the space of Xcode's shared
   DerivedData built from it (`global_dd_bytes`, which `bale up` also
   removes on macOS), and what sweep decided;
-- each operation (`new`, `adopt`, `up`, `cold`, `open`, `gc`): its outcome,
+- each operation (`new`, `adopt`, `up`, `cold`, `open`, `gc`, `touch`): its outcome,
   a fixed reason code when it did not succeed, how long it took, what
   started it (`cli`, `sweep` or a tool's hook), and for `up` and `cold` the
   free space gained. A `cold` run by a tool's remove or archive hook also
   carries `"intent": "remove"`, and a tree that was already gone is
-  recorded with outcome `missing`;
+  recorded with outcome `missing`. A `touch` is a tool reporting that a
+  turn of work in a tree ended (T3 Code's settle script); it only moves the
+  tree's last activity to now, and is `skipped` with reason `locked` when
+  another bale process holds the tree;
 - each Xcode build found in a tree's DerivedData build log manifest: start,
   stop, duration, error count and title, once per build. Manifests are
   read on every sweep and by `bale up` and `bale cold` before they remove

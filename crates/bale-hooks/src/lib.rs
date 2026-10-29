@@ -21,6 +21,7 @@ pub mod cursor;
 pub mod git;
 pub mod install;
 pub mod proc;
+pub mod t3;
 
 use install::Plan;
 
@@ -49,6 +50,18 @@ pub(crate) fn claude_home(home_dir: &Path) -> PathBuf {
     }
 }
 
+/// T3 Code's base dir: `T3CODE_HOME` when set (trimmed, a leading `~`
+/// meaning `home_dir`), else `<home_dir>/.t3`, as T3 Code resolves it.
+pub(crate) fn t3_home(home_dir: &Path) -> PathBuf {
+    let set = std::env::var("T3CODE_HOME").ok();
+    match set.as_deref().map(str::trim) {
+        Some("~") => home_dir.to_path_buf(),
+        Some(dir) if dir.starts_with("~/") || dir.starts_with("~\\") => home_dir.join(&dir[2..]),
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home_dir.join(".t3"),
+    }
+}
+
 /// A tool bale hooks into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -57,6 +70,7 @@ pub enum Tool {
     Conductor,
     Cursor,
     Codex,
+    T3,
 }
 
 impl Tool {
@@ -69,6 +83,8 @@ impl Tool {
             Tool::Conductor => &["Conductor"],
             Tool::Cursor => &["Cursor", "Cursor Helper"],
             Tool::Codex => &["codex", "Codex"],
+            // T3 Code has no remove hook; nothing walks up from its scripts.
+            Tool::T3 => &[],
         }
     }
 
@@ -80,15 +96,17 @@ impl Tool {
             Tool::Conductor => "conductor",
             Tool::Cursor => "cursor",
             Tool::Codex => "codex",
+            Tool::T3 => "t3",
         }
     }
 
-    const ALL: [Tool; 5] = [
+    const ALL: [Tool; 6] = [
         Tool::Claude,
         Tool::Git,
         Tool::Conductor,
         Tool::Cursor,
         Tool::Codex,
+        Tool::T3,
     ];
 
     /// The tool's name in messages.
@@ -99,6 +117,7 @@ impl Tool {
             Tool::Conductor => "Conductor",
             Tool::Cursor => "Cursor",
             Tool::Codex => "Codex",
+            Tool::T3 => "T3 Code",
         }
     }
 }
@@ -117,8 +136,8 @@ impl FromStr for Tool {
     }
 }
 
-/// The plan that hooks `tool` up to bale at `exe`. Claude Code's settings
-/// live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
+/// The plan that hooks `tool` up to bale at `exe`. Claude Code's and T3
+/// Code's settings live under `home`; git, Conductor and Cursor keep theirs in `repo`, which
 /// they require; Codex needs neither. A JSON config bale reformats is first
 /// backed up in `backups` (`$BALE_HOME/backups`).
 pub fn install_plan<'a>(
@@ -137,6 +156,18 @@ pub fn install_plan<'a>(
         Tool::Conductor => conductor::install_plan(need(repo)?, exe, backups),
         Tool::Cursor => cursor::install_plan(need(repo)?, exe, backups),
         Tool::Codex => codex::install_plan(exe),
+        Tool::T3 => {
+            let mut plan = t3::install_plan(&t3_home(home), exe, backups)?;
+            if std::env::var_os("T3CODE_HOME").is_none_or(|v| v.is_empty()) {
+                plan.extend(Plan::new(vec![install::Step::Note(
+                    "note: T3CODE_HOME is not set here, so this is ~/.t3. T3 Code can run \
+                     with another base dir (`echo $T3CODE_HOME` in a T3 Code terminal shows \
+                     it); if so, uninstall this and rerun with T3CODE_HOME set to that dir"
+                        .to_string(),
+                )]));
+            }
+            Ok(plan)
+        }
     }
 }
 
@@ -158,6 +189,7 @@ pub fn uninstall_plan(
         Tool::Conductor => conductor::uninstall_plan(&need(repo)?, backups),
         Tool::Cursor => cursor::uninstall_plan(&need(repo)?, backups),
         Tool::Codex => Ok(codex::uninstall_plan()),
+        Tool::T3 => t3::uninstall_plan(&t3_home(home), backups),
     }
 }
 

@@ -60,7 +60,10 @@ impl Env {
             .env_remove("CONDUCTOR_WORKSPACE_PATH")
             .env_remove("CONDUCTOR_ROOT_PATH")
             .env_remove("CONDUCTOR_WORKSPACE_NAME")
-            .env_remove("CLAUDE_CONFIG_DIR");
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("T3CODE_HOME")
+            .env_remove("T3CODE_WORKTREE_PATH")
+            .env_remove("T3CODE_PROJECT_ROOT");
     }
 
     /// `bale` with extra environment variables, set after isolation.
@@ -1434,6 +1437,152 @@ fn conductor_setup_outside_worktree_exits_0() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stderr(&out).contains("bale"), "{}", stderr(&out));
     assert!(env.registered().is_empty());
+}
+
+const T3_WT: &str = "T3CODE_WORKTREE_PATH";
+
+/// The `bale ls --json` row for the tree at `path`.
+fn ls_json_row(env: &Env, path: &Path) -> Value {
+    let out = env.bale(&env.repo, &["ls", "--json"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rows: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let want = canon(path);
+    rows.into_iter()
+        .find(|r| canon(Path::new(r["path"].as_str().unwrap())) == want)
+        .unwrap_or_else(|| panic!("{} is not registered", path.display()))
+}
+
+/// The trace's `touch` op lines.
+fn touch_lines(env: &Env) -> Vec<Value> {
+    trace_lines(env)
+        .into_iter()
+        .filter(|l| l["kind"] == "op" && l["op"] == "touch")
+        .collect()
+}
+
+#[test]
+fn t3_setup_registers_from_env_quietly() {
+    let env = Env::new();
+    let wt = env.add_worktree("t3-env");
+    let out = env.bale_env(&env.repo, &["hook", "t3", "setup"], &[(T3_WT, &wt)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(ls_json_row(&env, &wt)["origin"]["tool"], "t3");
+}
+
+#[test]
+fn t3_setup_registers_the_cwd() {
+    let env = Env::new();
+    let wt = env.add_worktree("t3-cwd");
+    let out = env.bale(&wt, &["hook", "t3", "setup"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(ls_json_row(&env, &wt)["origin"]["tool"], "t3");
+}
+
+#[test]
+fn t3_setup_outside_worktree_exits_0() {
+    let env = Env::new();
+    let outside = env.tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let out = env.bale(&outside, &["hook", "t3", "setup"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("bale"), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+}
+
+/// settle moves last_activity and traces a touch, leaving the tree hot with
+/// its build output.
+#[test]
+fn t3_settle_touches_a_tracked_tree_and_keeps_it_hot() {
+    let env = Env::new();
+    let wt = env.add_worktree("t3-settle");
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::write(wt.join("build/out.o"), "x").unwrap();
+    let out = env.bale(&wt, &["hook", "t3", "setup"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = ls_json_row(&env, &wt);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let out = env.bale_env(&env.repo, &["hook", "t3", "settle"], &[(T3_WT, &wt)]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!((stdout(&out).as_str(), stderr(&out).as_str()), ("", ""));
+    let after = ls_json_row(&env, &wt);
+    assert_ne!(after["last_activity"], before["last_activity"]);
+    assert_eq!(after["level"], before["level"]);
+    assert!(wt.join("build/out.o").exists());
+    let touches = touch_lines(&env);
+    assert_eq!(touches.len(), 1, "{touches:?}");
+    assert_eq!(touches[0]["trigger"], "hook:t3");
+    assert_eq!(touches[0]["outcome"], "ok");
+    assert_eq!(touches[0]["id"], before["id"]);
+}
+
+/// A tree T3 Code made before bale's setup script ran is registered on its
+/// first settle.
+#[test]
+fn t3_settle_registers_an_untracked_tree() {
+    let env = Env::new();
+    let wt = env.add_worktree("t3-late");
+    let out = env.bale(&wt, &["hook", "t3", "settle"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(ls_json_row(&env, &wt)["origin"]["tool"], "t3");
+    assert_eq!(touch_lines(&env).len(), 1);
+}
+
+#[test]
+fn t3_settle_outside_worktree_exits_0() {
+    let env = Env::new();
+    let outside = env.tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let out = env.bale(&outside, &["hook", "t3", "settle"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(env.registered().is_empty());
+    assert!(touch_lines(&env).is_empty());
+}
+
+/// install and uninstall edit `~/.t3/userdata/settings.json`, or the one
+/// under T3CODE_HOME, keeping the user's other settings; --print-only
+/// writes nothing.
+#[test]
+fn t3_install_and_uninstall_round_trip() {
+    let env = Env::new();
+    let original = "{\n  \"projectSettingsFolded\": true,\n  \"theme\": \"dark\"\n}\n";
+    for t3_home in [None, Some(env.tmp.path().join("t3 home"))] {
+        let base = t3_home.clone().unwrap_or_else(|| env.home().join(".t3"));
+        let path = base.join("userdata").join("settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, original).unwrap();
+        let vars: Vec<(&str, &Path)> = t3_home
+            .as_deref()
+            .map(|h| vec![("T3CODE_HOME", h)])
+            .unwrap_or_default();
+        let run = |args: &[&str]| {
+            let out = env.bale_env(&env.repo, args, &vars);
+            assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+            out
+        };
+        let out = run(&["install", "--hooks", "t3", "--print-only"]);
+        assert!(stdout(&out).contains("hook t3 settle"), "{}", stdout(&out));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        run(&["install", "--hooks", "t3"]);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        let ids: Vec<&str> = v["defaultProjectScripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["bale-setup", "bale-settle"]);
+        let out = run(&["install", "--hooks", "t3"]);
+        assert!(
+            stdout(&out).contains("already installed"),
+            "{}",
+            stdout(&out)
+        );
+        run(&["uninstall", "--hooks", "t3"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
 }
 
 #[test]
