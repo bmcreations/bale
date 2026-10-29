@@ -105,3 +105,31 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
     }
     out
 }
+
+/// The dirs whose large files `stash` may replace with empty stubs: a subset
+/// of [`regenerable_dirs`] holding only what the build treats as its own
+/// output, since a build that reads an empty input builds the wrong thing
+/// rather than failing. For Xcode that is `Build/` inside each DerivedData
+/// root (not `SourcePackages/` or the module caches, which hold inputs); for
+/// Gradle each `build/` dir (not `.gradle/`, `.kotlin/` or `.cxx/`).
+/// `regenerable_extra` dirs are left out: bale can't tell what they hold.
+/// Symlinked dirs are left out too.
+pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
+    let gradle = systems.contains(&BuildSystem::Gradle);
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let mut out = Vec::new();
+    for dir in regenerable_dirs(root, systems, cfg) {
+        if !real_dir(&dir) {
+            continue;
+        }
+        if is_derived_data_root(&dir) {
+            let build = dir.join("Build");
+            if real_dir(&build) {
+                out.push(build);
+            }
+        } else if gradle && dir.file_name().is_some_and(|n| n == "build") {
+            out.push(dir);
+        }
+    }
+    out
+}

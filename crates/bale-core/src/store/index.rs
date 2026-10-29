@@ -103,6 +103,16 @@ impl Index {
         Ok(hash)
     }
 
+    /// The entry for `rel`, if any. With [`Index::insert`], lets callers
+    /// hash outside a shared lock: look up, hash if the stat differs, insert.
+    pub fn get(&self, rel: &Path) -> Option<&IndexEntry> {
+        self.entries.get(rel)
+    }
+
+    pub fn insert(&mut self, rel: PathBuf, entry: IndexEntry) {
+        self.entries.insert(rel, entry);
+    }
+
     pub fn forget_missing(&mut self, keep: &BTreeSet<PathBuf>) {
         self.entries.retain(|p, _| keep.contains(p));
     }
