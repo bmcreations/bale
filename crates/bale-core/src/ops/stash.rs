@@ -564,7 +564,7 @@ fn stub(path: &Path, e: &Entry) -> Stub {
 
 /// Sets `mode`'s permission bits, plus the owner write bit if `writable`.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let bits = mode & 0o7777;
     let bits = if writable { bits | 0o200 } else { bits };
@@ -572,30 +572,30 @@ fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32, writable: bool) -> std::io::Result<()> {
     let mut p = fs::metadata(path)?.permissions();
     p.set_readonly(!writable && mode & 0o200 == 0);
     fs::set_permissions(path, p)
 }
 
 #[cfg(unix)]
-fn owner_writable(meta: &fs::Metadata) -> bool {
+pub(crate) fn owner_writable(meta: &fs::Metadata) -> bool {
     mode_of(meta) & 0o200 != 0
 }
 
 #[cfg(not(unix))]
-fn owner_writable(meta: &fs::Metadata) -> bool {
+pub(crate) fn owner_writable(meta: &fs::Metadata) -> bool {
     !meta.permissions().readonly()
 }
 
 #[cfg(unix)]
-fn mode_of(meta: &fs::Metadata) -> u32 {
+pub(crate) fn mode_of(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     meta.mode()
 }
 
 #[cfg(not(unix))]
-fn mode_of(meta: &fs::Metadata) -> u32 {
+pub(crate) fn mode_of(meta: &fs::Metadata) -> u32 {
     if meta.permissions().readonly() {
         0o444
     } else {
