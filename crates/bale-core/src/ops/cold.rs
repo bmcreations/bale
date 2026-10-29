@@ -468,6 +468,8 @@ fn finish(
     }
     // A failed removal leaves the record `Cooling`; the next run finishes it.
     remove_trash(&trash)?;
+    // The build dirs are gone; the blobs are left to GC.
+    record.stash = None;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))
@@ -714,6 +716,8 @@ fn recover(
         }
         remove_trash(&trash)?;
     }
+    // The build dirs are gone; the blobs are left to GC.
+    record.stash = None;
     record.level = Level::Cold;
     registry.put(&record)?;
     Ok(Outcome::Done(Level::Cold))

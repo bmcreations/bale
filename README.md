@@ -17,7 +17,7 @@ The binary is `target/release/bale`. `bale <command> --help` lists the exact fla
 
 ## Install and uninstall
 
-`bale install` with no flags installs the sweep schedule: `bale sweep` every 30 minutes, through launchd,
+`bale install` with no flags installs the sweep schedule: `bale sweep` every 5 minutes through launchd on macOS, or every 30 minutes through
 a systemd user timer or Task Scheduler. It does not touch any tool's configuration.
 
 `bale install --hooks <LIST>` installs only the hooks of the tools in the comma-separated list, and not the

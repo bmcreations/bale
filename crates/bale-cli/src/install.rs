@@ -341,7 +341,7 @@ fn launchd_plist(exe: &str, log: &str, env: &[(&str, String)]) -> String {
     <string>sweep</string>
   </array>
   <key>StartInterval</key>
-  <integer>1800</integer>
+  <integer>300</integer>
   <key>StandardOutPath</key>
   <string>{}</string>
   <key>StandardErrorPath</key>

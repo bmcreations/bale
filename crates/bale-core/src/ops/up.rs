@@ -355,6 +355,9 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
         }
     }
 
+    // The stubs went with the dirs; a later unstash must not refill them.
+    // The blobs are left to GC.
+    record.stash = None;
     record.level = Level::Baled;
     registry.put(&record)?;
     Ok(UpReport {

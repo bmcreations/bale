@@ -387,3 +387,289 @@ fn up_error_in_one_workspace_does_not_stop_the_next() {
     assert_eq!(level(&fx, &good_id), Level::Baled);
     assert!(!good.join("app/build").exists());
 }
+
+// ---- stash policy ----
+
+mod warm {
+    use super::*;
+    use bale_core::config::Config;
+    use bale_core::ops::cold::cold;
+    use bale_core::ops::stash::{stash, StashOutcome};
+    use bale_core::ops::sweep::decide;
+    use bale_core::ops::unstash::unstash;
+    use bale_core::ops::up::up;
+    use std::time::Duration;
+    use support::write_plist;
+
+    const MIB: usize = 1 << 20;
+    const BIG: &str = ".dd/Build/Products/Debug/a.bin";
+
+    fn cfg() -> Config {
+        Config {
+            idle_baled: Duration::from_secs(4 * 3600),
+            idle_cold: Duration::from_secs(7 * 86400),
+            idle_stash: Duration::from_secs(600),
+            stash_min_bytes: 1 << 20,
+            patch_max_depth: 4,
+            regenerable_extra: Vec::new(),
+            ignored_denylist_extra: Vec::new(),
+            worktree_root: None,
+        }
+    }
+
+    fn mins(n: u64) -> Duration {
+        Duration::from_secs(n * 60)
+    }
+
+    fn hours(n: u64) -> Duration {
+        Duration::from_secs(n * 3600)
+    }
+
+    #[test]
+    fn decide_stashes_after_idle_stash() {
+        for level in [Level::Hot, Level::Baled] {
+            assert_eq!(
+                decide(level, mins(11), false, false, false, &cfg()),
+                Action::Stash
+            );
+            assert_eq!(
+                decide(level, mins(9), false, false, false, &cfg()),
+                Action::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn decide_ups_a_stashed_tree_at_idle_baled() {
+        assert_eq!(
+            decide(Level::Hot, hours(5), false, true, true, &cfg()),
+            Action::Up
+        );
+        // Already stashed: nothing more to do until up is due.
+        assert_eq!(
+            decide(Level::Hot, mins(30), false, true, true, &cfg()),
+            Action::Keep
+        );
+    }
+
+    #[test]
+    fn decide_up_beats_stash() {
+        assert_eq!(
+            decide(Level::Hot, hours(5), false, true, false, &cfg()),
+            Action::Up
+        );
+    }
+
+    #[test]
+    fn decide_cold_beats_stash() {
+        assert_eq!(
+            decide(
+                Level::Hot,
+                Duration::from_secs(8 * 86400),
+                false,
+                true,
+                false,
+                &cfg()
+            ),
+            Action::Cold
+        );
+    }
+
+    /// An Xcode worktree whose ignored `.dd` holds one large build file.
+    /// `.gitignore` is committed first, so the tree is clean.
+    fn xcode_worktree(fx: &Fixture) -> PathBuf {
+        fs::write(fx.repo.join(".gitignore"), ".dd/\n").unwrap();
+        git(&fx.repo, &["add", ".gitignore"]);
+        git(&fx.repo, &["commit", "-m", "ignore"]);
+        let wt = fx.add_worktree("wt", "feature");
+        fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+        write_plist(&wt.join(".dd"), Some(&wt.join("App.xcodeproj")));
+        let p = wt.join(BIG);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let bytes: Vec<u8> = (0..2 * MIB)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        fs::write(p, bytes).unwrap();
+        wt
+    }
+
+    fn stashed_tree() -> (Fixture, PathBuf, String) {
+        let fx = Fixture::new();
+        let wt = xcode_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        let out = stash(&fx.home(), &id, &[]).unwrap();
+        assert!(matches!(out, StashOutcome::Stashed(_)), "{out:?}");
+        assert_eq!(fs::metadata(wt.join(BIG)).unwrap().len(), 0);
+        (fx, wt, id)
+    }
+
+    fn record(fx: &Fixture, id: &str) -> bale_core::registry::Record {
+        Registry::open(fx.home()).get(id).unwrap().unwrap()
+    }
+
+    fn mark_restoring(fx: &Fixture, id: &str) {
+        let reg = Registry::open(fx.home());
+        let mut rec = reg.get(id).unwrap().unwrap();
+        rec.stash.as_mut().unwrap().restoring = true;
+        reg.put(&rec).unwrap();
+    }
+
+    fn trace_lines(home: &BaleHome, kind: &str) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(home.trace_dir()).into_iter().flatten() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            for line in fs::read_to_string(path).unwrap().lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                if v["kind"] == kind {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sweep_up_clears_stash() {
+        let (fx, wt, id) = stashed_tree();
+        global_config(&fx.home(), "idle_baled_hours = 0\n");
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Up, "{rows:?}");
+        assert!(!wt.join(".dd").exists());
+        assert!(record(&fx, &id).stash.is_none());
+    }
+
+    #[test]
+    fn sweep_cold_clears_stash() {
+        let (fx, wt, id) = stashed_tree();
+        global_config(&fx.home(), "idle_baled_hours = 0\nidle_cold_days = 0\n");
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Cold, "{rows:?}");
+        assert!(!wt.exists());
+        assert!(record(&fx, &id).stash.is_none());
+    }
+
+    #[test]
+    fn manual_up_clears_stash_and_unstash_is_a_noop() {
+        let (fx, wt, id) = stashed_tree();
+        up(&fx.home(), &id).unwrap();
+        assert!(!wt.join(".dd").exists());
+        assert!(record(&fx, &id).stash.is_none());
+        assert!(unstash(&fx.home(), &id).unwrap().is_none());
+        assert!(!wt.join(".dd").exists(), "unstash must not recreate dirs");
+    }
+
+    #[test]
+    fn manual_up_clears_a_stash_that_is_restoring() {
+        let (fx, wt, id) = stashed_tree();
+        mark_restoring(&fx, &id);
+        up(&fx.home(), &id).unwrap();
+        assert!(!wt.join(".dd").exists());
+        assert!(record(&fx, &id).stash.is_none());
+        assert!(unstash(&fx.home(), &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn manual_cold_clears_stash() {
+        let (fx, wt, id) = stashed_tree();
+        cold(&fx.home(), &id).unwrap();
+        assert!(!wt.exists());
+        assert_eq!(level(&fx, &id), Level::Cold);
+        assert!(record(&fx, &id).stash.is_none());
+    }
+
+    #[test]
+    fn manual_cold_clears_a_stash_that_is_restoring() {
+        let (fx, wt, id) = stashed_tree();
+        mark_restoring(&fx, &id);
+        cold(&fx.home(), &id).unwrap();
+        assert!(!wt.exists());
+        assert!(record(&fx, &id).stash.is_none());
+    }
+
+    #[test]
+    fn unstash_ignores_a_cold_tree_with_a_leftover_stash() {
+        let (fx, _wt, id) = stashed_tree();
+        let reg = Registry::open(fx.home());
+        let mut rec = reg.get(&id).unwrap().unwrap();
+        rec.level = Level::Cold;
+        reg.put(&rec).unwrap();
+        assert!(unstash(&fx.home(), &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn sweep_stashes_and_traces() {
+        let fx = Fixture::new();
+        let wt = xcode_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        global_config(&fx.home(), "idle_stash_minutes = 0\n");
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Stash, "{rows:?}");
+        assert_eq!(fs::metadata(wt.join(BIG)).unwrap().len(), 0);
+        assert!(record(&fx, &id).stash.is_some());
+
+        let lines = trace_lines(&fx.home(), "stash");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], id.as_str());
+        assert_eq!(lines[0]["files"], 1);
+        assert_eq!(lines[0]["bytes"], 2 * MIB as u64);
+        assert!(lines[0]["stored_bytes"].as_u64().unwrap() > 0);
+        assert!(lines[0]["secs"].is_number());
+        let trees = trace_lines(&fx.home(), "tree");
+        assert_eq!(trees[0]["action"], "stash");
+
+        // Stashed now: the next sweep leaves it alone.
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Keep, "{rows:?}");
+        assert_eq!(trace_lines(&fx.home(), "stash").len(), 1);
+    }
+
+    #[test]
+    fn restored_tree_is_stashed_again() {
+        let fx = Fixture::new();
+        let wt = xcode_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        global_config(&fx.home(), "idle_stash_minutes = 0\n");
+        sweep(&fx.home(), false).unwrap();
+        let restored = unstash(&fx.home(), &id).unwrap().unwrap();
+        assert_eq!(restored.files, 1);
+        assert_eq!(trace_lines(&fx.home(), "unstash").len(), 1);
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Stash, "{rows:?}");
+        assert_eq!(fs::metadata(wt.join(BIG)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn skipped_stash_is_not_an_error_and_is_traced_with_a_reason() {
+        let fx = Fixture::new();
+        let wt = xcode_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        // Nothing reaches the size floor.
+        global_config(
+            &fx.home(),
+            "idle_stash_minutes = 0\nstash_min_bytes = 1073741824\n",
+        );
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        let (_, action, result) = row(&rows, &id);
+        assert_eq!(*action, Action::Stash);
+        assert!(result.starts_with("skipped: "), "{result}");
+        assert_eq!(fs::metadata(wt.join(BIG)).unwrap().len(), (2 * MIB) as u64);
+        let trees = trace_lines(&fx.home(), "tree");
+        assert_eq!(trees[0]["action"], "stash");
+        assert!(trees[0]["reason"].is_string(), "{trees:?}");
+        assert!(trace_lines(&fx.home(), "stash").is_empty());
+    }
+}

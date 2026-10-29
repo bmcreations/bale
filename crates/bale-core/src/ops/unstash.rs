@@ -19,7 +19,7 @@ use filetime::{set_file_mtime, FileTime};
 use super::stash::{mode_of, owner_writable, set_mode};
 use crate::lock::WorkspaceLock;
 use crate::par::{par_map, ByteBudget};
-use crate::registry::{Record, Registry};
+use crate::registry::{Level, Record, Registry};
 use crate::store::index::stat_of;
 use crate::store::manifest::{Entry, StashManifest};
 use crate::store::{sha256_file, Store};
@@ -111,6 +111,10 @@ pub fn unstash_with(
     let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
     };
+    // A tree that went cold or is going there has no build dirs to refill.
+    if !matches!(record.level, Level::Hot | Level::Baled) {
+        return Ok(None);
+    }
     let Some(state) = record.stash.clone().filter(|s| !s.restored) else {
         return Ok(None);
     };
@@ -228,6 +232,13 @@ pub fn unstash_with(
         );
     }
     report.secs = start.elapsed().as_secs_f64();
+    let mut f = serde_json::Map::new();
+    f.insert("id".into(), id.into());
+    f.insert("files".into(), report.files.into());
+    f.insert("bytes".into(), report.bytes.into());
+    f.insert("kept_newer".into(), report.kept_newer.into());
+    f.insert("secs".into(), report.secs.into());
+    crate::trace::emit(home, "unstash", f);
     Ok(Some(report))
 }
 

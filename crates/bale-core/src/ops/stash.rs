@@ -80,6 +80,25 @@ pub fn stash_with(
     ignore_pids: &[u32],
     opts: &StashOpts,
 ) -> Result<StashOutcome> {
+    let out = stash_inner(home, id, ignore_pids, opts)?;
+    if let StashOutcome::Stashed(r) = &out {
+        let mut f = serde_json::Map::new();
+        f.insert("id".into(), id.into());
+        f.insert("files".into(), r.files.into());
+        f.insert("bytes".into(), r.bytes.into());
+        f.insert("stored_bytes".into(), r.stored_bytes.into());
+        f.insert("secs".into(), r.secs.into());
+        crate::trace::emit(home, "stash", f);
+    }
+    Ok(out)
+}
+
+fn stash_inner(
+    home: &BaleHome,
+    id: &str,
+    ignore_pids: &[u32],
+    opts: &StashOpts,
+) -> Result<StashOutcome> {
     let start = Instant::now();
     let skip = |s: &str| Ok(StashOutcome::Skipped(s.to_string()));
     let Some(lock) = WorkspaceLock::try_acquire(home, id)? else {

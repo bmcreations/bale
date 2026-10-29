@@ -635,7 +635,7 @@ fn print_only_shows_schedule_and_changes_nothing() {
     }
     if cfg!(target_os = "macos") {
         assert!(text.contains("dev.bale.sweep.plist"), "{text}");
-        assert!(text.contains("<integer>1800</integer>"), "{text}");
+        assert!(text.contains("<integer>300</integer>"), "{text}");
         assert!(text.contains("launchctl bootstrap gui/"), "{text}");
     } else if cfg!(windows) {
         assert!(
