@@ -21,7 +21,7 @@ The binary is `target/release/bale`. `bale <command> --help` lists the exact fla
 a systemd user timer or Task Scheduler. It does not touch any tool's configuration.
 
 `bale install --hooks <LIST>` installs only the hooks of the tools in the comma-separated list, and not the
-schedule. The tools are `claude`, `git`, `conductor`, `cursor` and `codex`. `--repo <REPO>` names the repo
+schedule. The tools are `claude`, `git`, `conductor`, `cursor`, `codex` and `t3`. `--repo <REPO>` names the repo
 whose files to edit; it is required for `git`, `conductor` and `cursor`. `--print-only` prints the files
 and commands without changing anything.
 
@@ -29,7 +29,7 @@ and commands without changing anything.
 bale install --print-only
 bale install --hooks claude
 bale install --hooks git,conductor,cursor --repo ~/dev/myrepo
-bale install --hooks codex
+bale install --hooks codex,t3
 ```
 
 `bale uninstall` takes the same `--hooks`, `--repo` and `--print-only`. Without `--hooks` it removes the
@@ -52,12 +52,13 @@ remove hook, the sweep covers its idle trees.
 | git | Writes `post-checkout` in the repo's hooks dir (honouring `core.hooksPath`). An existing hook is moved to `post-checkout.pre-bale` and called by bale's. | `post-checkout` registers a linked worktree that `git worktree add` just created. | Verified by tests |
 | Conductor | Chains bale after your `setup` script and after your `archive` script in `<repo>/.conductor/settings.toml`. Your scripts and other keys stay. | `setup` registers the workspace. `archive` takes it cold; it exits 3 when something holds the tree and 4 when bale skipped it. | Unverified: not run against Conductor |
 | Cursor | Appends bale's command to the setup command list in `<repo>/.cursor/worktrees.json`. Refuses when the setup entry is a script path. | `setup` registers the worktree. Cursor has no remove hook. | Unverified: not run against Cursor |
+| T3 Code | Adds a `bale-setup` script (run on worktree create) and a `bale-settle` script (run when a thread settles) to `defaultProjectScripts` in `~/.t3/userdata/settings.json` (`$T3CODE_HOME/userdata/settings.json` when that is set). T3 Code runs only the first script with each flag, so when you already have one, bale's call goes in front of its command and your command still runs after it. These defaults reach every project when `projectSettingsFolded` is true in that file; a project with its own scripts or a script override does not run them. | `setup` registers the thread's worktree (`$T3CODE_WORKTREE_PATH`, else the current directory). `settle` records that a turn ended: it moves the tree's last activity to now and writes a `touch` line to the trace, registering the tree first if bale does not track it. It never bales or colds the tree, so the build stays warm between turns; the sweep applies the idle policy from the last turn's end. T3 Code has no remove hook. | Unverified: written from T3 Code's app bundle, not run against T3 Code |
 | Codex | Writes nothing. Prints the command to add to the setup script of your Codex local environment (Codex app Settings). | `setup [<path>]` registers the worktree (default: the current directory). Codex has no remove hook. | Unverified: not run against Codex |
 
 The Conductor and Cursor files usually live in the repo and are committed, so an install changes a file
 your team shares.
 
-"Unverified" means the adapter is written from the tool's documentation and its own tests, and nobody has
+"Unverified" means the adapter is written from the tool's documentation (for T3 Code, its app bundle) and its own tests, and nobody has
 yet created a workspace in the tool and watched the hook run. The process names the Conductor archive path
 uses to ignore Conductor itself are a guess until then.
 
@@ -81,8 +82,8 @@ directory.
 
 The `SESSION` column of `bale ls` is the tree's session title when bale knows it. Otherwise it is the
 newest commit subject, or the one saved when the tree went cold. Of the tools, only Claude Code supplies a
-session title today (bale reads it from Claude Code's transcript under `~/.claude/projects/`). Cursor and
-Codex trees record the tool as their origin with no session or title; other trees show no title.
+session title today (bale reads it from Claude Code's transcript under `~/.claude/projects/`). Cursor,
+Codex and T3 Code trees record the tool as their origin with no session or title; other trees show no title.
 
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
