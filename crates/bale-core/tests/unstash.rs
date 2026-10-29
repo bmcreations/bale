@@ -148,7 +148,7 @@ fn read_only_file_round_trips() {
 #[test]
 fn duplicate_content_keeps_both_inodes() {
     let (fx, wt, id) = setup();
-    let d1 = ".dd/Build/Products/Debug/dup1.bin";
+    let d1 = ".dd/Build/Intermediates.noindex/dup1.bin";
     let d2 = ".dd/Build/Intermediates.noindex/sub/dup2.bin";
     let bytes = noise(2 * MIB, 42);
     put(&wt, d1, &bytes);
@@ -162,6 +162,127 @@ fn duplicate_content_keeps_both_inodes() {
     assert_eq!([ino(&wt.join(d1)), ino(&wt.join(d2))], inos);
     assert!(fs::read(wt.join(d1)).unwrap() == bytes);
     assert!(fs::read(wt.join(d2)).unwrap() == bytes);
+}
+
+const PRODUCT_DUP: &str = ".dd/Build/Products/Debug/App.app/dup.bin";
+const INTERMEDIATE_DUP: &str = ".dd/Build/Intermediates.noindex/dup.bin";
+
+/// A 2 MiB product under `Build/Products` and its identical twin among the
+/// intermediates, stashed.
+fn stashed_duplicates() -> (Fixture, PathBuf, String, Vec<u8>) {
+    let (fx, wt, id) = setup();
+    let bytes = noise(2 * MIB, 42);
+    put(&wt, PRODUCT_DUP, &bytes);
+    put(&wt, INTERMEDIATE_DUP, &bytes);
+    set_file_mtime(
+        wt.join(PRODUCT_DUP),
+        FileTime::from_unix_time(1_700_000_200, 111_222_333),
+    )
+    .unwrap();
+    fs::set_permissions(wt.join(PRODUCT_DUP), fs::Permissions::from_mode(0o751)).unwrap();
+    do_stash(&fx.home(), &id);
+    (fx, wt, id, bytes)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn duplicate_product_is_cloned() {
+    let (fx, wt, id) = setup();
+    let bytes = noise(2 * MIB, 42);
+    put(&wt, PRODUCT_DUP, &bytes);
+    put(&wt, INTERMEDIATE_DUP, &bytes);
+    set_file_mtime(
+        wt.join(PRODUCT_DUP),
+        FileTime::from_unix_time(1_700_000_200, 111_222_333),
+    )
+    .unwrap();
+    fs::set_permissions(wt.join(PRODUCT_DUP), fs::Permissions::from_mode(0o751)).unwrap();
+    let want_product = snapshot(&wt.join(PRODUCT_DUP));
+    let inter_ino = ino(&wt.join(INTERMEDIATE_DUP));
+    let product_ino = ino(&wt.join(PRODUCT_DUP));
+    do_stash(&fx.home(), &id);
+
+    let r = restored(&fx.home(), &id);
+    assert_eq!(r.files, 4);
+    assert_eq!(r.bytes, (9 * MIB) as u64);
+    assert_eq!((r.cloned_files, r.cloned_bytes), (1, (2 * MIB) as u64));
+    let got = snapshot(&wt.join(PRODUCT_DUP));
+    assert!(got.0 == bytes, "product bytes");
+    assert_eq!(got.1, want_product.1, "mode");
+    assert_eq!(got.2 .0, want_product.2 .0, "size");
+    assert_eq!(got.2 .1, want_product.2 .1, "mtime_ns");
+    assert_ne!(got.2 .2, product_ino, "the product is a new inode");
+    assert_eq!(ino(&wt.join(INTERMEDIATE_DUP)), inter_ino);
+    assert!(fs::read(wt.join(INTERMEDIATE_DUP)).unwrap() == bytes);
+    assert_restored_state(&fx.home(), &id);
+    // No temp files left behind.
+    let dir = wt.join(PRODUCT_DUP).parent().unwrap().to_path_buf();
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 1);
+}
+
+#[test]
+fn duplicate_outside_products_is_rewritten_in_place() {
+    let (fx, wt, id) = setup();
+    let bytes = noise(2 * MIB, 42);
+    let d1 = ".dd/Build/Intermediates.noindex/x/dup.bin";
+    put(&wt, d1, &bytes);
+    put(&wt, INTERMEDIATE_DUP, &bytes);
+    let inos = [ino(&wt.join(d1)), ino(&wt.join(INTERMEDIATE_DUP))];
+    do_stash(&fx.home(), &id);
+    let r = restored(&fx.home(), &id);
+    assert_eq!((r.cloned_files, r.cloned_bytes), (0, 0));
+    assert_eq!(r.files, 4);
+    assert_eq!([ino(&wt.join(d1)), ino(&wt.join(INTERMEDIATE_DUP))], inos);
+    assert!(fs::read(wt.join(d1)).unwrap() == bytes);
+}
+
+#[test]
+fn products_without_a_twin_outside_products_are_rewritten_in_place() {
+    let (fx, wt, id) = setup();
+    let bytes = noise(2 * MIB, 42);
+    let other = ".dd/Build/Products/Debug/Other.app/dup.bin";
+    put(&wt, PRODUCT_DUP, &bytes);
+    put(&wt, other, &bytes);
+    let inos = [ino(&wt.join(PRODUCT_DUP)), ino(&wt.join(other))];
+    do_stash(&fx.home(), &id);
+    let r = restored(&fx.home(), &id);
+    assert_eq!(r.cloned_bytes, 0);
+    assert_eq!([ino(&wt.join(PRODUCT_DUP)), ino(&wt.join(other))], inos);
+}
+
+/// The twin was rebuilt while the tree was stashed, so it is not a source;
+/// the product is decoded from the store and keeps its inode.
+#[test]
+fn clone_falls_back_when_source_is_not_restored() {
+    let (fx, wt, id, bytes) = stashed_duplicates();
+    let product_ino = ino(&wt.join(PRODUCT_DUP));
+    fs::write(wt.join(INTERMEDIATE_DUP), b"rebuilt").unwrap();
+
+    let r = restored(&fx.home(), &id);
+    assert_eq!(r.kept_newer, 1);
+    assert_eq!((r.cloned_files, r.cloned_bytes), (0, 0));
+    assert!(fs::read(wt.join(PRODUCT_DUP)).unwrap() == bytes);
+    assert_eq!(ino(&wt.join(PRODUCT_DUP)), product_ino);
+    assert_eq!(fs::read(wt.join(INTERMEDIATE_DUP)).unwrap(), b"rebuilt");
+}
+
+/// Both copies share one blob, so when it is lost the product's fallback
+/// fails too and the usual lost-blob handling applies to both.
+#[test]
+fn clone_falls_back_when_source_lost() {
+    let (fx, wt, id, _) = stashed_duplicates();
+    corrupt_blob(&fx.home(), &id, INTERMEDIATE_DUP);
+    let err = unstash(&fx.home(), &id).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(PRODUCT_DUP) && msg.contains(INTERMEDIATE_DUP),
+        "{msg}"
+    );
+    assert_eq!(len(&wt.join(PRODUCT_DUP)), 0);
+    assert_eq!(len(&wt.join(INTERMEDIATE_DUP)), 0);
+    let m = manifest(&fx.home(), &id);
+    assert!(!m.entries.iter().any(|e| e.rel == Path::new(PRODUCT_DUP)));
+    assert_restored_state(&fx.home(), &id);
 }
 
 #[test]

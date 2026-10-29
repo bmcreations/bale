@@ -474,6 +474,9 @@ fn unstash_line(report: Option<&UnstashReport>) -> String {
         human(r.bytes),
         r.secs
     );
+    if r.cloned_files > 0 {
+        line.push_str(&format!(" ({} cloned)", human(r.cloned_bytes)));
+    }
     if r.kept_newer > 0 {
         line.push_str(&format!(" ({} kept newer)", r.kept_newer));
     }

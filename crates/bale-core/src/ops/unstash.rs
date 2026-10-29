@@ -6,8 +6,14 @@
 //! stashed is kept. The record says `restoring` from before the first write
 //! until the last one is done, so a run that stops part way is finished by
 //! the next one.
+//!
+//! On macOS a copy under a DerivedData `Build/Products/` dir whose twin
+//! elsewhere in the manifest was just restored is cloned from that twin
+//! (APFS `clonefile`) instead of decoded and written again. The clone is a new
+//! inode, which Xcode accepts for a final product; everything else keeps its
+//! inode.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -43,6 +49,10 @@ pub struct UnstashReport {
     /// Files that were gone and were created again; they have new inodes,
     /// so the next build relinks them.
     pub recreated: usize,
+    /// Of `files`, those restored as clones of an identical restored file
+    /// rather than written from the store; `cloned_bytes` is their size.
+    pub cloned_files: usize,
+    pub cloned_bytes: u64,
     pub secs: f64,
 }
 
@@ -171,8 +181,9 @@ pub fn unstash_with(
     }
 
     let budget = ByteBudget::new(BASE_BUDGET);
-    let indexed: Vec<(usize, &Entry)> = manifest.entries.iter().enumerate().collect();
-    let results = par_map(&indexed, |&(i, e)| {
+    let twins = clone_twins(&manifest.entries, &owned);
+    let run = |&i: &usize| {
+        let e = &manifest.entries[i];
         let fail = match opts.fail_after {
             Some(n) if i > n => return Ok(Outcome::Done),
             Some(n) => i == n,
@@ -187,26 +198,44 @@ pub fn unstash_with(
             was_restoring,
             fail,
         };
-        job.restore(e)
+        let sources: Vec<&Entry> = twins[i].iter().map(|&t| &manifest.entries[t]).collect();
+        job.restore(e, &sources)
             .with_context(|| format!("restoring {}", layout.path_of(e, &root).display()))
-    });
+    };
+    // Sources first: a clone needs its twin on disk.
+    let (clones, plain): (Vec<usize>, Vec<usize>) =
+        (0..manifest.entries.len()).partition(|&i| !twins[i].is_empty());
+    let mut results: Vec<Option<Result<Outcome>>> =
+        (0..manifest.entries.len()).map(|_| None).collect();
+    for batch in [plain, clones] {
+        let done = par_map(&batch, run);
+        for (i, r) in batch.into_iter().zip(done) {
+            results[i] = Some(r);
+        }
+    }
 
     let mut report = UnstashReport {
         files: 0,
         bytes: 0,
         kept_newer: pruned,
         recreated: 0,
+        cloned_files: 0,
+        cloned_bytes: 0,
         secs: 0.0,
     };
     let mut errors = Vec::new();
     let mut lost = Vec::new();
     for (i, r) in results.into_iter().enumerate() {
         let e = &manifest.entries[i];
-        match r {
-            Ok(Outcome::Written { recreated }) => {
+        match r.expect("every entry was restored") {
+            Ok(Outcome::Written { recreated, cloned }) => {
                 report.files += 1;
                 report.bytes += e.size;
                 report.recreated += usize::from(recreated);
+                if cloned {
+                    report.cloned_files += 1;
+                    report.cloned_bytes += e.size;
+                }
             }
             Ok(Outcome::KeptNewer) => report.kept_newer += 1,
             Ok(Outcome::Done) => {}
@@ -265,6 +294,8 @@ pub fn unstash_with(
     f.insert("id".into(), id.into());
     f.insert("files".into(), report.files.into());
     f.insert("bytes".into(), report.bytes.into());
+    f.insert("cloned_files".into(), report.cloned_files.into());
+    f.insert("cloned_bytes".into(), report.cloned_bytes.into());
     f.insert("kept_newer".into(), report.kept_newer.into());
     f.insert("secs".into(), report.secs.into());
     crate::trace::emit(home, "unstash", f);
@@ -392,6 +423,8 @@ fn wait_for_lock(home: &BaleHome, id: &str, wait: Duration) -> Result<WorkspaceL
 enum Outcome {
     Written {
         recreated: bool,
+        /// Cloned from a restored twin instead of written from the store.
+        cloned: bool,
     },
     KeptNewer,
     /// Already restored (by an earlier run), or not reached.
@@ -424,7 +457,9 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
-    fn restore(&self, e: &Entry) -> Result<Outcome> {
+    /// `twins` are identical entries that may be cloned from once restored;
+    /// empty for everything that is written in place.
+    fn restore(&self, e: &Entry, twins: &[&Entry]) -> Result<Outcome> {
         let path = self.layout.path_of(e, self.root);
         if !self.owned[usize::from(e.root)] {
             return Ok(Outcome::Lost(anyhow::anyhow!(
@@ -469,7 +504,47 @@ impl Job<'_> {
                 return Ok(Outcome::Done);
             }
         }
+        if !self.fail && !twins.is_empty() && self.clone_from(&path, e, twins) {
+            return Ok(Outcome::Written {
+                recreated: false,
+                cloned: true,
+            });
+        }
         self.refill(&path, &meta, e)
+    }
+
+    /// Replaces the stub at `path` with a clone of the first twin that is on
+    /// disk as its entry says. A twin that failed to restore, or a build
+    /// rewrote, does not match and is passed over. Returns whether the stub
+    /// was replaced; on any failure the stub is untouched and the caller
+    /// decodes the blob instead.
+    fn clone_from(&self, path: &Path, e: &Entry, twins: &[&Entry]) -> bool {
+        // Restored (or finished by an earlier run) means size and mtime are
+        // the entry's: both are set only after the bytes were verified.
+        let Some(twin) = twins.iter().find_map(|t| {
+            if !self.owned[usize::from(t.root)] {
+                return None;
+            }
+            let p = self.layout.path_of(t, self.root);
+            let m = fs::symlink_metadata(&p).ok()?;
+            let (size, mtime_ns, _) = stat_of(&m);
+            (m.file_type().is_file() && size == t.size && mtime_ns == t.mtime_ns).then_some(p)
+        }) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let tmp = parent.join(format!(".bale-clone-{}-{}", std::process::id(), e.ino));
+        let _ = fs::remove_file(&tmp);
+        let placed = clonefile(&twin, &tmp)
+            .and_then(|()| set_mtime(&tmp, e.mtime_ns).map_err(io::Error::other))
+            .and_then(|()| set_mode(&tmp, e.mode, false))
+            .and_then(|()| fs::rename(&tmp, path));
+        if placed.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        placed.is_ok()
     }
 
     /// Writes the blob into the existing file at the entry's inode.
@@ -523,7 +598,10 @@ impl Job<'_> {
         drop(file);
         set_mtime(path, e.mtime_ns)?;
         set_mode(path, e.mode, false).with_context(|| format!("chmod {}", path.display()))?;
-        Ok(Outcome::Written { recreated: false })
+        Ok(Outcome::Written {
+            recreated: false,
+            cloned: false,
+        })
     }
 
     /// Creates a missing file next to its path, fills and stamps it, then
@@ -554,7 +632,10 @@ impl Job<'_> {
         set_mtime(tmp.path(), e.mtime_ns)?;
         set_mode(tmp.path(), e.mode, false)?;
         match tmp.persist_noclobber(path) {
-            Ok(_) => Ok(Outcome::Written { recreated: true }),
+            Ok(_) => Ok(Outcome::Written {
+                recreated: true,
+                cloned: false,
+            }),
             Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => Ok(Outcome::KeptNewer),
             Err(err) => Err(err.error).with_context(|| format!("placing {}", path.display())),
         }
@@ -590,6 +671,70 @@ impl Job<'_> {
             blob: !file_failed,
         })
     }
+}
+
+/// For each entry, the entries it may be cloned from: those with its hash
+/// that are not themselves cloned. Empty unless the entry is a build product
+/// (see [`is_product`]) in a root bale may write to, on macOS, and has such a
+/// twin; empty means the entry is written in place.
+fn clone_twins(entries: &[Entry], owned: &[bool]) -> Vec<Vec<usize>> {
+    let mut twins = vec![Vec::new(); entries.len()];
+    if !cfg!(target_os = "macos") {
+        return twins;
+    }
+    let is_clone = |e: &Entry| owned[usize::from(e.root)] && is_product(&e.rel);
+    let mut by_hash: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.size > 0 {
+            by_hash.entry(e.hash.as_str()).or_default().push(i);
+        }
+    }
+    for group in by_hash.values() {
+        let sources: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&i| !is_clone(&entries[i]))
+            .collect();
+        for &i in group {
+            if is_clone(&entries[i]) {
+                twins[i] = sources.clone();
+            }
+        }
+    }
+    twins
+}
+
+/// Whether `rel` lies under a DerivedData `Build/Products` dir, where Xcode
+/// accepts a final product at a new inode (it copies products from linked
+/// intermediates instead of linking them).
+fn is_product(rel: &Path) -> bool {
+    let parts: Vec<_> = rel.components().collect();
+    parts
+        .windows(3)
+        .any(|w| w[0].as_os_str() == "Build" && w[1].as_os_str() == "Products")
+}
+
+/// Clones `src` to the new path `dst` (APFS copy-on-write; fails elsewhere).
+#[cfg(target_os = "macos")]
+fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    /// `CLONE_NOFOLLOW` from <sys/clonefile.h>; the libc crate omits it.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let c = |p: &Path| CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
+    let (src, dst) = (c(src)?, c(dst)?);
+    // SAFETY: both are valid NUL-terminated paths for the call's duration.
+    let rc = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clonefile(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Passes writes through, noting whether the destination failed. With
