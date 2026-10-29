@@ -9,12 +9,14 @@ dirs = "5"
 dunce = "=1.0.5"
 filetime = "0.2"
 fs4 = "0.13"
+md-5 = "0.11.0"
 plist = "1.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 tempfile = "3"
 toml = "0.8"
+unicode-normalization = "0.1.26"
 walkdir = "2"
 zstd-safe = { version = "7", features = ["std"] }
 
