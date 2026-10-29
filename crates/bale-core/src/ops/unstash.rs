@@ -68,6 +68,15 @@ pub fn unstash(home: &BaleHome, id: &str) -> Result<Option<UnstashReport>> {
 /// [`unstash`] for the tree that contains `cwd` (the registered tree with
 /// the longest path prefix). `None` when `cwd` is in no registered tree.
 pub fn unstash_path(home: &BaleHome, cwd: &Path) -> Result<Option<UnstashReport>> {
+    match tree_containing(home, cwd)? {
+        Some((_, id)) => unstash(home, &id),
+        None => Ok(None),
+    }
+}
+
+/// The registered tree that contains `cwd` (the longest path prefix), as its
+/// canonical path and id. `None` when `cwd` is in no registered tree.
+pub fn tree_containing(home: &BaleHome, cwd: &Path) -> Result<Option<(PathBuf, String)>> {
     let cwd =
         crate::paths::canonicalize(cwd).with_context(|| format!("resolving {}", cwd.display()))?;
     let registry = Registry::open(home.clone());
@@ -85,10 +94,7 @@ pub fn unstash_path(home: &BaleHome, cwd: &Path) -> Result<Option<UnstashReport>
             best = Some((path, rec.id));
         }
     }
-    match best {
-        Some((_, id)) => unstash(home, &id),
-        None => Ok(None),
-    }
+    Ok(best)
 }
 
 #[doc(hidden)]
@@ -267,6 +273,29 @@ fn commit(
     Ok(())
 }
 
+/// The tree's lock stayed held (by a stash or sweep) for the whole wait.
+#[derive(Debug)]
+pub struct LockTimeout {
+    pub id: String,
+    pub waited: Duration,
+    pub lock_file: PathBuf,
+}
+
+impl std::fmt::Display for LockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace {} is still locked after {}s by another bale process \
+             (a stash or sweep); lock file {}",
+            self.id,
+            self.waited.as_secs(),
+            self.lock_file.display()
+        )
+    }
+}
+
+impl std::error::Error for LockTimeout {}
+
 fn wait_for_lock(home: &BaleHome, id: &str, wait: Duration) -> Result<WorkspaceLock> {
     let deadline = Instant::now() + wait;
     loop {
@@ -277,12 +306,12 @@ fn wait_for_lock(home: &BaleHome, id: &str, wait: Duration) -> Result<WorkspaceL
             return Ok(lock);
         }
         if Instant::now() >= deadline {
-            bail!(
-                "workspace {id} is still locked after {}s by another bale process \
-                 (a stash or sweep); lock file {}",
-                wait.as_secs(),
-                home.locks_dir().join(format!("{id}.lock")).display()
-            );
+            return Err(LockTimeout {
+                id: id.to_string(),
+                waited: wait,
+                lock_file: home.locks_dir().join(format!("{id}.lock")),
+            }
+            .into());
         }
         std::thread::sleep(LOCK_POLL);
     }

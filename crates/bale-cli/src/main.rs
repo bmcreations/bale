@@ -11,7 +11,9 @@ use bale_core::ops::meta::set_pinned;
 use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
+use bale_core::ops::stash::{stash, StashOutcome};
 use bale_core::ops::sweep::{sweep, Action};
+use bale_core::ops::unstash::{unstash, UnstashReport};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
 use bale_core::par::par_map;
 use bale_core::registry::{workspace_id, Level, Record, Registry, Scope};
@@ -40,6 +42,19 @@ enum Command {
         /// Do not treat this process as holding the tree (repeatable).
         #[arg(long = "ignore-pid", value_name = "PID")]
         ignore_pid: Vec<u32>,
+    },
+    /// Compress a worktree's large build-output files into the store, leaving empty stubs.
+    Stash {
+        /// Worktree path or workspace id.
+        target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
+    },
+    /// Refill a worktree's stashed files from the store.
+    Unstash {
+        /// Worktree path or workspace id.
+        target: String,
     },
     /// Restore a cold worktree at its path, then remove its saved state.
     Open {
@@ -199,6 +214,19 @@ enum ClaudeHook {
     Create,
     /// WorktreeRemove: JSON on stdin, colds the worktree.
     Remove,
+    /// UserPromptSubmit: JSON on stdin, restores the stashed tree at its cwd.
+    Prompt {
+        /// Milliseconds to wait for the tree's lock; default 60000.
+        #[arg(long, hide = true, value_name = "MS")]
+        lock_wait_ms: Option<u64>,
+    },
+    /// PreToolUse (Bash): JSON on stdin, restores the stashed tree at its cwd.
+    PreTool {
+        #[arg(long, hide = true, value_name = "MS")]
+        lock_wait_ms: Option<u64>,
+    },
+    /// Stop: JSON on stdin, records the turn end for the tree at its cwd.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -266,6 +294,18 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
         }),
         Command::Cold { target, ignore_pid } => resolve(&home, &target)
             .and_then(|id| Ok(report_cold(&id, cold_ignoring(&home, &id, &ignore_pid)?))),
+        Command::Stash { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| stash(&home, &id, &ignore_pid))
+            .map(|outcome| {
+                println!("{}", stash_line(&outcome));
+                ExitCode::SUCCESS
+            }),
+        Command::Unstash { target } => resolve(&home, &target)
+            .and_then(|id| unstash(&home, &id))
+            .map(|report| {
+                println!("{}", unstash_line(report.as_ref()));
+                ExitCode::SUCCESS
+            }),
         Command::Open { target } => resolve(&home, &target).and_then(|id| {
             let opened = open(&home, &id)?;
             let code = report(&id, opened.outcome);
@@ -317,6 +357,15 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             HookKind::Claude {
                 event: ClaudeHook::Remove,
             } => bale_hooks::claude::remove(&home),
+            HookKind::Claude {
+                event: ClaudeHook::Prompt { lock_wait_ms },
+            } => Ok(bale_hooks::claude::prompt(&home, lock_wait_ms)),
+            HookKind::Claude {
+                event: ClaudeHook::PreTool { lock_wait_ms },
+            } => Ok(bale_hooks::claude::pre_tool(&home, lock_wait_ms)),
+            HookKind::Claude {
+                event: ClaudeHook::Stop,
+            } => Ok(bale_hooks::claude::stop(&home)),
             HookKind::Git {
                 event: GitHook::PostCheckout { prev, new, flag },
             } => Ok(bale_hooks::git::post_checkout(&home, &prev, &new, &flag)),
@@ -362,6 +411,46 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// The one line `bale stash` prints.
+fn stash_line(outcome: &StashOutcome) -> String {
+    match outcome {
+        StashOutcome::Stashed(r) => {
+            let mut line = format!(
+                "stashed {} files, {} -> {} in {:.1} s",
+                r.files,
+                human(r.bytes),
+                human(r.stored_bytes),
+                r.secs
+            );
+            if r.git_visible > 0 {
+                line.push_str(&format!(
+                    " ({} files skipped: not ignored by git)",
+                    r.git_visible
+                ));
+            }
+            line
+        }
+        StashOutcome::Skipped(reason) => format!("not stashed: {reason}"),
+    }
+}
+
+/// The one line `bale unstash` prints.
+fn unstash_line(report: Option<&UnstashReport>) -> String {
+    let Some(r) = report else {
+        return "nothing to restore".into();
+    };
+    let mut line = format!(
+        "restored {} files, {} in {:.1} s",
+        r.files,
+        human(r.bytes),
+        r.secs
+    );
+    if r.kept_newer > 0 {
+        line.push_str(&format!(" ({} kept newer)", r.kept_newer));
+    }
+    line
 }
 
 /// Prints `plan` with `print_only`, else applies it.

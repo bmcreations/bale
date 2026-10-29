@@ -1072,7 +1072,14 @@ fn claude_hooks_install_leaves_wrapped_bale_entries() {
     fs::write(&path, wrapped).unwrap();
     let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(fs::read_to_string(&path).unwrap(), wrapped);
+    // The wrapped entries stay as they were; only the new events are added.
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let old: Value = serde_json::from_str(wrapped).unwrap();
+    assert_eq!(v["hooks"]["WorktreeCreate"], old["hooks"]["WorktreeCreate"]);
+    assert_eq!(v["hooks"]["WorktreeRemove"], old["hooks"]["WorktreeRemove"]);
+    for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
+        assert_eq!(v["hooks"][event].as_array().unwrap().len(), 1, "{event}");
+    }
     let text = stdout(&out);
     assert!(text.contains("left unchanged"), "{text}");
     assert!(text.contains("nice '/old/bale'"), "{text}");
@@ -1166,7 +1173,15 @@ fn install_hooks_claude_keeps_user_hooks() {
     let first = fs::read_to_string(&path).unwrap();
     let v: Value = serde_json::from_str(&first).unwrap();
     let user: Value = serde_json::from_str(USER_HOOKS).unwrap();
-    assert_eq!(v["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
+    // bale's Bash entry is listed first; the user's stays as it was.
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{v}");
+    assert_eq!(pre[0]["matcher"], "Bash");
+    assert!(pre[0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude pre-tool"));
+    assert_eq!(pre[1], user["hooks"]["PreToolUse"][0]);
     // Claude Code runs matching hooks in parallel, so install says the
     // user's remove hook races bale's.
     assert!(
@@ -3272,4 +3287,364 @@ fn uninstall_conductor_keeps_file_when_backup_is_unreadable() {
         fs::set_permissions(b, fs::Permissions::from_mode(0o600)).unwrap();
     }
     assert!(path.is_file(), "{}", stdout(&out));
+}
+
+// Warm tier: `stash`, `unstash` and the Claude Code prompt, pre-tool and
+// stop hooks.
+
+const MIB: usize = 1 << 20;
+
+/// Deterministic, poorly compressible bytes.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+const BIG_A: &str = "build/a.bin";
+const BIG_B: &str = "build/b.bin";
+
+/// A registered Gradle worktree with two 2 MiB ignored files under `build/`.
+fn stash_tree(env: &Env) -> PathBuf {
+    let wt = env.add_worktree("warm");
+    fs::write(wt.join("settings.gradle"), "").unwrap();
+    fs::write(wt.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(wt.join("build")).unwrap();
+    fs::create_dir_all(wt.join("sub")).unwrap();
+    fs::write(wt.join(BIG_A), noise(2 * MIB, 1)).unwrap();
+    fs::write(wt.join(BIG_B), noise(2 * MIB, 2)).unwrap();
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    wt
+}
+
+fn stash_it(env: &Env, wt: &Path) -> Output {
+    env.bale(&env.repo, &["stash", wt.to_str().unwrap()], None)
+}
+
+fn hook_json(cwd: &Path, event: &str) -> String {
+    serde_json::json!({
+        "session_id": "s",
+        "cwd": cwd,
+        "hook_event_name": event,
+        "unknown_field": [1, 2],
+    })
+    .to_string()
+}
+
+fn len_of(p: &Path) -> u64 {
+    fs::metadata(p).unwrap().len()
+}
+
+fn blobs(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            blobs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "zst") {
+            out.push(p);
+        }
+    }
+}
+
+#[test]
+fn stash_and_unstash_commands_round_trip() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let (a, b) = (
+        fs::read(wt.join(BIG_A)).unwrap(),
+        fs::read(wt.join(BIG_B)).unwrap(),
+    );
+
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("stashed 2 files, "), "{text:?}");
+    assert!(!text.contains("skipped"), "{text:?}");
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+
+    let out = env.bale(&env.repo, &["unstash", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("restored 2 files, "), "{text:?}");
+    assert_eq!(fs::read(wt.join(BIG_A)).unwrap(), a);
+    assert_eq!(fs::read(wt.join(BIG_B)).unwrap(), b);
+}
+
+#[test]
+fn stash_command_reports_skipped_files() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    // Tracked despite the ignore rule: stash leaves it alone and says so.
+    fs::write(wt.join("build/tracked.bin"), noise(2 * MIB, 3)).unwrap();
+    env.git(&wt, &["add", "-f", "build/tracked.bin"]);
+
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("stashed 2 files, "), "{text:?}");
+    assert!(
+        text.trim_end()
+            .ends_with("(1 files skipped: not ignored by git)"),
+        "{text:?}"
+    );
+    assert_eq!(len_of(&wt.join("build/tracked.bin")), (2 * MIB) as u64);
+}
+
+#[test]
+fn stash_command_says_why_it_skipped() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let out = stash_it(&env, &wt);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "not stashed: already stashed\n");
+}
+
+#[test]
+fn hook_prompt_unstashes_tree_at_cwd() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let a = fs::read(wt.join(BIG_A)).unwrap();
+    assert!(stash_it(&env, &wt).status.success());
+
+    let input = hook_json(&wt.join("sub"), "UserPromptSubmit");
+    let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(&input));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(fs::read(wt.join(BIG_A)).unwrap(), a);
+    assert!(len_of(&wt.join(BIG_B)) > 0);
+}
+
+#[test]
+fn hook_prompt_outside_any_tree_is_noop() {
+    let env = Env::new();
+    let _wt = stash_tree(&env);
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "prompt"],
+        Some(&hook_json(&env.home(), "UserPromptSubmit")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn hook_prompt_with_bad_payload_does_not_block() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    for input in [
+        "not json",
+        "{}",
+        r#"{"cwd": 7}"#,
+        r#"{"cwd": "/no/such/dir"}"#,
+    ] {
+        let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(input));
+        assert_eq!(out.status.code(), Some(0), "{input}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{input}");
+        assert_eq!(stderr(&out).trim_end().lines().count(), 1, "{input}");
+    }
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn hook_prompt_fails_loudly_on_corrupt_blob() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let originals = [
+        (BIG_A, fs::read(wt.join(BIG_A)).unwrap()),
+        (BIG_B, fs::read(wt.join(BIG_B)).unwrap()),
+    ];
+    assert!(stash_it(&env, &wt).status.success());
+    let mut found = Vec::new();
+    blobs(&env.bale_home().join("store"), &mut found);
+    found.sort();
+    assert_eq!(found.len(), 2, "{found:?}");
+    let mut bytes = fs::read(&found[0]).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    fs::write(&found[0], bytes).unwrap();
+
+    let input = hook_json(&wt, "UserPromptSubmit");
+    let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(&input));
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let (lost, kept): (Vec<_>, Vec<_>) = originals
+        .iter()
+        .partition(|(rel, _)| len_of(&wt.join(rel)) == 0);
+    assert_eq!(lost.len(), 1, "exactly the corrupt file stays a stub");
+    assert!(stderr(&out).contains(lost[0].0), "{}", stderr(&out));
+    assert_eq!(fs::read(wt.join(kept[0].0)).unwrap(), kept[0].1);
+
+    // The lost file left the manifest, so the next prompt goes through.
+    let out = env.bale(&env.repo, &["hook", "claude", "prompt"], Some(&input));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn hook_prompt_lock_timeout_exits_2() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let home = bale_core::BaleHome(env.bale_home());
+    let id = bale_core::registry::workspace_id(&canon(&wt));
+    let _held = bale_core::lock::WorkspaceLock::try_acquire(&home, &id)
+        .unwrap()
+        .expect("lock is free");
+
+    for kind in ["prompt", "pre-tool"] {
+        let out = env.bale(
+            &env.repo,
+            &["hook", "claude", kind, "--lock-wait-ms", "300"],
+            Some(&hook_json(&wt, "UserPromptSubmit")),
+        );
+        assert_eq!(out.status.code(), Some(2), "{kind}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(err.contains("still busy"), "{err}");
+        assert!(err.contains("resend the prompt"), "{err}");
+        assert!(!err.contains("lock file"), "{err}");
+    }
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn hook_pre_tool_bumps_activity() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    let before = ls_json_row(&env, &wt)["last_activity"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&hook_json(&wt.join("sub"), "PreToolUse")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_ne!(ls_json_row(&env, &wt)["last_activity"], before);
+}
+
+#[test]
+fn hook_pre_tool_unstashes_tree() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&hook_json(&wt, "PreToolUse")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(len_of(&wt.join(BIG_A)) > 0);
+}
+
+#[test]
+fn hook_stop_only_touches_activity() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    assert!(stash_it(&env, &wt).status.success());
+    let store = env.bale_home().join("store");
+    let store_mtime = fs::metadata(&store).unwrap().modified().unwrap();
+    let before = ls_json_row(&env, &wt)["last_activity"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "stop"],
+        Some(&hook_json(&wt, "Stop")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_ne!(ls_json_row(&env, &wt)["last_activity"], before);
+    assert_eq!(
+        fs::metadata(&store).unwrap().modified().unwrap(),
+        store_mtime
+    );
+    // Stop restores nothing.
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+}
+
+#[test]
+fn install_plan_sets_timeout() {
+    let env = Env::new();
+    let path = settings_path(&env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo mine"}]}],
+            "PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"echo edit"}]}]}}"#,
+    )
+    .unwrap();
+    let out = env.bale(&env.repo, &["install", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+    // User entries stay, without a timeout bale did not set.
+    let prompt = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+    assert_eq!(prompt.len(), 2, "{prompt:?}");
+    let ours = |groups: &[Value]| -> Value {
+        groups
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .find(|h| h["command"].as_str().unwrap().contains("bale"))
+            .unwrap()
+            .clone()
+    };
+    let user = prompt
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().unwrap())
+        .find(|h| h["command"] == "echo mine")
+        .unwrap();
+    assert!(user.get("timeout").is_none());
+    assert_eq!(ours(prompt)["timeout"], 90);
+    assert!(ours(prompt)["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude prompt"));
+
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{pre:?}");
+    let group = pre
+        .iter()
+        .find(|g| {
+            g["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("hook claude pre-tool")
+        })
+        .unwrap();
+    assert_eq!(group["matcher"], "Bash");
+    assert_eq!(group["hooks"][0]["timeout"], 90);
+    assert_eq!(pre.iter().filter(|g| g["matcher"] == "Edit").count(), 1);
+
+    let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+    assert!(stop["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook claude stop"));
+    assert!(stop.get("timeout").is_none());
+
+    // Uninstall removes only bale's entries.
+    let out = env.bale(&env.repo, &["uninstall", "--hooks", "claude"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        "echo mine"
+    );
+    assert_eq!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+    assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Edit");
+    assert!(v["hooks"].get("Stop").is_none());
+    assert!(v["hooks"].get("WorktreeCreate").is_none());
 }

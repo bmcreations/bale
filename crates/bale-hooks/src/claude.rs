@@ -23,11 +23,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
-use bale_core::ops::meta::set_origin;
+use bale_core::ops::meta::{set_origin, touch};
 use bale_core::ops::new::{new_workspace, workspace_path};
+use bale_core::ops::unstash::{tree_containing, unstash_with, LockTimeout, UnstashOpts};
 use bale_core::ops::up::register;
 use bale_core::registry::Origin;
 use bale_core::BaleHome;
@@ -301,8 +303,124 @@ pub fn remove(home: &BaleHome) -> Result<ExitCode> {
     Ok(remove_tree(home, &path, Tool::Claude))
 }
 
+/// What a prompt or pre-tool hook needs from its payload: the tree to restore.
+/// `None` (with a line on stderr) for a payload that must not block the user.
+fn hook_cwd(event: &str) -> Option<PathBuf> {
+    let payload = match read_payload() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bale: {event} hook ignored: {e:#}");
+            return None;
+        }
+    };
+    match field(&payload, "cwd") {
+        Ok(cwd) if Path::new(cwd).is_dir() => Some(PathBuf::from(cwd)),
+        Ok(cwd) => {
+            eprintln!("bale: {event} hook ignored: cwd {cwd:?} is not a directory");
+            None
+        }
+        Err(e) => {
+            eprintln!("bale: {event} hook ignored: {e:#}");
+            None
+        }
+    }
+}
+
+/// UserPromptSubmit: restores the stashed tree at the payload's `cwd`, then
+/// counts the prompt as activity. Prints nothing on success (stdout would
+/// become model context). Exit 2 blocks the prompt and shows stderr, so a
+/// restore that fails is never silent.
+pub fn prompt(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
+    crate::as_hook(Tool::Claude, || {
+        restore_and_touch(home, "prompt", lock_wait_ms)
+    })
+}
+
+/// PreToolUse on Bash: as [`prompt`], for a tree stashed while a permission
+/// prompt waited.
+pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
+    crate::as_hook(Tool::Claude, || {
+        restore_and_touch(home, "pre-tool", lock_wait_ms)
+    })
+}
+
+fn restore_and_touch(home: &BaleHome, event: &str, lock_wait_ms: Option<u64>) -> ExitCode {
+    let Some(cwd) = hook_cwd(event) else {
+        return ExitCode::SUCCESS;
+    };
+    let opts = UnstashOpts {
+        lock_wait: lock_wait_ms.map(Duration::from_millis),
+        ..UnstashOpts::default()
+    };
+    let tree = match tree_containing(home, &cwd) {
+        Ok(Some(tree)) => tree,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("bale: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let (path, id) = tree;
+    if let Err(e) = unstash_with(home, &id, &opts) {
+        if e.downcast_ref::<LockTimeout>().is_some() {
+            eprintln!(
+                "bale: still busy with {}; resend the prompt in a moment",
+                display_path(&path)
+            );
+        } else {
+            eprintln!("bale: could not restore {}: {e:#}", display_path(&path));
+        }
+        return ExitCode::from(2);
+    }
+    if let Err(e) = touch(home, &path) {
+        eprintln!("bale: not recorded as activity: {e:#}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Stop: records the turn's end as the tree's last activity. No hashing and
+/// no store access; it never blocks Claude Code, so failures only print.
+pub fn stop(home: &BaleHome) -> ExitCode {
+    crate::as_hook(Tool::Claude, || {
+        let Some(cwd) = hook_cwd("stop") else {
+            return ExitCode::SUCCESS;
+        };
+        match tree_containing(home, &cwd) {
+            Ok(Some((path, _))) => {
+                if let Err(e) = touch(home, &path) {
+                    eprintln!("bale: not recorded as activity: {e:#}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("bale: {e:#}"),
+        }
+        ExitCode::SUCCESS
+    })
+}
+
 /// Each settings.json event bale hooks, with its `bale hook claude` subcommand.
-const HOOKS: [(&str, &str); 2] = [("WorktreeCreate", "create"), ("WorktreeRemove", "remove")];
+const HOOKS: [(&str, &str); 5] = [
+    ("WorktreeCreate", "create"),
+    ("WorktreeRemove", "remove"),
+    ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "pre-tool"),
+    ("Stop", "stop"),
+];
+
+/// Seconds Claude Code lets the prompt and pre-tool hooks run: above
+/// unstash's 60 s wait for a tree's lock, so bale's own timeout answers first.
+const RESTORE_TIMEOUT_SECS: u64 = 90;
+
+/// The tool matcher bale's entry for `kind` carries, if any. Only Bash calls
+/// run builds, so only they wait for a restore.
+fn hook_matcher(kind: &str) -> Option<&'static str> {
+    (kind == "pre-tool").then_some("Bash")
+}
+
+/// The `timeout` (seconds) bale's entry for `kind` sets, if any.
+fn hook_timeout(kind: &str) -> Option<u64> {
+    matches!(kind, "prompt" | "pre-tool").then_some(RESTORE_TIMEOUT_SECS)
+}
 
 /// `s` single-quoted for sh, which Claude Code runs command hooks with.
 pub(crate) fn sh_quote(s: &str) -> String {
@@ -396,10 +514,20 @@ fn settings_location(home: &Path) -> (PathBuf, PathBuf) {
 
 /// One settings.json hook group running `bale hook claude <kind>`.
 fn hook_group(exe: &Path, kind: &str) -> Value {
-    json!({ "hooks": [{ "type": "command", "command": hook_command(exe, kind) }] })
+    let mut entry = json!({ "type": "command", "command": hook_command(exe, kind) });
+    if let Some(secs) = hook_timeout(kind) {
+        entry["timeout"] = json!(secs);
+    }
+    let mut group = Map::new();
+    if let Some(matcher) = hook_matcher(kind) {
+        group.insert("matcher".into(), json!(matcher));
+    }
+    group.insert("hooks".into(), json!([entry]));
+    Value::Object(group)
 }
 
-/// Adds bale's WorktreeCreate and WorktreeRemove entries to
+/// Adds bale's entries (WorktreeCreate, WorktreeRemove, UserPromptSubmit,
+/// PreToolUse on Bash, Stop) to
 /// Claude Code's user settings.json (see [`settings_location`]), keeping
 /// every other hook. A user WorktreeRemove hook stays and runs in parallel
 /// with bale's, which install notes. A user WorktreeCreate hook
@@ -478,6 +606,10 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
                     h["command"] = Value::String(want.clone());
                     changed = true;
                 }
+                if let Some(secs) = hook_timeout(kind).filter(|s| h["timeout"] != json!(s)) {
+                    h["timeout"] = json!(secs);
+                    changed = true;
+                }
             } else if let Some(renamed) = renamed_wrapped(cmd, kind) {
                 // The user's command around bale, naming bale's old hook:
                 // only bale's words change.
@@ -551,7 +683,7 @@ pub fn install_plan(home: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
     Ok(Plan::new(notes))
 }
 
-/// Removes bale's own WorktreeCreate and WorktreeRemove entries from
+/// Removes bale's own entries (the events of [`install_plan`]) from
 /// Claude Code's user settings.json, as install recognises them; a command the
 /// user wrapped around bale stays. Groups, events and `hooks` emptied by the
 /// removal go too, and the file when bale created it and nothing is left,

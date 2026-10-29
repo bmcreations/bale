@@ -41,6 +41,9 @@ pub struct StashReport {
     pub stored_bytes: u64,
     /// Files whose blob was already in the store.
     pub reused: usize,
+    /// Candidate files left in place because git tracks them or sees them as
+    /// untracked and not ignored.
+    pub git_visible: usize,
     pub secs: f64,
 }
 
@@ -213,7 +216,9 @@ impl Run<'_> {
         });
         let seen_by_git = git_visible(&self.root, &self.dirs)?;
         let mut rels = candidates(&self.root, &self.dirs, cfg.stash_min_bytes);
+        let before = rels.len();
         rels.retain(|r| !seen_by_git.contains(r));
+        let git_visible = before - rels.len();
         if rels.is_empty() {
             return Ok(StashOutcome::Skipped("nothing to stash".into()));
         }
@@ -363,6 +368,7 @@ impl Run<'_> {
             bytes: done.bytes,
             stored_bytes,
             reused,
+            git_visible,
             secs: self.start.elapsed().as_secs_f64(),
         }))
     }
@@ -388,6 +394,7 @@ impl Run<'_> {
             bytes: done.bytes,
             stored_bytes: 0,
             reused: 0,
+            git_visible: 0,
             secs: self.start.elapsed().as_secs_f64(),
         }))
     }
