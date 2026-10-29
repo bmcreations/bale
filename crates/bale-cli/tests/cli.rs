@@ -3651,7 +3651,7 @@ fn background_failure_blocks_next_hook() {
     let out = pre_tool_hook(&env, &wt);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(stdout(&out), "");
-    let lost_rel = Path::new(lost[0].0).display().to_string();
+    let lost_rel = lost[0].0.replace('/', std::path::MAIN_SEPARATOR_STR);
     assert!(stderr(&out).contains(&lost_rel), "{}", stderr(&out));
     let out = pre_tool_hook(&env, &wt);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
