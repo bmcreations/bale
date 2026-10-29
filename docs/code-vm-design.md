@@ -55,6 +55,31 @@ What this means for the design:
 - **Compressing the shadow is for long waits.** At the measured speed, about 0.65 GB/s, a compressed shadow restores within the 3–4 s p95 target only up to about 2–2.5 GB. A larger shadow should stay uncompressed until the tree has been idle much longer than T.
 - **Branches drift far from a shared base.** Two branches' builds differed in 4.17 of 6.5 GB, so a long-lived branch tree ends up with most of a build in its delta. The base has to be refreshed, or a branch's own last build used as its base.
 
+**Compression options benchmark.** Same two DerivedData folders (A 6.63 GB and B 6.73 GB on disk, B has 92,561 files), warm cache, load 4-47.
+
+| Option | Size | Time | Reading every file back |
+|---|---|---|---|
+| Plain folder | 6.63 GB | - | 66 s |
+| Compressed image ULFO (lzfse) | 2.40 GB (2.8x) | create 100 s, attach 0.36-0.61 s | 81 s |
+| Compressed image UDZO (zlib) | 2.62 GB (2.5x) | create 104 s, attach 0.38-0.64 s | 76 s |
+| APFS compression, `afsctool` LZFSE | 2.76 GB (2.4x) | 42 s for the whole tree | 84 s |
+| APFS compression, `afsctool` ZLIB | 3.90 GB (1.7x) | 37 s | 59 s |
+
+Writing B into an attached ULFO image of A took 110 s and grew the shadow to 7.65 GB, more than B itself. Folding image plus shadow into a new ULFO image took 9.4 s and gave 2.54 GB.
+
+Storing B as a delta over A:
+- 2.33 GB of B's 6.50 GB is byte-identical to A at the same path, and 1.09 GB is duplicated within B itself.
+- 18,193 files changed (3.27 GB). zstd -3 per file gives 774 MB; `zstd --patch-from` against A's version gives 293 MB.
+- 4,104 new files (893 MB) give 424 MB with zstd -3.
+- So B costs about 717 MB over A, against 2.54 GB for the folded ULFO image and 4.43 GB for an uncompressed shadow.
+- A trained dictionary shrinks files of 128 KB or less by another 17% (sample of 10,000: 30.3 MB to 25.1 MB). Those files are 88,777 of the 92,561 but only 1.05 GB.
+- Xcode's index (`Index.noindex`) is 203-209 MB per folder, about 3%.
+
+What this means for the design:
+- **APFS compression costs nothing to restore.** Reads decompress on the fly at about the speed of the plain folder, so a tree compressed this way is never "restored". Files a build rewrites are stored uncompressed until bale compresses them again, so this suits trees between turns. Linux (btrfs `compress=zstd`) and Windows (`compact /EXE:LZX`) have equivalents. `afsctool` is GPL-3, so bale has to write its own compressor for this.
+- **A compressed image suits cold trees.** It attaches in under a second with nothing unpacked, but a build writing into it grows the shadow past the size of the build output, so it shouldn't be used for a tree that's building.
+- **Delta over a base is 3.5x smaller than any packaged option** (717 MB against 2.54 GB for B). Restoring it means writing about 22,000 files, which is too slow without a filesystem that writes them only when they're read. That is the case for bale's own format plus a user-space filesystem.
+
 **Still unmeasured:**
 - How large the delta over a warm base is after a typical turn's edit and incremental build. This needs real builds.
 
