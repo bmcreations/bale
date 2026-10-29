@@ -7,6 +7,7 @@ use std::time::Duration;
 const DEFAULT_IDLE_BALED_HOURS: u64 = 4;
 const DEFAULT_IDLE_COLD_DAYS: u64 = 7;
 const DEFAULT_IDLE_STASH_MINUTES: u64 = 10;
+const DEFAULT_REAP_GRACE_MINUTES: u64 = 60;
 const DEFAULT_STASH_MIN_BYTES: u64 = 1 << 20;
 const DEFAULT_PATCH_MAX_DEPTH: u32 = 4;
 
@@ -15,6 +16,8 @@ pub struct Config {
     pub idle_baled: Duration,
     pub idle_cold: Duration,
     pub idle_stash: Duration,
+    /// How long orphaned Xcode DerivedData must be untouched before sweep reaps it.
+    pub reap_grace: Duration,
     pub stash_min_bytes: u64,
     pub patch_max_depth: u32,
     pub regenerable_extra: Vec<String>,
@@ -28,6 +31,7 @@ struct RawConfig {
     idle_baled_hours: Option<u64>,
     idle_cold_days: Option<u64>,
     idle_stash_minutes: Option<u64>,
+    reap_grace_minutes: Option<u64>,
     stash_min_bytes: Option<u64>,
     patch_max_depth: Option<u32>,
     regenerable: Option<Vec<String>>,
@@ -64,10 +68,15 @@ pub fn load_config(home: &BaleHome, repo_root: Option<&Path>) -> Result<Config> 
         .idle_stash_minutes
         .or(machine.idle_stash_minutes)
         .unwrap_or(DEFAULT_IDLE_STASH_MINUTES);
+    let reap_minutes = repo
+        .reap_grace_minutes
+        .or(machine.reap_grace_minutes)
+        .unwrap_or(DEFAULT_REAP_GRACE_MINUTES);
     Ok(Config {
         idle_baled: Duration::from_secs(hours * 3600),
         idle_cold: Duration::from_secs(days * 86400),
         idle_stash: Duration::from_secs(minutes * 60),
+        reap_grace: Duration::from_secs(reap_minutes * 60),
         stash_min_bytes: repo
             .stash_min_bytes
             .or(machine.stash_min_bytes)
@@ -96,6 +105,7 @@ mod tests {
         let c = load_config(&BaleHome(h.path().into()), None).unwrap();
         assert_eq!(c.idle_baled, Duration::from_secs(4 * 3600));
         assert_eq!(c.idle_cold, Duration::from_secs(7 * 86400));
+        assert_eq!(c.reap_grace, Duration::from_secs(3600));
         assert!(c.regenerable_extra.is_empty());
         assert!(c.ignored_denylist_extra.is_empty());
         assert_eq!(c.worktree_root, None);
@@ -115,6 +125,14 @@ mod tests {
         assert_eq!(c.idle_baled, Duration::from_secs(3600));
         assert_eq!(c.idle_cold, Duration::from_secs(3 * 86400));
         assert_eq!(c.regenerable_extra, vec!["out".to_string()]);
+    }
+
+    #[test]
+    fn reap_grace_is_configurable() {
+        let h = tempfile::tempdir().unwrap();
+        fs::write(h.path().join("config.toml"), "reap_grace_minutes = 5\n").unwrap();
+        let c = load_config(&BaleHome(h.path().into()), None).unwrap();
+        assert_eq!(c.reap_grace, Duration::from_secs(300));
     }
 
     #[test]

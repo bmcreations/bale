@@ -447,6 +447,25 @@ fn insert_context(fields: &mut Map<String, Value>) {
     }
 }
 
+/// Writes the `op` line for one reaped DerivedData folder: `bytes_freed` is
+/// what the folder held when `Ok`. Best-effort.
+pub fn reaped(home: &BaleHome, bytes: u64, removed: bool, duration: Duration) {
+    let mut fields = Map::new();
+    fields.insert("op".into(), "reap".into());
+    fields.insert("id".into(), Value::Null);
+    fields.insert(
+        "outcome".into(),
+        if removed { "ok" } else { "error" }.into(),
+    );
+    if !removed {
+        fields.insert("reason".into(), "io".into());
+    }
+    fields.insert("duration_ms".into(), ms(duration).into());
+    insert_context(&mut fields);
+    fields.insert("bytes_freed".into(), removed.then_some(bytes).into());
+    emit(home, "op", fields);
+}
+
 /// Writes the `op` line for an operation whose target was gone before it
 /// could run: outcome and reason `missing`, the target's `path`, and its
 /// id when a record for that path exists. Best-effort.

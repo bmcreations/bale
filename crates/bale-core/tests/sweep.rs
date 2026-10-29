@@ -90,6 +90,102 @@ fn missing_dir_is_reported_and_other_is_processed() {
     assert!(!kept.join("app/build").exists());
 }
 
+/// A worktree made with plain `git worktree add`, which no hook saw.
+fn plain_worktree(fx: &Fixture, name: &str) -> PathBuf {
+    fx.add_worktree(name, name)
+}
+
+fn adopt_rows(rows: &[(String, Action, String)]) -> Vec<&(String, Action, String)> {
+    rows.iter().filter(|r| r.1 == Action::Adopt).collect()
+}
+
+#[test]
+fn sweep_adopts_worktrees_of_a_known_repo_that_were_never_registered() {
+    let fx = Fixture::new();
+    let known = plain_worktree(&fx, "known");
+    let missed = plain_worktree(&fx, "missed");
+    let known_id = register(&fx.home(), &known).unwrap().id;
+    // idle_stash_minutes = 0 would stash any tree a restoring hook covers.
+    global_config(&fx.home(), "idle_stash_minutes = 0\n");
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let adopted = adopt_rows(&rows);
+    assert_eq!(adopted.len(), 1, "{rows:?}");
+    let id = &adopted[0].0;
+    assert_ne!(id, &known_id);
+    let rec = Registry::open(fx.home()).get(id).unwrap().unwrap();
+    assert_eq!(rec.path, bale_core::paths::canonicalize(&missed).unwrap());
+    assert_eq!(rec.level, Level::Hot);
+    assert!(!rec.restore_hook && rec.stash.is_none());
+    // The main checkout stays out, and a second sweep adopts nothing more.
+    assert_eq!(Registry::open(fx.home()).all_lenient().unwrap().len(), 2);
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(adopt_rows(&rows).is_empty(), "{rows:?}");
+    assert_ne!(row(&rows, id).1, Action::Stash);
+    assert!(
+        !Registry::open(fx.home())
+            .get(id)
+            .unwrap()
+            .unwrap()
+            .restore_hook
+    );
+}
+
+#[test]
+fn sweep_does_not_adopt_what_adopt_refuses_or_is_not_there() {
+    let fx = Fixture::new();
+    let known = plain_worktree(&fx, "known");
+    register(&fx.home(), &known).unwrap();
+    // A worktree whose directory is gone is prunable.
+    let gone = plain_worktree(&fx, "gone");
+    fs::remove_dir_all(&gone).unwrap();
+    // A gitfile pointing at the main git dir is not a linked worktree's.
+    let fake = plain_worktree(&fx, "fake");
+    fs::write(
+        fake.join(".git"),
+        format!("gitdir: {}\n", fx.repo.join(".git").display()),
+    )
+    .unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(adopt_rows(&rows).is_empty(), "{rows:?}");
+    // Only `known`: the main checkout is never adopted.
+    assert_eq!(Registry::open(fx.home()).all_lenient().unwrap().len(), 1);
+}
+
+#[test]
+fn dry_run_reports_missed_worktrees_without_registering() {
+    let fx = Fixture::new();
+    register(&fx.home(), &plain_worktree(&fx, "known")).unwrap();
+    plain_worktree(&fx, "missed");
+
+    let rows = sweep(&fx.home(), true).unwrap();
+    let adopted = adopt_rows(&rows);
+    assert_eq!(adopted.len(), 1, "{rows:?}");
+    assert!(adopted[0].2.starts_with("would adopt"), "{rows:?}");
+    assert_eq!(Registry::open(fx.home()).all_lenient().unwrap().len(), 1);
+}
+
+#[test]
+fn a_broken_repo_does_not_stop_adoption_elsewhere() {
+    let broken = Fixture::new();
+    let broken_wt = plain_worktree(&broken, "wt");
+    let fx = Fixture::new();
+    let wt = plain_worktree(&fx, "known");
+    let home = fx.home();
+    let broken_id = register(&home, &broken_wt).unwrap().id;
+    register(&home, &wt).unwrap();
+    plain_worktree(&fx, "missed");
+    // The first tree's record names a repo that is not there.
+    let reg = Registry::open(home.clone());
+    let mut rec = reg.get(&broken_id).unwrap().unwrap();
+    rec.repo_common_dir = broken.repo.join("no-such-git-dir");
+    reg.put(&rec).unwrap();
+
+    let rows = sweep(&home, false).unwrap();
+    assert_eq!(adopt_rows(&rows).len(), 1, "{rows:?}");
+}
+
 #[test]
 fn fresh_worktree_is_kept() {
     let fx = Fixture::new();
@@ -409,6 +505,7 @@ mod warm {
             idle_baled: Duration::from_secs(4 * 3600),
             idle_cold: Duration::from_secs(7 * 86400),
             idle_stash: Duration::from_secs(600),
+            reap_grace: Duration::from_secs(3600),
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
             regenerable_extra: Vec::new(),

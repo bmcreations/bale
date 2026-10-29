@@ -5,6 +5,8 @@ pub mod meta;
 pub mod migrate;
 pub mod new;
 pub mod open;
+#[cfg(target_os = "macos")]
+mod reap;
 pub mod stash;
 pub mod sweep;
 pub mod unstash;

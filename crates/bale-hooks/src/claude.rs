@@ -309,6 +309,11 @@ pub fn remove(home: &BaleHome) -> Result<ExitCode> {
 /// What a prompt or pre-tool hook needs from its payload: the tree to restore.
 /// `None` (with a line on stderr) for a payload that must not block the user.
 fn hook_cwd(event: &str) -> Option<PathBuf> {
+    hook_input(event).map(|(cwd, _)| cwd)
+}
+
+/// [`hook_cwd`] with the payload it came from.
+fn hook_input(event: &str) -> Option<(PathBuf, Value)> {
     let payload = match read_payload() {
         Ok(p) => p,
         Err(e) => {
@@ -317,7 +322,7 @@ fn hook_cwd(event: &str) -> Option<PathBuf> {
         }
     };
     match field(&payload, "cwd") {
-        Ok(cwd) if Path::new(cwd).is_dir() => Some(PathBuf::from(cwd)),
+        Ok(cwd) if Path::new(cwd).is_dir() => Some((PathBuf::from(cwd), payload.clone())),
         Ok(cwd) => {
             eprintln!("bale: {event} hook ignored: cwd {cwd:?} is not a directory");
             None
@@ -390,9 +395,10 @@ pub fn prompt(home: &BaleHome) -> ExitCode {
 /// and the store is not opened.
 pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
     crate::as_hook(Tool::Claude, || {
-        let Some(cwd) = hook_cwd("pre-tool") else {
+        let Some((cwd, payload)) = hook_input("pre-tool") else {
             return ExitCode::SUCCESS;
         };
+        learn_dd_roots(home, &payload, &cwd);
         let (path, id) = match tree_containing(home, &cwd) {
             Ok(Some(tree)) => tree,
             Ok(None) => return ExitCode::SUCCESS,
@@ -429,6 +435,110 @@ pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
         }
         ExitCode::SUCCESS
     })
+}
+
+/// Records the `-derivedDataPath` of a Bash command as a DerivedData root
+/// for sweep to reap once its project is gone. Best-effort: the hook's exit
+/// code and output never depend on it, and a command without the flag costs
+/// one substring search.
+fn learn_dd_roots(home: &BaleHome, payload: &Value, cwd: &Path) {
+    let Some(command) = payload["tool_input"]["command"].as_str() else {
+        return;
+    };
+    if !command.contains(DD_FLAG) {
+        return;
+    }
+    let user_home = bale_core::paths::home_dir();
+    for root in derived_data_paths(command, cwd, user_home.as_deref()) {
+        let _ = bale_core::derived_data::learn_root(home, &root);
+    }
+}
+
+const DD_FLAG: &str = "-derivedDataPath";
+
+/// The argument after each `-derivedDataPath` in `command`, as an absolute
+/// path: quotes removed, a leading `~` expanded to `user_home`, a relative
+/// path joined to `cwd`. An argument that needs the shell to resolve
+/// (`$VAR`, `$(..)`, backticks), is missing, or looks like another flag is
+/// left out.
+fn derived_data_paths(command: &str, cwd: &Path, user_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (at, _) in command.match_indices(DD_FLAG) {
+        let starts_word = command[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '\'' | '"' | ';' | '&' | '|' | '('));
+        let rest = &command[at + DD_FLAG.len()..];
+        if !starts_word || !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(arg) = shell_word(rest.trim_start()) else {
+            continue;
+        };
+        if arg.is_empty() || arg.starts_with('-') || arg.contains(['$', '`']) {
+            continue;
+        }
+        let path = if arg == "~" || arg.starts_with("~/") {
+            match user_home {
+                Some(h) => h.join(arg[1..].trim_start_matches('/')),
+                None => continue,
+            }
+        } else {
+            cwd.join(&arg)
+        };
+        let path = lexical(&path);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The first shell word of `s` with quotes and backslash escapes resolved;
+/// `None` for an unterminated quote.
+fn shell_word(s: &str) -> Option<String> {
+    let mut word = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')') => break,
+            '\\' => word.push(chars.next()?),
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    c => word.push(c),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => word.push(chars.next()?),
+                    c => word.push(c),
+                }
+            },
+            c => word.push(c),
+        }
+    }
+    Some(word)
+}
+
+/// `path` without `.` components and with `..` applied, without touching
+/// the disk (the folder may not exist yet).
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(c);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Prints and removes the failure a background restore left for the tree;
@@ -1131,5 +1241,77 @@ mod tests {
         let (tree, dir) = project(home.path());
         fs::write(dir.join("s.jsonl"), "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(session_title(home.path(), &tree, Some("s")), None);
+    }
+
+    #[cfg(unix)]
+    fn dd_args(command: &str) -> Vec<PathBuf> {
+        derived_data_paths(
+            command,
+            Path::new("/work/tree"),
+            Some(Path::new("/home/me")),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_path_takes_the_next_argument() {
+        assert_eq!(
+            dd_args("xcodebuild -scheme A -derivedDataPath /tmp/fc-1-dd build"),
+            vec![PathBuf::from("/tmp/fc-1-dd")]
+        );
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath '/tmp/my dd' -quiet"),
+            vec![PathBuf::from("/tmp/my dd")]
+        );
+        assert_eq!(
+            dd_args("cd x && xcodebuild -derivedDataPath \"/tmp/q dd\""),
+            vec![PathBuf::from("/tmp/q dd")]
+        );
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath /tmp/a\\ b"),
+            vec![PathBuf::from("/tmp/a b")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_path_expands_tilde_and_resolves_relative() {
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath ~/dd"),
+            vec![PathBuf::from("/home/me/dd")]
+        );
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath ./build/../dd"),
+            vec![PathBuf::from("/work/tree/dd")]
+        );
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath dd"),
+            vec![PathBuf::from("/work/tree/dd")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_path_skips_what_it_cannot_resolve() {
+        for cmd in [
+            "xcodebuild build",
+            "xcodebuild -derivedDataPath",
+            "xcodebuild -derivedDataPath -quiet",
+            "xcodebuild -derivedDataPath $TMPDIR/dd",
+            "xcodebuild -derivedDataPath \"$(mktemp -d)\"",
+            "xcodebuild -derivedDataPath 'unterminated",
+            "echo not-derivedDataPath /tmp/x",
+        ] {
+            assert!(dd_args(cmd).is_empty(), "{cmd}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_path_finds_every_use() {
+        assert_eq!(
+            dd_args("xcodebuild -derivedDataPath /a build; xcodebuild -derivedDataPath /b test"),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 }

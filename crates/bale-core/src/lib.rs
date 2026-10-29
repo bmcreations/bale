@@ -59,6 +59,11 @@ impl BaleHome {
         self.0.join(id)
     }
 
+    /// DerivedData roots learned from `-derivedDataPath`, one path per line.
+    pub fn dd_roots_file(&self) -> PathBuf {
+        self.0.join("dd-roots")
+    }
+
     /// Where the local usage trace is kept (see [`trace`]).
     pub fn trace_dir(&self) -> PathBuf {
         self.0.join("trace")

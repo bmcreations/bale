@@ -143,6 +143,27 @@ fn home_is_under_fixture() {
 }
 
 #[test]
+fn bare_repo_is_listed_as_bare() {
+    let fx = Fixture::new();
+    let bare = fx.repo.parent().unwrap().join("bare.git");
+    sh(
+        &fx.repo,
+        &[
+            "clone",
+            "--bare",
+            fx.repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let wt = fx.repo.parent().unwrap().join("from-bare");
+    sh(&bare, &["worktree", "add", wt.to_str().unwrap(), "main"]);
+    let list = git::worktrees(&bare).unwrap();
+    assert!(list[0].bare && list[0].is_main, "{list:?}");
+    assert!(!list[1].bare, "{list:?}");
+    assert!(!git::worktrees(&fx.repo).unwrap().iter().any(|w| w.bare));
+}
+
+#[test]
 fn is_dirty_does_not_need_index_lock() {
     let fx = Fixture::new();
     let wt = fx.add_worktree("wt", "feat");

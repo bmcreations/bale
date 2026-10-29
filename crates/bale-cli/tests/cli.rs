@@ -3583,6 +3583,110 @@ fn pre_tool_not_stashed_is_fast() {
     assert!(!env.bale_home().join("store").exists());
 }
 
+fn bash_payload(cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "session_id": "s",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_tool_learns_derived_data_path_from_a_bash_command() {
+    let env = Env::new();
+    let cwd = env.repo.clone();
+    let run = |command: &str| {
+        let out = env.bale(
+            &cwd,
+            &["hook", "claude", "pre-tool"],
+            Some(&bash_payload(&cwd, command)),
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(stderr(&out), "");
+    };
+    let roots = env.bale_home().join("dd-roots");
+    run("ls -la");
+    assert!(!roots.exists());
+    run("xcodebuild -scheme App -derivedDataPath /tmp/fc-1-dd build");
+    run("xcodebuild -derivedDataPath rel-dd test");
+    run("xcodebuild -derivedDataPath /tmp/fc-1-dd build");
+    assert_eq!(
+        fs::read_to_string(&roots).unwrap(),
+        format!("/tmp/fc-1-dd\n{}\n", cwd.join("rel-dd").display())
+    );
+}
+
+/// A hook-learned `-derivedDataPath` root whose project was deleted is reaped
+/// by the next sweep once past the grace period; `--dry-run` only reports.
+#[cfg(target_os = "macos")]
+#[test]
+fn sweep_reaps_a_derived_data_root_the_hook_learned() {
+    let env = Env::new();
+    let dd = env.home().join("fc-9-dd");
+    fs::create_dir_all(dd.join("Build/Products")).unwrap();
+    fs::write(dd.join("Build/Products/out"), vec![0u8; 4096]).unwrap();
+    let missing = env.home().join("deleted-wt/App.xcodeproj");
+    fs::write(
+        dd.join("info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>{}</string></dict></plist>\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&bash_payload(
+            &env.repo,
+            &format!("xcodebuild -derivedDataPath {} build", dd.display()),
+        )),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [dd.clone(), dd.join("info.plist"), dd.join("Build")] {
+        fs::File::open(p).unwrap().set_modified(old).unwrap();
+    }
+
+    let out = env.bale(&env.repo, &["sweep", "--dry-run"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("reap  would reap"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(dd.exists());
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("reap  reaped"), "{}", stdout(&out));
+    assert!(!dd.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_tool_ignores_a_derived_data_path_it_cannot_write() {
+    let env = Env::new();
+    // A directory where the file belongs makes the append fail.
+    fs::create_dir_all(env.bale_home().join("dd-roots")).unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&bash_payload(
+            &env.repo,
+            "xcodebuild -derivedDataPath /tmp/x",
+        )),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!((stdout(&out).as_str(), stderr(&out).as_str()), ("", ""));
+}
+
 #[test]
 fn hook_prompt_outside_any_tree_is_noop() {
     let env = Env::new();
