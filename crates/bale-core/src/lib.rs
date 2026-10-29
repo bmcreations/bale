@@ -65,6 +65,11 @@ impl BaleHome {
         self.0.join("dd-roots")
     }
 
+    /// Shared Swift packages folders, one `<key>` directory each.
+    pub fn spm_dir(&self) -> PathBuf {
+        self.0.join("spm")
+    }
+
     /// Where the local usage trace is kept (see [`trace`]).
     pub fn trace_dir(&self) -> PathBuf {
         self.0.join("trace")
