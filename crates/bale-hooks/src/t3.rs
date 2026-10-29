@@ -390,8 +390,7 @@ pub fn install_plan(base: &Path, exe: &Path, backups: &Path) -> Result<Plan> {
 /// shell that cannot run bale's sh command.
 fn context_notes(obj: &Map<String, Value>, path: &Path) -> Vec<Step> {
     let mut notes = vec![Step::Note(format!(
-        "note: T3 Code's settings: {} ($T3CODE_HOME/userdata, else ~/.t3/userdata); set \
-         T3CODE_HOME to T3 Code's base dir if it runs with another",
+        "note: T3 Code's settings: {}",
         display_path(path)
     ))];
     if obj.get("projectSettingsFolded").and_then(Value::as_bool) != Some(true) {
@@ -819,6 +818,21 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
         assert_eq!(out.status.code(), Some(7));
+    }
+
+    /// T3 Code decodes a missing projectSettingsFolded as false, so the note
+    /// that projects may skip bale's scripts shows unless it is true.
+    #[test]
+    fn folded_note_shows_unless_folded_is_true() {
+        let folded = |text: &str| {
+            let v: Value = serde_json::from_str(text).unwrap();
+            context_notes(v.as_object().unwrap(), Path::new("/s.json"))
+                .iter()
+                .any(|n| matches!(n, Step::Note(t) if t.contains("projectSettingsFolded")))
+        };
+        assert!(folded("{}"));
+        assert!(folded(r#"{"projectSettingsFolded": false}"#));
+        assert!(!folded(r#"{"projectSettingsFolded": true}"#));
     }
 
     #[test]

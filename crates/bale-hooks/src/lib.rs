@@ -156,7 +156,18 @@ pub fn install_plan<'a>(
         Tool::Conductor => conductor::install_plan(need(repo)?, exe, backups),
         Tool::Cursor => cursor::install_plan(need(repo)?, exe, backups),
         Tool::Codex => codex::install_plan(exe),
-        Tool::T3 => t3::install_plan(&t3_home(home), exe, backups),
+        Tool::T3 => {
+            let mut plan = t3::install_plan(&t3_home(home), exe, backups)?;
+            if std::env::var_os("T3CODE_HOME").is_none_or(|v| v.is_empty()) {
+                plan.extend(Plan::new(vec![install::Step::Note(
+                    "note: T3CODE_HOME is not set here, so this is ~/.t3. T3 Code can run \
+                     with another base dir (`echo $T3CODE_HOME` in a T3 Code terminal shows \
+                     it); if so, uninstall this and rerun with T3CODE_HOME set to that dir"
+                        .to_string(),
+                )]));
+            }
+            Ok(plan)
+        }
     }
 }
 
