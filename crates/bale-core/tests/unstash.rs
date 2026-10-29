@@ -1,7 +1,7 @@
 mod support;
 
 use bale_core::lock::WorkspaceLock;
-use bale_core::ops::stash::{stash, StashOutcome};
+use bale_core::ops::stash::{stash, stash_with, StashOpts, StashOutcome};
 use bale_core::ops::unstash::{unstash, unstash_path, unstash_with, UnstashOpts, UnstashReport};
 use bale_core::ops::up::register;
 use bale_core::registry::{Record, Registry};
@@ -313,8 +313,135 @@ fn corrupt_blob_errs_and_leaves_stub() {
     assert!(format!("{err:#}").contains(A), "{err:#}");
     assert_eq!(len(&wt.join(A)), 0);
     assert_eq!(ino(&wt.join(A)), a.ino);
-    let st = record(&fx.home(), &id).stash.unwrap();
-    assert!(st.restoring && !st.restored);
+    // The other file is restored, the lost one leaves the manifest, and the
+    // tree is no longer mid-restore: the next prompt has nothing to do.
+    assert_eq!(len(&wt.join(B)), (3 * MIB) as u64);
+    let m = manifest(&fx.home(), &id);
+    assert_eq!(m.entries.len(), 1);
+    assert_eq!(m.entries[0].rel, Path::new(B));
+    assert_restored_state(&fx.home(), &id);
+    assert!(unstash(&fx.home(), &id).unwrap().is_none());
+}
+
+/// Corrupts the stored blob of the manifest entry at `rel`.
+fn corrupt_blob(home: &BaleHome, id: &str, rel: &str) {
+    let e = manifest(home, id)
+        .entries
+        .into_iter()
+        .find(|e| e.rel == Path::new(rel))
+        .unwrap();
+    let zst = walkdir::WalkDir::new(home.0.join("store/objects"))
+        .into_iter()
+        .flatten()
+        .find(|f| f.file_name().to_str() == Some(&format!("{}.zst", e.hash)))
+        .unwrap()
+        .into_path();
+    let mut frame = fs::read(&zst).unwrap();
+    let mid = frame.len() / 2;
+    for b in &mut frame[mid..mid + 64] {
+        *b ^= 0x5A;
+    }
+    fs::write(&zst, frame).unwrap();
+}
+
+/// A lost blob must not keep the tree mid-restore, or every later prompt
+/// would overwrite what the build wrote meanwhile.
+#[test]
+fn lost_blob_does_not_clobber_rebuilt_file() {
+    let (fx, wt, id) = setup();
+    let b_old = fs::read(wt.join(B)).unwrap();
+    do_stash(&fx.home(), &id);
+    corrupt_blob(&fx.home(), &id, A);
+    assert!(unstash(&fx.home(), &id).is_err());
+    assert!(
+        fs::read(wt.join(B)).unwrap() == b_old,
+        "B restored by run 1"
+    );
+    // A build now rewrites B in place.
+    let new_b = noise(MIB, 77);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(wt.join(B))
+        .unwrap();
+    f.write_all(&new_b).unwrap();
+    drop(f);
+    assert!(unstash(&fx.home(), &id).unwrap().is_none());
+    assert!(
+        fs::read(wt.join(B)).unwrap() == new_b,
+        "build's B overwritten"
+    );
+}
+
+/// A prompt that arrives while a stash holds the lock (hashing, record not
+/// yet moved) waits for it instead of reporting nothing to do, and asks the
+/// stash to stop.
+#[test]
+fn prompt_waits_for_a_stash_holding_the_lock() {
+    let (fx, _wt, id) = setup();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let home = fx.home();
+    let lock_id = id.clone();
+    let holder = std::thread::spawn(move || {
+        let lock = WorkspaceLock::try_acquire(&home, &lock_id)
+            .unwrap()
+            .unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        lock.requested()
+    });
+    rx.recv().unwrap();
+    let t = Instant::now();
+    assert!(unstash(&fx.home(), &id).unwrap().is_none());
+    assert!(t.elapsed() >= Duration::from_millis(250), "did not wait");
+    assert!(holder.join().unwrap(), "the holder was not asked to stop");
+}
+
+/// A stash that a prompt asks to stop gives up before committing, leaving
+/// every file whole.
+#[test]
+fn stash_stops_for_a_waiting_prompt() {
+    let (fx, wt, id) = setup();
+    let home = fx.home();
+    let waiter = std::sync::Mutex::new(None);
+    let prompt = || {
+        let (home, id) = (home.clone(), id.clone());
+        *waiter.lock().unwrap() = Some(std::thread::spawn(move || unstash(&home, &id)));
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let opts = StashOpts {
+        before_commit: Some(&prompt),
+        ..Default::default()
+    };
+    let out = stash_with(&fx.home(), &id, &[], &opts).unwrap();
+    assert!(
+        matches!(&out, StashOutcome::Skipped(s) if s == "prompt waiting"),
+        "{out:?}"
+    );
+    let r = waiter.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(r.unwrap().is_none());
+    assert_eq!(len(&wt.join(A)), (2 * MIB) as u64);
+    assert_eq!(len(&wt.join(B)), (3 * MIB) as u64);
+    assert!(record(&fx.home(), &id).stash.is_none());
+}
+
+/// After a stash committed its manifest but stopped before truncating, the
+/// files are whole; unstash drops them without calling them newer.
+#[test]
+fn never_stubbed_files_are_not_counted_newer() {
+    let (fx, wt, id) = setup();
+    let before = [snapshot(&wt.join(A)), snapshot(&wt.join(B))];
+    let opts = StashOpts {
+        fail_before_truncate: true,
+        ..Default::default()
+    };
+    assert!(stash_with(&fx.home(), &id, &[], &opts).is_err());
+    assert!(!record(&fx.home(), &id).stash.unwrap().restored);
+
+    let r = restored(&fx.home(), &id);
+    assert_eq!((r.files, r.kept_newer, r.recreated), (0, 0, 0));
+    assert!([snapshot(&wt.join(A)), snapshot(&wt.join(B))] == before);
+    assert_restored_state(&fx.home(), &id);
 }
 
 #[test]

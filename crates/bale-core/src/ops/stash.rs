@@ -59,7 +59,12 @@ pub struct StashOpts<'a> {
     pub fail_before_truncate: bool,
     /// Called at the same point, just before truncation starts.
     pub before_truncate: Option<&'a dyn Fn()>,
+    /// Called once the blobs are stored, before the manifest is written.
+    pub before_commit: Option<&'a dyn Fn()>,
 }
+
+/// Why a stash gave the lock up part way: a prompt asked for the tree.
+const PROMPT_WAITING: &str = "prompt waiting";
 
 /// Stashes the large files in the tree's build-output dirs (see
 /// [`stash_dirs`]). Processes in `ignore_pids` do not count as holding the
@@ -77,7 +82,7 @@ pub fn stash_with(
 ) -> Result<StashOutcome> {
     let start = Instant::now();
     let skip = |s: &str| Ok(StashOutcome::Skipped(s.to_string()));
-    let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
+    let Some(lock) = WorkspaceLock::try_acquire(home, id)? else {
         return skip("locked");
     };
     let registry = Registry::open(home.clone());
@@ -115,6 +120,7 @@ pub fn stash_with(
         dirs,
         ignore_pids,
         start,
+        lock: &lock,
     };
     match run.record.stash.clone() {
         Some(s) if !s.restored => run.resume(&s.commitment),
@@ -141,6 +147,9 @@ struct Run<'a> {
     dirs: Vec<PathBuf>,
     ignore_pids: &'a [u32],
     start: Instant,
+    /// Polled so a waiting prompt (unstash) stops the stash; see
+    /// [`WorkspaceLock::requested`].
+    lock: &'a WorkspaceLock,
 }
 
 /// A file picked for stashing, with the stat it was hashed at.
@@ -199,16 +208,25 @@ impl Run<'_> {
             .unwrap_or_default();
 
         let index = Mutex::new(Index::load(self.store, id)?);
-        let mut found: Vec<Candidate> = par_map(&rels, |rel| hash_one(&self.root, rel, &index))
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let lock = self.lock;
+        let mut found: Vec<Candidate> = par_map(&rels, |rel| {
+            if lock.requested() {
+                return Ok(None);
+            }
+            hash_one(&self.root, rel, &index)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
         let mut index = index.into_inner().unwrap_or_else(|e| e.into_inner());
         let keep: BTreeSet<PathBuf> = rels.iter().cloned().collect();
         index.forget_missing(&keep);
         index.save(self.store, id)?;
+        if lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
 
         // One put per distinct content, the first file holding it as source.
         let mut sources: Vec<(Hash, PathBuf)> = Vec::new();
@@ -230,6 +248,9 @@ impl Run<'_> {
             if present.contains(hash) {
                 return Ok(Some(0));
             }
+            if lock.requested() {
+                return Ok(None);
+            }
             let base = bases.get(rel).filter(|b| *b != hash);
             let hold = base
                 .filter(|b| self.store.has(b))
@@ -241,10 +262,11 @@ impl Run<'_> {
                 self.store.put(&full, hash, base, cfg.patch_max_depth)?
             };
             // `put` trusts the hash it is given; a file that changed while
-            // it was read left a blob whose bytes may not match its name.
+            // it was read may have left a blob whose bytes do not match its
+            // name. Its entry is dropped, but the blob stays: another tree's
+            // stash may have just found it and reused it. GC reclaims it.
             let now = fs::symlink_metadata(&full).map(|m| stat_of(&m)).ok();
             if now != Some(stats[rel]) {
-                self.store.remove(hash)?;
                 return Ok(None);
             }
             Ok(Some(meta.stored))
@@ -260,6 +282,13 @@ impl Run<'_> {
             }
         }
         found.retain(|c| !dropped.contains(&c.hash));
+        if let Some(f) = opts.before_commit {
+            f();
+        }
+        // Blobs already stored stay for the next stash (or GC).
+        if lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
         if found.is_empty() {
             return Ok(StashOutcome::Skipped("nothing to stash".into()));
         }
@@ -300,6 +329,9 @@ impl Run<'_> {
         if let Some(f) = opts.before_truncate {
             f();
         }
+        if self.lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
         // Hashing and storing can take minutes; a build may have started
         // since the first check. The record already points at the manifest,
         // so the next `stash` finishes the job.
@@ -321,6 +353,9 @@ impl Run<'_> {
     /// for the next stash.
     fn resume(&mut self, commitment: &Hash) -> Result<StashOutcome> {
         let manifest = self.store.read_manifest(commitment)?;
+        if self.lock.requested() {
+            return Ok(StashOutcome::Skipped(PROMPT_WAITING.into()));
+        }
         // Checked again right before cutting, as in `fresh`.
         if let Some(busy) = busy(&self.dirs, self.ignore_pids)? {
             return Ok(StashOutcome::Skipped(busy));

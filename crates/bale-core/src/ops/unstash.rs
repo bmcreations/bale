@@ -7,6 +7,7 @@
 //! until the last one is done, so a run that stops part way is finished by
 //! the next one.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use crate::lock::WorkspaceLock;
 use crate::par::{par_map, ByteBudget};
 use crate::registry::{Record, Registry};
 use crate::store::index::stat_of;
-use crate::store::manifest::Entry;
+use crate::store::manifest::{Entry, StashManifest};
 use crate::store::{sha256_file, Store};
 use crate::BaleHome;
 
@@ -58,7 +59,8 @@ pub struct UnstashOpts {
 }
 
 /// Restores the tree's stashed files. `None` when the tree is not stashed
-/// (or already restored), which costs one record read.
+/// (or already restored), which costs one lock attempt and one record read; a
+/// held lock is waited for (up to 60 s), since a stash may be under way.
 pub fn unstash(home: &BaleHome, id: &str) -> Result<Option<UnstashReport>> {
     unstash_with(home, id, &UnstashOpts::default())
 }
@@ -89,10 +91,6 @@ pub fn unstash_path(home: &BaleHome, cwd: &Path) -> Result<Option<UnstashReport>
     }
 }
 
-fn has_work(rec: &Record) -> bool {
-    rec.stash.as_ref().is_some_and(|s| !s.restored)
-}
-
 #[doc(hidden)]
 pub fn unstash_with(
     home: &BaleHome,
@@ -101,24 +99,19 @@ pub fn unstash_with(
 ) -> Result<Option<UnstashReport>> {
     let start = Instant::now();
     let registry = Registry::open(home.clone());
-    let Some(record) = registry.get(id)? else {
+    // The lock comes before the record read: a stash holds it while hashing,
+    // before it moves the record, so a record read without it can say
+    // "nothing to do" just before the tree is stubbed.
+    let _lock = match WorkspaceLock::try_acquire(home, id)? {
+        Some(lock) => lock,
+        // Ask the holder to stop and wait for it, since the prompt is about
+        // to use the tree.
+        None => wait_for_lock(home, id, opts.lock_wait.unwrap_or(LOCK_WAIT))?,
+    };
+    let Some(mut record) = registry.get(id)? else {
         bail!("no record for {id}; register the worktree first with `bale up <path>`");
     };
-    if !has_work(&record) {
-        return Ok(None);
-    }
-
-    // The prompt is waiting, so wait out a stash or sweep instead of
-    // skipping.
-    let _lock = wait_for_lock(home, id, opts.lock_wait.unwrap_or(LOCK_WAIT))?;
-    // A restore may have finished, or a stash moved the record, meanwhile.
-    let Some(mut record) = registry.get(id)? else {
-        bail!("record for {id} disappeared");
-    };
-    if !has_work(&record) {
-        return Ok(None);
-    }
-    let Some(state) = record.stash.clone() else {
+    let Some(state) = record.stash.clone().filter(|s| !s.restored) else {
         return Ok(None);
     };
     let was_restoring = state.restoring;
@@ -136,25 +129,22 @@ pub fn unstash_with(
         // as half written and gets overwritten. A file a build rewrote in
         // place while the tree was stashed looks the same, so it leaves the
         // manifest first, in the same record write that sets `restoring`.
-        let before = manifest.entries.len();
+        // So does a file a stash committed but never cut (it stopped before
+        // truncating); that one is not counted as newer.
         manifest
             .entries
-            .retain(|e| !rewritten_while_stashed(&root.join(&e.rel), e));
-        pruned = before - manifest.entries.len();
-        let old = state.commitment.clone();
-        let commitment = if pruned > 0 {
-            store.write_manifest(&manifest)?
-        } else {
-            old.clone()
-        };
+            .retain(|e| match look(&root.join(&e.rel), e) {
+                Look::Stub | Look::Missing => true,
+                Look::NeverStubbed => false,
+                Look::Rewritten => {
+                    pruned += 1;
+                    false
+                }
+            });
         if let Some(s) = record.stash.as_mut() {
-            s.commitment = commitment.clone();
             s.restoring = true;
         }
-        registry.put(&record)?;
-        if commitment != old {
-            store.remove_manifest(&old)?;
-        }
+        commit(&store, &registry, &mut record, &manifest)?;
     }
 
     let budget = ByteBudget::new(BASE_BUDGET);
@@ -184,7 +174,9 @@ pub fn unstash_with(
         secs: 0.0,
     };
     let mut errors = Vec::new();
-    for (e, r) in manifest.entries.iter().zip(results) {
+    let mut lost = Vec::new();
+    for (i, r) in results.into_iter().enumerate() {
+        let e = &manifest.entries[i];
         match r {
             Ok(Outcome::Written { recreated }) => {
                 report.files += 1;
@@ -193,11 +185,32 @@ pub fn unstash_with(
             }
             Ok(Outcome::KeptNewer) => report.kept_newer += 1,
             Ok(Outcome::Done) => {}
+            Ok(Outcome::Lost(err)) => lost.push((i, err)),
             Err(err) => errors.push(err),
         }
     }
+
+    // A file whose blob is gone or corrupt can never be restored; retrying
+    // it on every prompt would keep the tree `restoring` and overwrite what
+    // the build writes meanwhile. It stays a stub (the build regenerates it)
+    // and leaves the manifest.
+    let lost_paths: Vec<String> = lost
+        .iter()
+        .map(|(i, err)| format!("{}: {err:#}", manifest.entries[*i].rel.display()))
+        .collect();
+    if !lost.is_empty() {
+        let gone: BTreeSet<usize> = lost.iter().map(|(i, _)| *i).collect();
+        let mut i = 0;
+        manifest.entries.retain(|_| {
+            i += 1;
+            !gone.contains(&(i - 1))
+        });
+    }
     if let Some(first) = errors.into_iter().next() {
         // `restoring` stays set; the next run finishes the job.
+        if !lost.is_empty() {
+            commit(&store, &registry, &mut record, &manifest)?;
+        }
         return Err(first);
     }
 
@@ -205,14 +218,50 @@ pub fn unstash_with(
         s.restored = true;
         s.restoring = false;
     }
-    registry.put(&record)?;
+    commit(&store, &registry, &mut record, &manifest)?;
+    if !lost_paths.is_empty() {
+        bail!(
+            "{} stashed file(s) could not be restored and were left empty for the \
+             build to regenerate: {}",
+            lost_paths.len(),
+            lost_paths.join("; ")
+        );
+    }
     report.secs = start.elapsed().as_secs_f64();
     Ok(Some(report))
+}
+
+/// Points the record at `manifest` (written first if it differs from the
+/// record's), saves the record, then removes the manifest it pointed at
+/// before, so the record never points at a missing manifest.
+fn commit(
+    store: &Store,
+    registry: &Registry,
+    record: &mut Record,
+    manifest: &StashManifest,
+) -> Result<()> {
+    let Some(s) = record.stash.as_mut() else {
+        return registry.put(record);
+    };
+    let old = s.commitment.clone();
+    let new = manifest.commitment();
+    if new != old {
+        store.write_manifest(manifest)?;
+        s.commitment = new.clone();
+    }
+    registry.put(record)?;
+    if new != old {
+        store.remove_manifest(&old)?;
+    }
+    Ok(())
 }
 
 fn wait_for_lock(home: &BaleHome, id: &str, wait: Duration) -> Result<WorkspaceLock> {
     let deadline = Instant::now() + wait;
     loop {
+        // Asked again each time: a stash that took the lock after an earlier
+        // ask would not see it.
+        WorkspaceLock::request(home, id)?;
         if let Some(lock) = WorkspaceLock::try_acquire(home, id)? {
             return Ok(lock);
         }
@@ -235,6 +284,16 @@ enum Outcome {
     KeptNewer,
     /// Already restored (by an earlier run), or not reached.
     Done,
+    /// The blob is missing or corrupt; the file was left empty (or still
+    /// missing) for the build to regenerate.
+    Lost(anyhow::Error),
+}
+
+/// A failed [`Job::stream`]: `blob` when the store could not produce the
+/// bytes, as opposed to the file not taking them.
+struct StreamError {
+    err: anyhow::Error,
+    blob: bool,
 }
 
 struct Job<'a> {
@@ -320,16 +379,24 @@ impl Job<'_> {
         }
         let written = file
             .set_len(0)
-            .map_err(anyhow::Error::from)
+            .map_err(|err| StreamError {
+                err: err.into(),
+                blob: false,
+            })
             .and_then(|()| self.stream(&file, e));
-        if let Err(err) = written {
+        if let Err(StreamError { err, blob }) = written {
             if !self.fail {
-                // Keep the inode; a stub is what the next run expects.
+                // Keep the inode; a stub is what the next run expects, and a
+                // stub with a new mtime is what the build regenerates.
                 let _ = file.set_len(0);
             }
             drop(file);
             let _ = set_mode(path, e.mode, false);
-            return Err(err);
+            return if blob {
+                Ok(Outcome::Lost(err))
+            } else {
+                Err(err)
+            };
         }
         drop(file);
         set_mtime(path, e.mtime_ns)?;
@@ -355,7 +422,12 @@ impl Job<'_> {
             .prefix(".bale-unstash-")
             .tempfile_in(parent)
             .with_context(|| format!("creating a temp file in {}", parent.display()))?;
-        self.stream(tmp.as_file(), e)?;
+        match self.stream(tmp.as_file(), e) {
+            Ok(()) => {}
+            // The temp file goes on drop; the path stays missing.
+            Err(StreamError { err, blob: true }) => return Ok(Outcome::Lost(err)),
+            Err(StreamError { err, blob: false }) => return Err(err),
+        }
         set_mtime(tmp.path(), e.mtime_ns)?;
         set_mode(tmp.path(), e.mode, false)?;
         match tmp.persist_noclobber(path) {
@@ -367,11 +439,12 @@ impl Job<'_> {
 
     /// Streams the entry's blob into `file`, holding its patch base's share
     /// of the budget. `Store::read_to` verifies size and hash after writing.
-    fn stream(&self, file: &File, e: &Entry) -> Result<()> {
-        let meta = self.store.meta(&e.hash)?;
+    fn stream(&self, file: &File, e: &Entry) -> std::result::Result<(), StreamError> {
+        let blob = |err: anyhow::Error| StreamError { err, blob: true };
+        let meta = self.store.meta(&e.hash).map_err(blob)?;
         // Resolving a base below depth 0 holds about twice its size.
         let hold = match &meta.base {
-            Some(b) => 2 * self.store.meta(b)?.size,
+            Some(b) => 2 * self.store.meta(b).map_err(blob)?.size,
             None => 0,
         };
         let _held = self.budget.acquire(hold);
@@ -380,36 +453,57 @@ impl Job<'_> {
             Limit {
                 inner: file,
                 left: self.fail.then_some(e.size / 2),
+                failed: false,
             },
         );
-        self.store.read_to(&e.hash, &mut out)?;
-        out.flush()?;
-        Ok(())
+        let res = self
+            .store
+            .read_to(&e.hash, &mut out)
+            .and_then(|_| out.flush().map_err(anyhow::Error::from));
+        // Any error the file gave is the file's; any other is the blob's.
+        let file_failed = out.get_ref().failed;
+        res.map_err(|err| StreamError {
+            err,
+            blob: !file_failed,
+        })
     }
 }
 
-/// A writer that fails once `left` bytes have gone through (test hook).
+/// Passes writes through, noting whether the destination failed. With
+/// `left` set it fails once that many bytes have gone through (test hook).
 struct Limit<W> {
     inner: W,
     left: Option<u64>,
+    failed: bool,
+}
+
+impl<W: Write> Limit<W> {
+    fn note<T>(&mut self, r: io::Result<T>) -> io::Result<T> {
+        self.failed |= r.is_err();
+        r
+    }
 }
 
 impl<W: Write> Write for Limit<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let Some(left) = self.left.as_mut() else {
-            return self.inner.write(buf);
+        let Some(left) = self.left else {
+            let r = self.inner.write(buf);
+            return self.note(r);
         };
-        if *left == 0 {
-            return Err(io::Error::other("unstash: injected failure mid-file"));
+        if left == 0 {
+            let r = Err(io::Error::other("unstash: injected failure mid-file"));
+            return self.note(r);
         }
-        let n = buf.len().min(*left as usize);
-        let n = self.inner.write(&buf[..n])?;
-        *left -= n as u64;
+        let n = buf.len().min(left as usize);
+        let r = self.inner.write(&buf[..n]);
+        let n = self.note(r)?;
+        self.left = Some(left - n as u64);
         Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        let r = self.inner.flush();
+        self.note(r)
     }
 }
 
@@ -429,15 +523,27 @@ fn fix_mode(path: &Path, meta: &fs::Metadata, e: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// Whether the file at an entry's path is no longer its stub: replaced (a
-/// new inode or not a regular file) or written into. A missing file is not:
-/// it is recreated.
-fn rewritten_while_stashed(path: &Path, e: &Entry) -> bool {
+/// What is at an entry's path before a restore starts.
+enum Look {
+    /// The empty file stash left, at the entry's inode.
+    Stub,
+    /// Gone; it is recreated.
+    Missing,
+    /// Exactly as the entry recorded it: a stash committed the manifest but
+    /// stopped before cutting this file.
+    NeverStubbed,
+    /// Replaced (a new inode, or not a regular file) or written into.
+    Rewritten,
+}
+
+fn look(path: &Path, e: &Entry) -> Look {
     match fs::symlink_metadata(path) {
-        Ok(m) => {
-            let (size, _, ino) = stat_of(&m);
-            !m.file_type().is_file() || ino != e.ino || size != 0
-        }
-        Err(_) => false,
+        Ok(m) if !m.file_type().is_file() => Look::Rewritten,
+        Ok(m) => match stat_of(&m) {
+            (0, _, ino) if ino == e.ino => Look::Stub,
+            stat if stat == (e.size, e.mtime_ns, e.ino) => Look::NeverStubbed,
+            _ => Look::Rewritten,
+        },
+        Err(_) => Look::Missing,
     }
 }

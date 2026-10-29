@@ -1,4 +1,6 @@
 use std::fs::{self, File, OpenOptions};
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use fs4::fs_std::FileExt;
@@ -9,6 +11,8 @@ use crate::BaleHome;
 #[derive(Debug)]
 pub struct WorkspaceLock {
     file: File,
+    /// The lock file's mtime when this holder took it; see [`Self::requested`].
+    mtime_at_acquire: Option<SystemTime>,
 }
 
 impl Drop for WorkspaceLock {
@@ -33,7 +37,13 @@ impl WorkspaceLock {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock_exclusive() {
-            Ok(true) => Ok(Some(WorkspaceLock { file })),
+            Ok(true) => {
+                let mtime_at_acquire = file.metadata().and_then(|m| m.modified()).ok();
+                Ok(Some(WorkspaceLock {
+                    file,
+                    mtime_at_acquire,
+                }))
+            }
             Ok(false) => Ok(None),
             Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
         }
@@ -51,11 +61,34 @@ impl WorkspaceLock {
         };
         match file.try_lock_exclusive() {
             Ok(true) => {
-                drop(WorkspaceLock { file });
+                let _ = FileExt::unlock(&file);
                 Ok(false)
             }
             Ok(false) => Ok(true),
             Err(e) => Err(e).with_context(|| format!("locking {}", path.display())),
         }
     }
+
+    /// Asks the current holder to give the lock up soon, without taking it:
+    /// sets the lock file's mtime to now. Long holders (stash) poll
+    /// [`Self::requested`] and stop. Needs no lock, so a waiting prompt can
+    /// call it. A missing lock file means nobody holds the lock.
+    pub fn request(home: &BaleHome, id: &str) -> Result<()> {
+        let path = lock_path(home, id);
+        match filetime::set_file_mtime(&path, filetime::FileTime::now()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("touching {}", path.display())),
+        }
+    }
+
+    /// Whether someone called [`Self::request`] since this holder took the lock.
+    pub fn requested(&self) -> bool {
+        let now = self.file.metadata().and_then(|m| m.modified()).ok();
+        now != self.mtime_at_acquire
+    }
+}
+
+fn lock_path(home: &BaleHome, id: &str) -> PathBuf {
+    home.locks_dir().join(format!("{id}.lock"))
 }
