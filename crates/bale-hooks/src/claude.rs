@@ -484,9 +484,37 @@ fn spawn_background_unstash(id: &str) -> std::io::Result<()> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // std spawns with handle inheritance on, so the child would inherit
+        // this hook's stdout/stderr pipes despite `Stdio::null()`, and Claude
+        // Code would wait for the restore to close them.
+        disinherit_std_handles();
     }
     // Not waited for: the hook exits and init reaps it.
     cmd.spawn().map(drop)
+}
+
+/// Marks this process's stdin, stdout and stderr handles as not inheritable.
+#[cfg(windows)]
+fn disinherit_std_handles() {
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    extern "system" {
+        fn GetStdHandle(which: u32) -> isize;
+        fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32;
+    }
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on this process's own std handles; an
+        // invalid handle only makes SetHandleInformation fail, which is
+        // ignored.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if handle != 0 && handle != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// Stop: records the turn's end as the tree's last activity. No hashing and

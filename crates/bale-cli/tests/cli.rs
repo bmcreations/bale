@@ -3361,15 +3361,33 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 /// Waits until no background restore for `wt` is running, so no detached
 /// process outlives the test (or its temp dir).
 fn wait_no_background(wt: &Path) {
+    wait_until("background unstash to exit", || !background_running(wt));
+}
+
+/// Whether a `bale unstash --background` for `wt` is running.
+fn background_running(wt: &Path) -> bool {
     let pattern = format!("unstash --background {}", tree_id(wt));
-    wait_until("background unstash to exit", || {
-        !Command::new("pgrep")
-            .args(["-f", &pattern])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    });
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = Command::new("pgrep");
+        cmd.args(["-f", &pattern]);
+        cmd
+    };
+    // No pgrep on Windows; match on bale.exe so PowerShell's own command
+    // line (which holds the pattern) doesn't count.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "if (Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'bale.exe' -and $_.CommandLine -like '*{pattern}*' }}) {{ exit 0 }} else {{ exit 1 }}"
+            ),
+        ]);
+        cmd
+    };
+    cmd.output().unwrap().status.success()
 }
 
 fn prompt_hook(env: &Env, wt: &Path) -> Output {
@@ -3544,12 +3562,7 @@ fn prompt_not_stashed_spawns_nothing() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "");
     assert_eq!(stderr(&out), "");
-    let pattern = format!("unstash --background {}", tree_id(&wt));
-    let found = Command::new("pgrep")
-        .args(["-f", &pattern])
-        .output()
-        .unwrap();
-    assert!(!found.status.success(), "a background restore was spawned");
+    assert!(!background_running(&wt), "a background restore was spawned");
     assert!(!env.bale_home().join("restore-failed").exists());
 }
 
