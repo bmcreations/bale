@@ -15,9 +15,9 @@ use crate::git;
 use crate::idle::last_source_change;
 use crate::ops::cold::cold_if_clean;
 use crate::ops::stash::{stash, StashOutcome};
-use crate::ops::up::{bale_able_from, up_report, Outcome};
+use crate::ops::up::{bale_able_from, register, up_report, Outcome};
 use crate::par::par_map;
-use crate::registry::{Level, Record, Registry};
+use crate::registry::{workspace_id, Level, Record, Registry};
 use crate::trace::{put_clipped, BuildLog, Size, MAX_ID, MAX_PATH};
 use crate::BaleHome;
 
@@ -34,6 +34,8 @@ pub enum Action {
     Stash,
     /// Delete Xcode DerivedData whose project is gone. Its row is keyed by the folder.
     Reap,
+    /// Register a worktree made outside bale's hooks. Its row is keyed by the new id.
+    Adopt,
     Report(String),
 }
 
@@ -90,7 +92,11 @@ pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, Stri
 
 fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
     let start = Instant::now();
-    let records = Registry::open(home.clone()).all_lenient()?;
+    let mut records = Registry::open(home.clone()).all_lenient()?;
+    let adopted = adopt_missed(home, &records, dry_run);
+    if adopted.iter().any(|_| !dry_run) {
+        records = Registry::open(home.clone()).all_lenient()?;
+    }
     // Xcode's shared DerivedData is listed once and each folder in it sized
     // once, however many trees it belongs to.
     let global = global_root().map(|g| index(&g)).unwrap_or_default();
@@ -117,7 +123,8 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
             }
         }
     }
-    let mut rows = Vec::with_capacity(records.len());
+    let mut rows = adopted;
+    rows.reserve(records.len());
     let mut builds = Vec::new();
     let mut paths = Vec::new();
     for ((stem, record), m) in records.into_iter().zip(measured) {
@@ -160,6 +167,83 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
     Ok(rows)
+}
+
+/// Listing one repository's worktrees longer than this is given up on, and
+/// so is adopting once the whole pass has run this long.
+const ADOPT_LIMIT: Duration = Duration::from_secs(20);
+
+/// Registers the worktrees of the repositories behind `records` that exist
+/// on disk but have no record, one row each (`would adopt` on `dry_run`,
+/// when nothing is registered). `git worktree list` runs once per repo, on
+/// up to [`crate::par::THREADS`] threads, and a repo whose listing fails or
+/// misses [`ADOPT_LIMIT`] is skipped. Registering is `up::register`, so its
+/// refusals (the main checkout, a gitfile that is not a linked worktree's)
+/// apply, and the record starts without `restore_hook`: sweep never stashes
+/// an adopted tree until a hook has restored it once.
+fn adopt_missed(
+    home: &BaleHome,
+    records: &[(String, Result<Record>)],
+    dry_run: bool,
+) -> Vec<(String, Action, String)> {
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for record in records.iter().filter_map(|(_, r)| r.as_ref().ok()) {
+        if !repos.contains(&record.repo_common_dir) {
+            repos.push(record.repo_common_dir.clone());
+        }
+    }
+    let deadline = Instant::now() + ADOPT_LIMIT;
+    let listed = list_worktrees(&repos, deadline);
+    let registry = Registry::open(home.clone());
+    let mut rows = Vec::new();
+    for info in listed.iter().flatten().flatten() {
+        if info.is_main || info.bare || info.prunable {
+            continue;
+        }
+        let Ok(path) = crate::paths::canonicalize(&info.path) else {
+            continue;
+        };
+        let id = workspace_id(&path);
+        if !matches!(registry.get(&id), Ok(None)) {
+            continue;
+        }
+        if dry_run {
+            rows.push((id, Action::Adopt, "would adopt".to_string()));
+        } else if Instant::now() < deadline {
+            // A refusal is not news: the same worktree is refused every sweep.
+            if let Ok(record) = register(home, &path) {
+                rows.push((record.id, Action::Adopt, "adopted".to_string()));
+            }
+        }
+    }
+    rows
+}
+
+/// `git worktree list` for each repo in `repos`, in order; `None` for a repo
+/// whose listing failed or was not done by `deadline`.
+fn list_worktrees(repos: &[PathBuf], deadline: Instant) -> Vec<Option<Vec<git::WorktreeInfo>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    let repos = Arc::new(repos.to_vec());
+    let next = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..crate::par::THREADS.min(repos.len()) {
+        let (repos, next, tx) = (repos.clone(), next.clone(), tx.clone());
+        // Detached: a git that hangs past the deadline is left behind.
+        std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(repo) = repos.get(i) else { break };
+            if tx.send((i, git::worktrees(repo).ok())).is_err() {
+                break;
+            }
+        });
+    }
+    drop(tx);
+    let mut out = vec![None; repos.len()];
+    while let Ok((i, list)) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        out[i] = list;
+    }
+    out
 }
 
 /// The rows for DerivedData reaped (or that `dry_run` would reap); none when
@@ -373,7 +457,7 @@ fn trace_tree(
             ("report", Some(text.replace("<id>", &record.id)))
         }
         Action::Report(_) => ("report", Some("probe failed".to_string())),
-        Action::Reap => unreachable!("reap rows are not trees"),
+        Action::Reap | Action::Adopt => unreachable!("reap and adopt rows are not trees"),
     };
     let mut f = Map::new();
     f.insert("id".into(), record.id.clone().into());
@@ -483,7 +567,7 @@ fn sweep_one(
         },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
         Action::Stash => stash_text(stash(home, &record.id, &[])),
-        Action::Reap => unreachable!("reap rows are not trees"),
+        Action::Reap | Action::Adopt => unreachable!("reap and adopt rows are not trees"),
     };
     (action, result, edited)
 }

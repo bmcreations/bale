@@ -124,6 +124,8 @@ pub struct WorktreeInfo {
     /// `Some(reason)` when locked (reason may be empty).
     pub locked: Option<String>,
     pub prunable: bool,
+    /// The entry is a bare repository, which has no checkout.
+    pub bare: bool,
 }
 
 impl WorktreeInfo {
@@ -150,6 +152,7 @@ pub fn worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>> {
                 is_main: list.is_empty(),
                 locked: None,
                 prunable: false,
+                bare: false,
             });
             continue;
         }
@@ -158,6 +161,8 @@ pub fn worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>> {
             cur.head = h.to_string();
         } else if let Some(b) = line.strip_prefix("branch ") {
             cur.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "bare" {
+            cur.bare = true;
         } else if line == "locked" {
             cur.locked = Some(String::new());
         } else if let Some(r) = line.strip_prefix("locked ") {

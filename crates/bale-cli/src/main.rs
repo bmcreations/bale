@@ -566,6 +566,7 @@ fn sweep_lines(id: &str, action: &Action, result: &str) -> Vec<(bool, String)> {
         Action::Cold => "cold",
         Action::Stash => "stash",
         Action::Reap => "reap",
+        Action::Adopt => "adopt",
         Action::Report(_) => "report",
     };
     let line = format!("{id}  {name}  {result}");
