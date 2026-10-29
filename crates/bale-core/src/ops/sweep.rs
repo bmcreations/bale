@@ -156,7 +156,10 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
         }
     }
     #[cfg(target_os = "macos")]
-    rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
+    {
+        rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
+        rows.extend(spm_gc_rows(home, dry_run));
+    }
     let now = SystemTime::now();
     crate::trace::record_builds(home, &builds, now);
     let mut fields = Map::new();
@@ -330,6 +333,23 @@ fn reap_rows(
     };
     let trees: Vec<PathBuf> = roots.iter().flatten().chain(paths).cloned().collect();
     super::reap::reap_orphans(home, global, &trees, cfg.reap_grace, dry_run)
+        .into_iter()
+        .map(|(dir, result)| (dir, Action::Reap, result))
+        .collect()
+}
+
+/// The rows for shared Swift packages folders removed (or that `dry_run`
+/// would remove). Runs whether or not `share_swift_packages` is on.
+#[cfg(target_os = "macos")]
+fn spm_gc_rows(home: &BaleHome, dry_run: bool) -> Vec<(String, Action, String)> {
+    let cfg = match load_config(home, None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::trace::warn(&e);
+            return Vec::new();
+        }
+    };
+    super::spm_gc::collect(home, cfg.reap_grace, dry_run)
         .into_iter()
         .map(|(dir, result)| (dir, Action::Reap, result))
         .collect()
