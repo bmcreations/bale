@@ -32,6 +32,31 @@
 
 ---
 
+### Task 0: Check that Xcode accepts a rewritten output (blocks Task 1)
+
+The plan deletes a stashed file and later writes a new one with the same bytes, mode and mtime. If Xcode's build system compares the inode as well, every restored dylib gets relinked and a 2 s restore turns into a full link step. Gradle compares content, so only Xcode needs this check.
+
+**Files:**
+- Create: `docs/bench/2026-10-warm-tier.md` (Task 10 adds to it). Scripts go in the session scratchpad.
+
+- [ ] **Step 1:** Set up the fixture Task 10 also uses: `git clone --shared` the Flipcash iOS repo into a scratch dir, copy its gitignored `Configurations/secrets.local.xcconfig`, build once with `-derivedDataPath <clone>/.dd CODE_SIGNING_ALLOWED=NO`. Never build in the user's own trees. Delete any global DerivedData folder the build creates.
+- [ ] **Step 2:** Time three incremental builds with no source edit, each preceded by the change below on the largest `*.debug.dylib` under `.dd`. Restore mtime with nanosecond precision (`os.utime(path, ns=(atime, mtime))`), not `touch -r`.
+  1. No change (baseline).
+  2. New inode: copy the file aside, `rm` it, copy it back, restore mode and mtime.
+  3. Same inode: copy the bytes aside, truncate the file to 0 in place, write the bytes back into the same file, restore mtime.
+  Record each build's time and whether the log shows `Ld` or a link step for that target.
+- [ ] **Step 3:** Run `xattr -lr .dd | awk -F: '{print $NF}' | sort | uniq -c | sort -rn | head` and record which extended attributes build output carries.
+- [ ] **Step 4:** Copy a 400 MB file with a 10-line Rust program calling `std::fs::copy`, and compare `df` before and after. Record whether it cloned.
+- [ ] **Step 5:** Apply the outcome before starting Task 1:
+  - If case 2 relinks and case 3 doesn't: in Task 5 step 7, truncate stashed files to 0 bytes in place instead of deleting them. In Task 6, write into the existing file, and treat a non-zero size at a stashed path as a newer file.
+  - If both relink: stop and report. Restoring a stat signature exactly isn't possible, so the warm tier needs a different design.
+  - If neither relinks: the plan stands.
+  - If Step 3 shows xattrs on most large files: in Task 5 step 3, save and restore xattrs with the helpers `cold` already uses in `ops/disk.rs` instead of skipping those files.
+  - If Step 4 shows a full copy: in Task 6, clone with `libc::clonefile` on macOS and fall back to `std::fs::copy` elsewhere.
+- [ ] **Step 6:** Write the numbers to `docs/bench/2026-10-warm-tier.md`, edit this plan's affected tasks, and commit both together: `docs: record Xcode rewrite check for warm tier`. Keep the clone for Task 10.
+
+---
+
 ### Task 1: zstd codec with patch-from
 
 **Files:**
@@ -87,6 +112,8 @@ fn patch_with_wrong_base_fails_or_differs() {
 Run: `cargo test -p bale-core --test store_codec`
 Expected: compile error, `store` module missing.
 
+Memory: debug dylibs reach 470 MB, so whole-buffer calls running 8 at a time could hold several GB at once. Add streaming variants used by the store for files over 64 MiB: `pub fn compress_stream(src: &mut impl Read, dst: &mut impl Write, base: Option<&[u8]>, level: i32) -> Result<u64>` and `pub fn decompress_stream(src: &mut impl Read, dst: &mut impl Write, base: Option<&[u8]>) -> Result<u64>`, built on `zstd_safe::CCtx::compress_stream2` / `DCtx::decompress_stream` with 1 MiB buffers. Only the patch base is held in memory. Add a test that a 100 MiB input round-trips through the streaming pair, with and without a base.
+
 - [ ] **Step 3: Implement `codec.rs`**
 
 Use `zstd_safe::CCtx` / `DCtx` directly; this is what `zstd --patch-from` does underneath. For `compress_patch`: set `CParameter::WindowLog(w)` where `w` = smallest power of two ≥ max(base.len(), data.len()), clamped to 10..=31; set `CParameter::EnableLongDistanceMatching(true)`; `cctx.ref_prefix(base)`; then `compress2`. For `decompress` with a base: set `DParameter::WindowLogMax(31)`, `dctx.ref_prefix(base)`, and decompress into a `Vec` with capacity `size_hint`. If `zstd-safe` 7 does not expose `ref_prefix` on both contexts, stop and report: the alternative is `CCtx::ref_cdict`-free `load_dictionary` with raw-content dictionaries, which needs a design check because a dictionary is limited in size.
@@ -116,7 +143,8 @@ Expected: 3 passed.
   - `pub fn put(&self, src: &Path, hash: &Hash, base: Option<&Hash>, max_depth: u32) -> Result<BlobMeta>`
   - `pub fn has(&self, hash: &Hash) -> bool`
   - `pub fn meta(&self, hash: &Hash) -> Result<BlobMeta>`
-  - `pub fn read(&self, hash: &Hash) -> Result<Vec<u8>>` (resolves the base chain, verifies the SHA-256 of the result)
+  - `pub fn read(&self, hash: &Hash) -> Result<Vec<u8>>` (resolves the base chain, verifies the SHA-256 of the result; for small files and for loading a patch base)
+  - `pub fn read_to(&self, hash: &Hash, dst: &mut impl Write) -> Result<u64>` (streams the decompressed content, hashing as it writes; returns an error on mismatch after writing, so callers write to a temp file)
   - `pub fn remove(&self, hash: &Hash) -> Result<u64>` (bytes freed)
   - `pub fn list(&self) -> Result<Vec<BlobMeta>>`
   - `pub fn sha256_file(path: &Path) -> Result<Hash>` in `store/mod.rs`
@@ -264,7 +292,7 @@ Note on step 1 of `crash_before_delete...`: a rerun with `stash` already `Some(r
 Restore rules:
 - Group entries by hash. For each hash, decompress once into `<dir>/.bale-tmp-<rand>`, verify SHA-256, set mode and mtime (`filetime::set_file_mtime` with nanosecond precision), rename into place. Further entries with the same hash are `std::fs::copy` of the first restored file (an APFS clone) followed by the same mode/mtime set.
 - If a file already exists at `rel`, leave it, count `kept_newer`.
-- Run groups in parallel, 8 at a time.
+- Run groups in parallel, up to 8 at a time, and also cap bytes in flight at 2 GiB (sum of file size plus base size for running groups); a group waits when it would exceed the cap. Write through `Store::read_to` into the temp file, not through `read`.
 - On success set `record.stash.restored = true` and save. A failure mid-way leaves `restored: false`; a rerun restores the rest (present files are skipped by the rule above).
 
 - [ ] **Step 1: Write the failing tests**
@@ -321,6 +349,7 @@ Live manifests are the `stash.commitment` of every record. Live blobs = every en
 Policy changes in `decide` (keep the existing order: cold first):
 - `Hot` or `Baled`, not stashed, `idle_for >= cfg.idle_stash` → `Action::Stash`, unless a cold or up action applies first.
 - A stashed tree never gets `Action::Up`: stashing replaces deleting build output. It still goes cold at `idle_cold`; cold must unstash nothing, and Task 5's manifest stays until GC (cold's existing removal of build dirs deletes the small files; the stashed blobs are dropped by GC once the cold record's stash is cleared — clear `record.stash` in `cold` when it removes the build dirs).
+- `up` on a stashed tree (manual `bale up`): clear `record.stash` when it removes the build dirs, the same as `cold`, so a later unstash doesn't write dylibs into an emptied DerivedData. Add a test: stash, `up`, then `unstash` returns `Ok(None)`.
 - Trace: add a `stash` line `{id, files, bytes, stored_bytes, secs}` and an `unstash` line with the same fields plus `kept_newer`, so the replay can measure real restore times.
 
 - [ ] **Step 1: Write the failing tests** in `tests/sweep.rs`
@@ -335,7 +364,7 @@ Policy changes in `decide` (keep the existing order: cold first):
 - [ ] **Step 2–4:** fail, implement, pass; update existing `decide` call sites and tests for the new parameter.
 - [ ] **Step 5: Commit** — `feat(sweep): stash trees idle past idle_stash`
 
-The launchd sweep runs every 30 minutes, so T = 10 minutes is only met at 30-minute granularity. Change the launchd interval written by `bale install` to 5 minutes in this task (find it with `grep -rn StartInterval crates/`), and note it in the commit message.
+The launchd sweep runs every 30 minutes, so T = 10 minutes is only met at 30-minute granularity. Change the launchd interval written by `bale install` to 5 minutes in this task (find it with `grep -rn StartInterval crates/`), and note it in the commit message. Machines with an existing install keep the 30-minute plist until `bale install` runs again; say so in the PR body.
 
 ---
 
@@ -352,6 +381,7 @@ The launchd sweep runs every 30 minutes, so T = 10 minutes is only met at 30-min
   - `bale hook claude prompt` (for `UserPromptSubmit`) and `bale hook claude pre-tool` (for `PreToolUse` with matcher `Bash`): read the hook JSON from stdin, take `cwd`, call `unstash_path`. Exit 0 on success or when `cwd` is in no tree. On any error, including a hash mismatch, exit 2 with the reason on stderr, so Claude Code blocks the prompt and shows it (spec, Lifecycle step 3: never continue silently). The store and manifest are left as they are.
   - The spec says no work on `PreToolUse`. This plan keeps one hook there, limited to `Bash`, because a tree can be stashed during a permission wait longer than T, after `UserPromptSubmit` has already run. On a tree that isn't stashed it costs one record read.
   - `bale hook claude stop` (for `Stop`): update `last_activity` of the tree at `cwd` and exit. No hashing, no store access.
+  - `prompt` and `pre-tool` also update `last_activity` (the same record write), so a long turn never crosses T and gets stashed while the agent is working.
   - `HOOKS` in `claude.rs` grows to five entries: the existing two plus `("UserPromptSubmit", "prompt")`, `("PreToolUse", "pre-tool")` with matcher `"Bash"`, `("Stop", "stop")`. Install and uninstall plans handle the matcher; uninstall removes only entries bale added (existing behaviour).
 
 - [ ] **Step 1: Write the failing tests**
@@ -362,6 +392,7 @@ The launchd sweep runs every 30 minutes, so T = 10 minutes is only met at 30-min
 #[test] fn hook_prompt_unstashes_tree_at_cwd()       // stash fixture; pipe {"cwd": "<tree>/sub", "hook_event_name": "UserPromptSubmit"} to `bale hook claude prompt` -> exit 0, files back
 #[test] fn hook_prompt_outside_any_tree_is_noop()    // cwd=/tmp -> exit 0, no output on stdout
 #[test] fn hook_prompt_fails_loudly_on_corrupt_blob() // stash, flip a byte in one .zst -> exit 2, stderr names the file, store and manifest unchanged
+#[test] fn hook_pre_tool_bumps_activity()           // last_activity advances after `bale hook claude pre-tool`
 #[test] fn hook_stop_only_touches_activity()         // record last_activity advances; store directory untouched (mtime of store root unchanged)
 // claude.rs tests
 #[test] fn install_plan_adds_prompt_pretool_stop()   // settings JSON gains the three events, PreToolUse with matcher "Bash"; existing user hooks kept
@@ -380,7 +411,7 @@ No code; this checks the plan against the restore budget on real build output be
 **Files:**
 - Create: `docs/bench/2026-10-warm-tier.md` (results), script under the session scratchpad, not in the repo
 
-- [ ] **Step 1:** `cargo build --release`. Using a temp `BALE_HOME` (never `~/.bale`, never `~/.local/bin/bale`), `git clone --shared` the Flipcash iOS repo into a scratch dir, copy its gitignored `Configurations/secrets.local.xcconfig`, build once with `-derivedDataPath <clone>/.dd CODE_SIGNING_ALLOWED=NO`, and `bale adopt` it.
+- [ ] **Step 1:** `cargo build --release`. Using a temp `BALE_HOME` (never `~/.bale`, never `~/.local/bin/bale`), `bale adopt` the clone from Task 0 (rebuild it first if the scratch dir was cleared).
 - [ ] **Step 2:** Run `bale stash` then `bale unstash` 5 times; record stash and restore seconds, stored bytes, and disk freed (`du -sk .dd` before and after stash).
 - [ ] **Step 3:** Make the leaf edit from the spec's calibration (`Flipcash/UI/EnterAmountView.swift` string), incremental build, stash, unstash; record times and stored bytes (expect tens of MB from patching).
 - [ ] **Step 4:** After unstash, run the incremental build again with no edit and record its time. **Expected:** about the same as a no-op build before stashing (seconds). A full rebuild means mtimes or content did not round-trip: stop and report.
