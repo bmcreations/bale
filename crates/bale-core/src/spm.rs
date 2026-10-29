@@ -70,6 +70,7 @@ pub(crate) fn key(resolved: &Path, xcode_build: &str) -> io::Result<String> {
     let bytes = std::fs::read(resolved)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
+    hasher.update([0]);
     hasher.update(xcode_build.as_bytes());
     Ok(hasher
         .finalize()
@@ -79,17 +80,22 @@ pub(crate) fn key(resolved: &Path, xcode_build: &str) -> io::Result<String> {
         .collect())
 }
 
-/// `ProductBuildVersion` of the active Xcode, read from `version.plist` beside
-/// its developer dir (`$DEVELOPER_DIR`, else `xcode-select -p`) without running
-/// `xcodebuild`. Cached per process. `None` off macOS or when it can't be read,
-/// which turns shared packages off for the call.
+/// `ProductBuildVersion` of the active Xcode, read from the `version.plist` of
+/// its developer dir (`$DEVELOPER_DIR`, else the `xcode-select` link, else
+/// `xcode-select -p`) without running `xcodebuild`. A found build is cached per
+/// process. `None` off macOS or when it can't be read, which turns shared
+/// packages off for the call.
 pub(crate) fn xcode_build() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        static BUILD: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        BUILD
-            .get_or_init(|| developer_dir().and_then(|d| build_version(&d)))
-            .clone()
+        static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(b) = BUILD.get() {
+            return Some(b.clone());
+        }
+        let dir = developer_dir(std::env::var_os("DEVELOPER_DIR"), XCODE_SELECT_LINK)
+            .or_else(xcode_select_p)?;
+        let build = build_version(&dir)?;
+        Some(BUILD.get_or_init(|| build).clone())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -97,12 +103,22 @@ pub(crate) fn xcode_build() -> Option<String> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn developer_dir() -> Option<PathBuf> {
-    match std::env::var_os("DEVELOPER_DIR") {
-        Some(d) if !d.is_empty() => return Some(PathBuf::from(d)),
-        _ => {}
+/// Where `xcode-select --switch` records the developer dir.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
+
+/// `$DEVELOPER_DIR` when set and non-empty, else the target of the
+/// `xcode-select` link, which saves spawning `xcode-select -p` in every hook.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn developer_dir(env: Option<std::ffi::OsString>, link: impl AsRef<Path>) -> Option<PathBuf> {
+    match env {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => std::fs::read_link(link).ok(),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn xcode_select_p() -> Option<PathBuf> {
     let out = std::process::Command::new("xcode-select")
         .arg("-p")
         .output()
@@ -115,9 +131,16 @@ fn developer_dir() -> Option<PathBuf> {
     (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
-/// `ProductBuildVersion` from `<developer_dir>/../version.plist`.
+/// `ProductBuildVersion` from `<developer_dir>/../version.plist`, or from
+/// `<developer_dir>/Contents/version.plist` when `$DEVELOPER_DIR` names the
+/// `.app` rather than its `Contents/Developer`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn build_version(developer_dir: &Path) -> Option<String> {
-    let plist = plist::Value::from_file(developer_dir.parent()?.join("version.plist")).ok()?;
+    let beside = developer_dir.parent()?.join("version.plist");
+    let inside = developer_dir.join("Contents/version.plist");
+    let plist = plist::Value::from_file(beside)
+        .or_else(|_| plist::Value::from_file(inside))
+        .ok()?;
     let build = plist
         .as_dictionary()?
         .get("ProductBuildVersion")?
@@ -184,17 +207,32 @@ mod tests {
         assert!(resolved_files(t.path()).is_empty());
     }
 
-    #[test]
-    fn regenerable_dirs_and_git_are_skipped() {
+    fn assert_skipped(dir: &str) {
         let t = tempfile::tempdir().unwrap();
-        for dir in [".git", ".build", "build", "Elsewhere/App-abc"] {
-            write(
-                &xcodeproj_resolved(&t.path().join(dir).join("X.xcodeproj")),
-                "{}",
-            );
-        }
-        // A DerivedData root is recognised by info.plist (with WorkspacePath) and Build/.
+        write(
+            &xcodeproj_resolved(&t.path().join(dir).join("X.xcodeproj")),
+            "{}",
+        );
+        assert_eq!(resolved_files(t.path()), Vec::new(), "{dir}");
+    }
+
+    #[test]
+    fn git_is_skipped() {
+        assert_skipped(".git");
+    }
+
+    #[test]
+    fn build_dirs_are_skipped() {
+        assert_skipped("build");
+        assert_skipped(".build");
+    }
+
+    #[test]
+    fn derived_data_root_is_skipped() {
+        let t = tempfile::tempdir().unwrap();
         let dd = t.path().join("Elsewhere/App-abc");
+        write(&xcodeproj_resolved(&dd.join("X.xcodeproj")), "{}");
+        // A DerivedData root is recognised by info.plist (with WorkspacePath) and Build/.
         write(
             &dd.join("info.plist"),
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -252,6 +290,41 @@ mod tests {
         assert_eq!(build_version(&t.path().join("Contents/Developer")), None);
         write(&t.path().join("Contents/version.plist"), "not a plist");
         assert_eq!(build_version(&t.path().join("Contents/Developer")), None);
+    }
+
+    #[test]
+    fn build_version_accepts_the_app_bundle_form() {
+        let t = tempfile::tempdir().unwrap();
+        write(
+            &t.path().join("Xcode.app/Contents/version.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>ProductBuildVersion</key><string>27A9275</string></dict></plist>"#,
+        );
+        assert_eq!(
+            build_version(&t.path().join("Xcode.app")),
+            Some("27A9275".to_string())
+        );
+    }
+
+    #[test]
+    fn developer_dir_prefers_env_then_the_link() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(
+            developer_dir(Some("/env/Developer".into()), t.path().join("none")),
+            Some(PathBuf::from("/env/Developer"))
+        );
+        assert_eq!(developer_dir(None, t.path().join("none")), None);
+        #[cfg(unix)]
+        {
+            let link = t.path().join("xcode_select_link");
+            std::os::unix::fs::symlink("/x/Contents/Developer", &link).unwrap();
+            for env in [None, Some("".into())] {
+                assert_eq!(
+                    developer_dir(env, &link),
+                    Some(PathBuf::from("/x/Contents/Developer"))
+                );
+            }
+        }
     }
 
     #[test]
