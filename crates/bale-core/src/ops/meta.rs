@@ -65,9 +65,15 @@ impl crate::trace::Traced for Touch {
 /// record gives [`Touch::Untracked`]; a tree whose lock is held is left
 /// alone rather than waited for.
 pub fn touch(home: &BaleHome, path: &Path) -> Result<Touch> {
-    let absolute =
-        std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
-    let id = workspace_id(&absolute);
+    // Records are keyed by the canonical path `register` stores, so a tree
+    // reached through a symlink still finds its record.
+    let canonical = match crate::paths::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => {
+            std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?
+        }
+    };
+    let id = workspace_id(&canonical);
     let registry = Registry::open(home.clone());
     if registry.get(&id)?.is_none() {
         return Ok(Touch::Untracked);
@@ -116,6 +122,7 @@ mod tests {
         let home = BaleHome(tmp.path().join("bale"));
         let tree = tmp.path().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
+        let tree = crate::paths::canonicalize(&tree).unwrap();
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let registry = Registry::open(home.clone());
         registry.put(&record(&tree, old)).unwrap();
@@ -130,6 +137,25 @@ mod tests {
             .collect::<String>();
         assert!(trace.contains("\"op\":\"touch\""), "{trace}");
         assert!(trace.contains("\"outcome\":\"ok\""), "{trace}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn touch_finds_a_tree_reached_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let canonical = crate::paths::canonicalize(&tree).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&tree, &link).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let registry = Registry::open(home.clone());
+        registry.put(&record(&canonical, old)).unwrap();
+
+        assert_eq!(touch(&home, &link).unwrap(), Touch::Touched);
+        let after = registry.get(&workspace_id(&canonical)).unwrap().unwrap();
+        assert!(after.last_activity > old);
     }
 
     #[test]
@@ -147,6 +173,7 @@ mod tests {
         let home = BaleHome(tmp.path().join("bale"));
         let tree = tmp.path().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
+        let tree = crate::paths::canonicalize(&tree).unwrap();
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let registry = Registry::open(home.clone());
         registry.put(&record(&tree, old)).unwrap();
