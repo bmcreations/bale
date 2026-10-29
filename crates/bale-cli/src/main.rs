@@ -87,14 +87,14 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Entry points for Claude Code, Codex, Cursor, Conductor and git hooks.
+    /// Entry points for Claude Code, Codex, Cursor, Conductor, T3 Code and git hooks.
     Hook {
         #[command(subcommand)]
         kind: HookKind,
     },
     /// Install the 30-minute sweep schedule, or with --hooks only those tools' hooks.
     Install {
-        /// Comma-separated tools to hook: claude, git, conductor, cursor, codex.
+        /// Comma-separated tools to hook: claude, git, conductor, cursor, codex, t3.
         #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
         hooks: Vec<bale_hooks::Tool>,
         /// The repo whose hooks to edit; required for git, conductor and cursor.
@@ -112,7 +112,7 @@ enum Command {
     /// ($CLAUDE_CONFIG_DIR/settings.json when that is set) installed by an older bale whose settings.json.bak-bale was since
     /// deleted: bale treats it as its own.
     Uninstall {
-        /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex.
+        /// Comma-separated tools to unhook: claude, git, conductor, cursor, codex, t3.
         #[arg(long, value_name = "LIST", value_delimiter = ',', num_args = 1)]
         hooks: Vec<bale_hooks::Tool>,
         /// The repo whose hooks to edit; required for git, conductor and cursor.
@@ -186,6 +186,11 @@ enum HookKind {
         #[command(subcommand)]
         event: CodexHook,
     },
+    /// T3 Code's worktree setup and settle scripts.
+    T3 {
+        #[command(subcommand)]
+        event: T3Hook,
+    },
 }
 
 #[derive(Subcommand)]
@@ -208,6 +213,16 @@ enum ConductorHook {
 enum CursorHook {
     /// setup: registers the cwd; always exits 0.
     Setup,
+}
+
+#[derive(Subcommand)]
+enum T3Hook {
+    /// setup: registers $T3CODE_WORKTREE_PATH (or the cwd); always exits 0.
+    Setup,
+    /// settle: records a turn's end in $T3CODE_WORKTREE_PATH (or the cwd),
+    /// registering it if bale does not track it; never ups or colds;
+    /// always exits 0.
+    Settle,
 }
 
 #[derive(Subcommand)]
@@ -317,6 +332,12 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             HookKind::Codex {
                 event: CodexHook::Setup { path },
             } => Ok(bale_hooks::codex::setup(&home, path)),
+            HookKind::T3 {
+                event: T3Hook::Setup,
+            } => Ok(bale_hooks::t3::setup(&home)),
+            HookKind::T3 {
+                event: T3Hook::Settle,
+            } => Ok(bale_hooks::t3::settle(&home)),
         },
         Command::Install {
             hooks,

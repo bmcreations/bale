@@ -54,6 +54,14 @@ fn tools_plan(
                     .to_string(),
             )]));
         }
+        if tool == Tool::T3 && repo.is_some() {
+            plan.extend(Plan::new(vec![Step::Note(
+                "note: T3 Code scripts are per-user (~/.t3/userdata/settings.json, or \
+                 $T3CODE_HOME/userdata/settings.json when that is set); --repo is ignored \
+                 for t3"
+                    .to_string(),
+            )]));
+        }
         plan.extend(each(tool)?);
     }
     Ok(plan)
