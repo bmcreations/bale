@@ -32,6 +32,8 @@ pub enum Action {
     Cold,
     /// Truncate the large build files to stubs, keeping them in the store.
     Stash,
+    /// Delete Xcode DerivedData whose project is gone. Its row is keyed by the folder.
+    Reap,
     Report(String),
 }
 
@@ -134,6 +136,8 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
     let now = SystemTime::now();
     crate::trace::record_builds(home, &builds, now);
     let mut fields = Map::new();
@@ -156,6 +160,30 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
     Ok(rows)
+}
+
+/// The rows for DerivedData reaped (or that `dry_run` would reap); none when
+/// the config cannot be read.
+#[cfg(target_os = "macos")]
+fn reap_rows(
+    home: &BaleHome,
+    global: &[DdDir],
+    roots: &[Option<PathBuf>],
+    paths: &[PathBuf],
+    dry_run: bool,
+) -> Vec<(String, Action, String)> {
+    let cfg = match load_config(home, None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::trace::warn(&e);
+            return Vec::new();
+        }
+    };
+    let trees: Vec<PathBuf> = roots.iter().flatten().chain(paths).cloned().collect();
+    super::reap::reap_orphans(home, global, &trees, cfg.reap_grace, dry_run)
+        .into_iter()
+        .map(|(dir, result)| (dir, Action::Reap, result))
+        .collect()
 }
 
 /// Sizing longer than this for one tree's checkout is cut short; the bytes
@@ -345,6 +373,7 @@ fn trace_tree(
             ("report", Some(text.replace("<id>", &record.id)))
         }
         Action::Report(_) => ("report", Some("probe failed".to_string())),
+        Action::Reap => unreachable!("reap rows are not trees"),
     };
     let mut f = Map::new();
     f.insert("id".into(), record.id.clone().into());
@@ -454,6 +483,7 @@ fn sweep_one(
         },
         Action::Cold => outcome_text(cold_if_clean(home, &record.id)),
         Action::Stash => stash_text(stash(home, &record.id, &[])),
+        Action::Reap => unreachable!("reap rows are not trees"),
     };
     (action, result, edited)
 }
@@ -565,6 +595,7 @@ mod tests {
             idle_baled: Duration::from_secs(4 * 3600),
             idle_cold: Duration::from_secs(7 * 86400),
             idle_stash: Duration::from_secs(600),
+            reap_grace: Duration::from_secs(3600),
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
             regenerable_extra: Vec::new(),

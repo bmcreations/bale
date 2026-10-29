@@ -409,6 +409,7 @@ mod warm {
             idle_baled: Duration::from_secs(4 * 3600),
             idle_cold: Duration::from_secs(7 * 86400),
             idle_stash: Duration::from_secs(600),
+            reap_grace: Duration::from_secs(3600),
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
             regenerable_extra: Vec::new(),

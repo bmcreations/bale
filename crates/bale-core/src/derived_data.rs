@@ -29,7 +29,8 @@ pub(crate) struct DdDir {
 }
 
 impl DdDir {
-    fn read(dir: PathBuf) -> DdDir {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn read(dir: PathBuf) -> DdDir {
         let workspace = workspace_path(&dir.join("info.plist"));
         let canonical = workspace
             .as_ref()
@@ -39,6 +40,12 @@ impl DdDir {
             workspace,
             canonical,
         }
+    }
+
+    /// The `WorkspacePath` as recorded, if the folder has a usable plist.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn workspace(&self) -> Option<&Path> {
+        self.workspace.as_deref()
     }
 
     /// True when the project this folder was built from lies inside the

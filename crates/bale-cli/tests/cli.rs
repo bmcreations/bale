@@ -3621,6 +3621,54 @@ fn pre_tool_learns_derived_data_path_from_a_bash_command() {
     );
 }
 
+/// A hook-learned `-derivedDataPath` root whose project was deleted is reaped
+/// by the next sweep once past the grace period; `--dry-run` only reports.
+#[cfg(target_os = "macos")]
+#[test]
+fn sweep_reaps_a_derived_data_root_the_hook_learned() {
+    let env = Env::new();
+    let dd = env.home().join("fc-9-dd");
+    fs::create_dir_all(dd.join("Build/Products")).unwrap();
+    fs::write(dd.join("Build/Products/out"), vec![0u8; 4096]).unwrap();
+    let missing = env.home().join("deleted-wt/App.xcodeproj");
+    fs::write(
+        dd.join("info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>{}</string></dict></plist>\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", "pre-tool"],
+        Some(&bash_payload(
+            &env.repo,
+            &format!("xcodebuild -derivedDataPath {} build", dd.display()),
+        )),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [dd.clone(), dd.join("info.plist"), dd.join("Build")] {
+        fs::File::open(p).unwrap().set_modified(old).unwrap();
+    }
+
+    let out = env.bale(&env.repo, &["sweep", "--dry-run"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("reap  would reap"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(dd.exists());
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("reap  reaped"), "{}", stdout(&out));
+    assert!(!dd.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn pre_tool_ignores_a_derived_data_path_it_cannot_write() {
