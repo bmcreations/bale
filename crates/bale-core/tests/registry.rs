@@ -20,6 +20,7 @@ fn record(id: &str) -> Record {
         origin: None,
         pinned: false,
         scope: None,
+        stash: None,
     }
 }
 

@@ -212,6 +212,7 @@ fn cold_refuses_main_checkout() {
         origin: None,
         pinned: false,
         scope: None,
+        stash: None,
     };
     Registry::open(fx.home()).put(&rec).unwrap();
     let err = cold(&fx.home(), &id).unwrap_err();

@@ -1363,6 +1363,9 @@ fn no_extras() -> Config {
     Config {
         idle_baled: Duration::ZERO,
         idle_cold: Duration::ZERO,
+        idle_stash: Duration::ZERO,
+        stash_min_bytes: 0,
+        patch_max_depth: 0,
         regenerable_extra: Vec::new(),
         ignored_denylist_extra: Vec::new(),
         worktree_root: None,

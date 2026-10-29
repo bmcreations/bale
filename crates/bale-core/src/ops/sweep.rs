@@ -517,6 +517,9 @@ mod tests {
         Config {
             idle_baled: Duration::from_secs(4 * 3600),
             idle_cold: Duration::from_secs(7 * 86400),
+            idle_stash: Duration::from_secs(600),
+            stash_min_bytes: 1 << 20,
+            patch_max_depth: 4,
             regenerable_extra: Vec::new(),
             ignored_denylist_extra: Vec::new(),
             worktree_root: None,

@@ -204,6 +204,7 @@ pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> 
                 origin: None,
                 pinned: false,
                 scope: None,
+                stash: None,
             }
         }
     };

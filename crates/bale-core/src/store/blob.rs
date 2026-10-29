@@ -40,7 +40,7 @@ pub struct BlobMeta {
 }
 
 pub struct Store {
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 
 /// Forwards writes while hashing them.
@@ -61,7 +61,7 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
 }
 
-fn is_hash(s: &str) -> bool {
+pub(super) fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

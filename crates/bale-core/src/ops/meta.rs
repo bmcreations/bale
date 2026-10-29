@@ -113,6 +113,7 @@ mod tests {
             origin: None,
             pinned: false,
             scope: None,
+            stash: None,
         }
     }
 
