@@ -59,3 +59,23 @@ Two ways to write fewer bytes:
 
 - The `.app` and `.appex` copies under `Build/Products` duplicate intermediate binaries: three dylib pairs, 919 MiB. Task 0 showed Xcode accepts a final product with a new inode, so those copies could be restored as APFS clones of their twins instead of rewritten.
 - The spec's lazy file system restores only the files a build opens.
+
+## Duplicate products cloned (2026-10-29)
+
+On macOS, unstash now restores an entry under `Build/Products/` as an APFS clone of a byte-identical entry outside `Build/Products/` that it has just restored, instead of decoding and writing the bytes again. The clone is a new inode; everything else keeps its inode.
+
+On the Task 10 checkout the rule cloned 202.6 MiB of the 5.6 GiB restored (the stash is now 413 files; the checkout carried the leaf edit from Task 10). It did not reach the 919 MiB that Task 10 expected. The three `*.debug.dylib` pairs (312, 281 and 323 MiB) are both under `Build/Products/`: `Flipcash.app/PlugIns/X.appex/X.debug.dylib` and `Debug-iphonesimulator/X.appex/X.debug.dylib`. The rule needs a twin outside `Build/Products/`, so neither copy qualifies. The 202.6 MiB is mostly `Assets.car`, `opencv2` and the `.bundle` resources. Counting every duplicate of a group but its first copy, the manifest holds 1,259 MiB of duplicates.
+
+Restore time showed no gain that the load lets us separate. Eight stash/unstash cycles each with the old and the new release binary, alternating the order between the two rounds, with 1-minute load average 154–189 (`uptime` at each run is in the table; Task 10 ran at 7–13):
+
+| Binary | Restore wall time, s | Median |
+|---|---|---|
+| Before (Task 12 build) | 5.6, 15.3, 10.5, 11.0, 10.4, 3.8, 6.6, 5.3 | 8.5 |
+| With clones | 11.1, 4.1, 4.0, 5.9, 19.7, 8.1, 13.2, 5.2 | 7.0 |
+
+| Run | Load averages (1, 5, 15 min) |
+|---|---|
+| First round, old-1 to new-4 | 153/118/124 to 170/136/130 |
+| Second round, new-1 to old-4 | 181/142/133 to 164/149/136 |
+
+Same-binary runs vary from 3.8 to 15.3 s, so a 1.5 s difference in medians is noise; 202.6 MiB is 3.6% of the bytes. Task 10's numbers (median 5.3 s, worst 10.8 s) were taken at load 7–13, so these runs are not comparable with them either. Cloning the three dylib pairs would save about 916 MiB, 16% of the bytes. Whether Xcode accepts that is untested: Task 0 tested `Flipcash.debug.dylib` in `Flipcash.app/`, not the appex dylibs, and `Debug-iphonesimulator/X.appex/X.debug.dylib` may be the linker's own output.
