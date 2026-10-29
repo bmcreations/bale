@@ -184,7 +184,14 @@ fn run(
             .all_lenient()
             .map_err(|e| ScanError::new("registry", format!("cannot list the records: {e:#}")))?;
         let second = References::scan(home, &records)?;
-        for dir in held.into_iter().filter(|k| !second.contains(k)) {
+        let unreferenced: Vec<PathBuf> = held.into_iter().filter(|k| !second.contains(k)).collect();
+        // A process may have started using a folder since the first check.
+        let still_idle = idle(&unreferenced)?;
+        for dir in unreferenced
+            .into_iter()
+            .zip(still_idle)
+            .filter_map(|(d, i)| i.then_some(d))
+        {
             match condemn(&dir) {
                 Ok(gc) => condemned.push(gc),
                 Err(e) => rows.push((
@@ -422,9 +429,10 @@ impl References {
 
     /// A tree's own folders as DerivedData roots: `<tree>`, each
     /// `<tree>/<child>` (such as `.dd`), and `<tree>/<child>/DerivedData`
-    /// (such as `build/DerivedData`). A child the user can't read is skipped:
-    /// a tree holds many folders, and one of them being locked must not stop
-    /// the cleanup. Anything deeper that fails still does.
+    /// (such as `build/DerivedData`). A `<tree>/<child>` that cannot be listed
+    /// for lack of permission is skipped: a tree holds many folders, and one
+    /// of them being locked must not stop the cleanup. Any failure below a
+    /// child still does, since that is where the links are.
     fn scan_tree(&mut self, tree: &Path) -> Scan<()> {
         self.scan_link(&tree.join("SourcePackages"))?;
         let Some(entries) = or_missing(fs::read_dir(tree))? else {
@@ -436,10 +444,13 @@ impl References {
                 continue;
             }
             let child = entry.path();
-            match self.scan_root(&child) {
-                Err(ScanError { reason, .. }) if reason == "PermissionDenied" => continue,
-                other => other?,
+            // Only the child itself may be unreadable; below it, links live
+            // exactly where an unreadable folder could hide one.
+            match fs::read_dir(&child) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => continue,
+                _ => {}
             }
+            self.scan_root(&child)?;
             let derived = child.join("DerivedData");
             if or_missing(fs::symlink_metadata(&derived))?.is_some_and(|m| m.is_dir()) {
                 self.scan_root(&derived)?;

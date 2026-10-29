@@ -468,5 +468,19 @@ fn one_unreadable_folder_in_a_tree_does_not_disable_gc() {
     let rows = sweep(&e.fx.home(), false).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!old.exists(), "{rows:?}");
-    assert!(!old.exists());
+}
+
+#[test]
+fn an_unreadable_folder_below_a_trees_child_stops_gc() {
+    let e = env();
+    let k = e.shared("aaaa", 2);
+    let wt = e.fx.add_worktree("wt", "wt");
+    register(&e.fx.home(), &wt).unwrap();
+    let hidden = wt.join(".dd/Proj-x");
+    fs::create_dir_all(&hidden).unwrap();
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    let skipped = skip_rows(&e);
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(k.exists());
 }
