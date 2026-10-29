@@ -80,17 +80,42 @@ What this means for the design:
 - **A compressed image suits cold trees.** It attaches in under a second with nothing unpacked, but a build writing into it grows the shadow past the size of the build output, so it shouldn't be used for a tree that's building.
 - **Delta over a base is 3.5x smaller than any packaged option** (717 MB against 2.54 GB for B). Restoring it means writing about 22,000 files, which is too slow without a filesystem that writes them only when they're read. That is the case for bale's own format plus a user-space filesystem.
 
-**Still unmeasured:**
-- How large the delta over a warm base is after a typical turn's edit and incremental build. This needs real builds.
+**Per-turn delta (calibration builds).** Shared clones of Flipcash iOS (`main` 7a27829f5, scheme Flipcash, simulator build, in-tree `-derivedDataPath`) and Flipcash Android (`code/cash` 429f5914a, `:apps:flipcash:app:assembleDebug`). Each edit was built incrementally against an APFS snapshot of the previous build output; the delta is measured against that snapshot.
+
+| Repo, edit | Build | Files changed / added | Changed bytes | zstd -3 alone | `--patch-from` |
+|---|---|---|---|---|---|
+| iOS clean build | 388 s | 114,901 files, 11.58 GB | | | |
+| iOS leaf (string in a view) | 45 s | 77 / 803 | 1.05 GB | 219 MB | 19 MB (+5 MB added) |
+| iOS core body (`FlipcashCore`, ~875 importers) | 35 s | 37 / 7 | 4.17 GB | 884 MB | 201 MB |
+| iOS core API (new public func) | 95 s | 79 / 19 | 4.24 GB | 910 MB | 454 MB |
+| Android clean build | 126 s | 54,048 files, 2.58 GB | | | |
+| Android leaf | 9 s | 58 / 10 | 474 MB | 131 MB | 6 MB |
+| Android core body (~591 importers) | 9 s | 49 / 10 | 480 MB | 131 MB | 3 MB |
+| Android core API | 28 s | 237 / 140 | 808 MB | 236 MB | 8 MB (+8 MB added) |
+
+- A turn touches tens to hundreds of files, not tens of thousands, so restoring one turn's delta doesn't need a lazy filesystem. Most of the bytes are a few large files rewritten in place: the iOS debug dylibs (350–470 MB each, some stored twice) and the Android APK (381 MB, 2 MB as a patch).
+- Writing those files back is the restore cost. An iOS core edit means writing about 4 GB, which may not fit the p95 budget; that restore time is not measured yet.
+- **A tree cloned to a new path does not start warm.** The iOS build failed outright (`SwiftShims` precompiled with the old module cache path). With `ModuleCache.noindex` deleted it built in 200 s and rewrote 28,887 files. The Android build succeeded but rewrote 985 files and deleted 2,873, because outputs embed absolute paths. Build output is only valid at the path it was built at.
+
+**Serving the store without root (macOS 27.2).** A Rust NFSv3 server (`nfsserve` 0.11, its `mirrorfs` passthrough example) mounted with `mount_nfs` on localhost as the user, with no sudo, kext or System Settings approval. Over a clone of one DerivedData folder (91,399 files), single runs:
+
+| Test | Plain APFS | Through NFS | Ratio |
+|---|---|---|---|
+| mount / unmount | | 0.05 s / 0.03 s | |
+| read every file (`tar`) | 61.6 s | 144.9 s | 2.35x |
+| `find -type f` | 1.15 s | 11.6 s | 10x |
+| open and read 1,000 small files | 0.15 s | 0.79 s | 5.3x |
+
+FSKit can serve a path-backed filesystem since macOS 26 (`FSPathURLResource`), but only from a signed app extension that the user enables in System Settings, and it stays in the I/O path just like NFS. On Linux the equivalent is FUSE (`fuser`); on Windows, ProjFS, which hydrates a placeholder into a real file on first read and then steps aside.
 
 ## Design
 
 ### Tree layout
 
 - **Base.** One per repo. It is a checkout at a commit plus a warm build, read-only, and owned by bale.
-- **Tree.** Every bale tree is created from the base with copy-on-write: `clonefile` on APFS, reflink on btrfs and XFS, block clone on ReFS and Dev Drive. A new tree costs close to zero bytes and starts with a warm build.
+- **Tree.** Every bale tree is created from the base with copy-on-write: `clonefile` on APFS, reflink on btrfs and XFS, block clone on ReFS and Dev Drive. A new tree's source costs close to zero bytes. Its build does not carry over: the calibration builds showed build output is only valid at the path it was built at, so a new tree builds once at its own path.
 - **No copy-on-write available** (ext4, NTFS): the tree is a plain worktree, and tier 1 governs it.
-- **Build output must live in the tree.** Xcode's shared DerivedData is keyed by workspace path, so a tree cloned to a new path gets a new, empty DerivedData folder and builds from scratch. A bale tree builds with `-derivedDataPath` inside the tree, so the clone carries the base's build. Whether that build is still valid at the new path is measured, not assumed (see Benchmark).
+- **Build output must live in the tree.** Xcode's shared DerivedData is keyed by workspace path, so a tree cloned to a new path gets a new, empty DerivedData folder and builds from scratch. A bale tree builds with `-derivedDataPath` inside the tree, so the clone carries the base's build. Each tree's build output is stored and restored at that tree's own path only.
 
 ### Lifecycle per turn (Claude Code)
 
@@ -196,3 +221,6 @@ The acceptance bar stays the same: a full day of 4 or more sessions keeps free d
 
 - Off-hours calibration builds on the Flipcash iOS repo and one Android repo are approved.
 - Rehydrate budget: p50 at most 2 s; p95 3–4 s, with 5 s acceptable.
+- Storage is bale's own format in v1, not packaged images or filesystem compression: content-addressed files, deduplicated across trees, with changed files stored as `zstd --patch-from` against the tree's previous version. A tree's B-over-A delta was 717 MB this way, against 2.54 GB for the smallest packaged option.
+- No off-machine storage tier.
+- Cold trees are served through a user-space filesystem (NFSv3 loopback on macOS, FUSE on Linux, ProjFS on Windows) while a background job writes the files for real; then bale unmounts and swaps in the real directory. A turn-sized delta is written back directly.
