@@ -430,12 +430,35 @@ pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+        share_packages(home, &payload, &cwd, &id);
         if let Err(e) = touch_restoring(home, &path) {
             eprintln!("bale: not recorded as activity: {e:#}");
         }
         ExitCode::SUCCESS
     })
 }
+
+/// Keeps the tree's shared Swift packages link current before a tool runs:
+/// relinks when a `Package.resolved` changed, and links the folder a Bash
+/// command's `-derivedDataPath` names. Best-effort and silent; the unchanged
+/// case is one record read and one stat per linked project.
+#[cfg(target_os = "macos")]
+fn share_packages(home: &BaleHome, payload: &Value, cwd: &Path, id: &str) {
+    bale_core::spm_link::relink_tree(home, id);
+    let Some(command) = payload["tool_input"]["command"].as_str() else {
+        return;
+    };
+    if !command.contains(DD_FLAG) {
+        return;
+    }
+    let user_home = bale_core::paths::home_dir();
+    for root in derived_data_paths(command, cwd, user_home.as_deref()) {
+        bale_core::spm_link::link_derived_data_path(home, id, &root);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn share_packages(_home: &BaleHome, _payload: &Value, _cwd: &Path, _id: &str) {}
 
 /// Records the `-derivedDataPath` of a Bash command as a DerivedData root
 /// for sweep to reap once its project is gone. Best-effort: the hook's exit
@@ -1313,5 +1336,62 @@ mod tests {
             dd_args("xcodebuild -derivedDataPath /a build; xcodebuild -derivedDataPath /b test"),
             vec![PathBuf::from("/a"), PathBuf::from("/b")]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn derived_data_path_is_resolved_against_the_hook_cwd_and_linked() {
+        use bale_core::registry::{workspace_id, Level, Record, Registry, SpmLink};
+        use std::time::SystemTime;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let tree = bale_core::paths::canonicalize(tmp.path())
+            .unwrap()
+            .join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let shared = home.spm_dir().join("k1");
+        fs::create_dir_all(&shared).unwrap();
+        let id = workspace_id(&tree);
+        Registry::open(home.clone())
+            .put(&Record {
+                id: id.clone(),
+                repo_common_dir: PathBuf::from("/r/.git"),
+                path: tree.clone(),
+                admin_dir: PathBuf::from("/r/.git/worktrees/t"),
+                branch: None,
+                head: "0".repeat(40),
+                level: Level::Hot,
+                last_activity: SystemTime::now(),
+                note: None,
+                trash: Vec::new(),
+                origin: None,
+                pinned: false,
+                scope: None,
+                stash: None,
+                restore_hook: false,
+                spm: vec![SpmLink {
+                    project: tree.join("A.xcodeproj"),
+                    resolved: tree.join("Package.resolved"),
+                    mtime: SystemTime::now(),
+                    size: 0,
+                    key: "k1".into(),
+                    folder: tree.join("dd0"),
+                }],
+            })
+            .unwrap();
+
+        let payload =
+            json!({"tool_input": {"command": "xcodebuild -derivedDataPath build/dd build"}});
+        share_packages(&home, &payload, &tree, &id);
+        let link = tree.join("build/dd/SourcePackages");
+        assert_eq!(fs::read_link(&link).unwrap(), shared);
+
+        // A command without the flag, or with an existing folder, changes nothing.
+        let other = json!({"tool_input": {"command": "ls"}});
+        share_packages(&home, &other, &tree, &id);
+        share_packages(&home, &payload, &tree, &id);
+        assert_eq!(fs::read_link(&link).unwrap(), shared);
+        assert!(!tree.join("SourcePackages").exists());
     }
 }

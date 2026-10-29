@@ -14,7 +14,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::derived_data::folder_name;
-use crate::registry::{Record, SpmLink};
+use crate::lock::WorkspaceLock;
+use crate::registry::{Record, Registry, SpmLink};
 use crate::spm::{finished, key, resolved_files, seed, xcode_build, Resolved};
 use crate::BaleHome;
 
@@ -163,4 +164,132 @@ pub(crate) fn drop_stubs(record: &mut Record) -> bool {
     }
     record.spm.retain(|l| exists(&l.folder));
     record.spm.len() != before
+}
+
+/// True when the `Package.resolved` `l` was linked for has a different mtime
+/// or size now. One stat. A file that is gone counts as unchanged: there is
+/// nothing to relink to.
+fn changed(l: &SpmLink) -> bool {
+    fs::metadata(&l.resolved).is_ok_and(|m| m.len() != l.size || m.modified().ok() != Some(l.mtime))
+}
+
+/// The `SourcePackages` link of `l` when it is a symlink into bale's `spm/`
+/// folder. A real directory (Xcode's own, or one a user made) or a link
+/// somewhere else is not bale's to change.
+fn own_link(home: &BaleHome, l: &SpmLink) -> Option<PathBuf> {
+    let sp = l.folder.join("SourcePackages");
+    let is_link = fs::symlink_metadata(&sp).is_ok_and(|m| m.file_type().is_symlink());
+    let into_spm = fs::read_link(&sp).is_ok_and(|t| t.starts_with(home.spm_dir()));
+    (is_link && into_spm).then_some(sp)
+}
+
+/// Points `sp` at `target` by making a link under a temp name in the same
+/// directory and renaming it over `sp`, so a build never sees it missing.
+fn repoint(sp: &Path, target: &Path) -> io::Result<()> {
+    let tmp = sp.with_file_name(format!(".SourcePackages.bale-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)?;
+    fs::rename(&tmp, sp).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Brings `l` up to date with its `Package.resolved`; true when `l` changed.
+fn relink_one(home: &BaleHome, l: &mut SpmLink, build: &str) -> bool {
+    let (Ok(k2), Ok(meta)) = (key(&l.resolved, build), fs::metadata(&l.resolved)) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    if k2 != l.key {
+        // Not bale's link any more: leave the folder alone and only refresh
+        // mtime and size, so the edit isn't rehashed on every call.
+        if let Some(sp) = own_link(home, l) {
+            // A clone of the old folder, not an empty one: SPM then updates
+            // the changed pins instead of fetching everything.
+            let old = home.spm_dir().join(&l.key);
+            let new = home.spm_dir().join(&k2);
+            let target = if is_real_dir(&new) {
+                Some(new)
+            } else if is_real_dir(&old) {
+                seed(home, &k2, &old).ok()
+            } else {
+                None
+            };
+            let Some(target) = target else { return false };
+            if repoint(&sp, &target).is_err() {
+                return false;
+            }
+            l.key = k2;
+        }
+    }
+    l.mtime = mtime;
+    l.size = meta.len();
+    true
+}
+
+/// Pre-tool hook: relinks the tree `id`'s pre-made DerivedData folders whose
+/// `Package.resolved` changed since they were linked.
+///
+/// The common case, nothing changed, reads the record and stats each
+/// `Package.resolved` once: no hashing, no walk, no writes. On a change the
+/// file is rehashed. An unchanged key only refreshes the recorded mtime and
+/// size. A new key moves the link to `spm/<key>`, cloned from the old key's
+/// folder when it doesn't exist. Only a symlink into `spm/` is repointed. The
+/// record is written under the workspace lock; a locked tree is skipped and
+/// retried by the next hook. Every failure is swallowed.
+pub fn relink_tree(home: &BaleHome, id: &str) {
+    let registry = Registry::open(home.clone());
+    match registry.get(id) {
+        Ok(Some(r)) if r.spm.iter().any(changed) => {}
+        _ => return,
+    }
+    if !enabled(home) {
+        return;
+    }
+    let Some(build) = xcode_build() else { return };
+    let Ok(Some(_lock)) = WorkspaceLock::try_acquire(home, id) else {
+        return;
+    };
+    let Ok(Some(mut record)) = registry.get(id) else {
+        return;
+    };
+    let mut dirty = false;
+    for l in record.spm.iter_mut().filter(|l| changed(l)) {
+        dirty |= relink_one(home, l, &build);
+    }
+    if dirty {
+        let _ = registry.put(&record);
+    }
+}
+
+/// Pre-tool hook, for a Bash command with `-derivedDataPath root`: when
+/// `root/SourcePackages` doesn't exist and tree `id` is linked to a shared
+/// folder that exists, links it. An existing `root/SourcePackages`, of any
+/// kind, is left alone. Never seeds: only an existing folder is linked. With
+/// several projects of different keys, the first one's folder is used.
+pub fn link_derived_data_path(home: &BaleHome, id: &str, root: &Path) {
+    let sp = root.join("SourcePackages");
+    if exists(&sp) {
+        return;
+    }
+    let Ok(Some(record)) = Registry::open(home.clone()).get(id) else {
+        return;
+    };
+    let Some(shared) = record
+        .spm
+        .iter()
+        .map(|l| home.spm_dir().join(&l.key))
+        .find(|p| is_real_dir(p))
+    else {
+        return;
+    };
+    if !enabled(home) {
+        return;
+    }
+    let made_root = !root.exists() && fs::create_dir_all(root).is_ok();
+    if std::os::unix::fs::symlink(&shared, &sp).is_err() && made_root {
+        let _ = fs::remove_dir(root);
+    }
 }

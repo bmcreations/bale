@@ -8,6 +8,7 @@ use bale_core::derived_data::folder_name;
 use bale_core::ops::cold::cold;
 use bale_core::ops::sweep::sweep;
 use bale_core::ops::up::{register, up};
+use bale_core::spm_link::{link_derived_data_path, relink_tree};
 use bale_core::BaleHome;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -440,4 +441,283 @@ fn gc_removes_the_premade_folder_of_a_vanished_tree() {
     assert_eq!(report.removed, vec![id]);
     assert!(fs::symlink_metadata(&folder).is_err());
     assert!(shared(&h).join("marker").is_file());
+}
+
+// Pre-tool hook: relink on change and -derivedDataPath.
+
+const RESOLVED2: &str = r#"{"pins":[{"identity":"a","state":{"revision":"r2"}}],"version":3}"#;
+
+fn key_of(resolved: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(resolved.as_bytes());
+    h.update([0]);
+    h.update(BUILD.as_bytes());
+    h.finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn resolved_of(proj: &Path) -> PathBuf {
+    proj.join("project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+}
+
+/// A registered tree linked to the K1 shared folder; returns (id, project, folder).
+fn linked_tree(e: &Env) -> (String, PathBuf, PathBuf) {
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    let folder = dd_of(e, &proj);
+    assert!(is_link_to(&folder.join("SourcePackages"), &shared(&h)));
+    (id, proj, folder)
+}
+
+fn record(h: &BaleHome, id: &str) -> bale_core::registry::Record {
+    bale_core::registry::Registry::open(h.clone())
+        .get(id)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn relink_repoints_to_an_existing_shared_folder_for_the_new_key() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    let k2 = h.spm_dir().join(key_of(RESOLVED2));
+    fs::create_dir_all(&k2).unwrap();
+    fs::write(k2.join("other"), "o").unwrap();
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    assert!(is_link_to(&folder.join("SourcePackages"), &k2));
+    assert_eq!(names(&k2), ["other"], "an existing K2 is not touched");
+    let l = &record(&h, &id).spm[0];
+    assert_eq!(l.key, key_of(RESOLVED2));
+    assert_eq!(l.size, RESOLVED2.len() as u64);
+    assert_eq!(
+        l.mtime,
+        fs::metadata(resolved_of(&proj))
+            .unwrap()
+            .modified()
+            .unwrap()
+    );
+    // No temp link left behind, K1 kept for other trees.
+    assert_eq!(names(&folder), ["SourcePackages"]);
+    assert!(shared(&h).join("marker").is_file());
+}
+
+#[test]
+fn relink_seeds_a_clone_of_the_old_folder_when_the_new_key_has_none() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    let k2 = h.spm_dir().join(key_of(RESOLVED2));
+    assert!(is_link_to(&folder.join("SourcePackages"), &k2));
+    assert_eq!(fs::read_to_string(k2.join("marker")).unwrap(), "m");
+    assert!(shared(&h).join("marker").is_file(), "K1 untouched");
+    assert_eq!(record(&h, &id).spm[0].key, key_of(RESOLVED2));
+}
+
+#[test]
+fn relink_with_an_unchanged_key_only_refreshes_mtime_and_size() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    let before = fs::symlink_metadata(folder.join("SourcePackages"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    // Same bytes, later mtime (as `git checkout` rewrites a file).
+    let f = fs::File::options()
+        .write(true)
+        .open(resolved_of(&proj))
+        .unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    f.set_modified(later).unwrap();
+    drop(f);
+
+    relink_tree(&h, &id);
+
+    let l = &record(&h, &id).spm[0];
+    assert_eq!(l.key, key());
+    assert_eq!(l.mtime, later);
+    assert_eq!(names(&h.spm_dir()), [key()], "nothing seeded");
+    let after = fs::symlink_metadata(folder.join("SourcePackages"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(before, after, "link not recreated");
+}
+
+#[test]
+fn relink_never_touches_a_real_source_packages_dir() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    // Xcode (or the user) replaced the link with a real folder.
+    fs::remove_file(folder.join("SourcePackages")).unwrap();
+    let sp = real_packages(&folder);
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    assert!(fs::symlink_metadata(&sp).unwrap().is_dir());
+    assert!(sp.join("marker").is_file());
+    assert_eq!(names(&folder), ["SourcePackages"]);
+    assert_eq!(names(&h.spm_dir()), [key()], "nothing seeded for it");
+}
+
+#[test]
+fn relink_leaves_a_link_to_somewhere_else_alone() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    let elsewhere = e.dd.parent().unwrap().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::remove_file(folder.join("SourcePackages")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, folder.join("SourcePackages")).unwrap();
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    assert!(is_link_to(&folder.join("SourcePackages"), &elsewhere));
+}
+
+#[test]
+fn relink_does_nothing_when_sharing_is_disabled() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    disable(&h);
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    assert!(is_link_to(&folder.join("SourcePackages"), &shared(&h)));
+    assert_eq!(record(&h, &id).spm[0].key, key());
+}
+
+#[test]
+fn relink_skips_a_locked_tree_and_retries_later() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+    {
+        let _held = bale_core::lock::WorkspaceLock::try_acquire(&h, &id)
+            .unwrap()
+            .unwrap();
+        relink_tree(&h, &id);
+        assert!(is_link_to(&folder.join("SourcePackages"), &shared(&h)));
+    }
+    relink_tree(&h, &id);
+    assert!(is_link_to(
+        &folder.join("SourcePackages"),
+        &h.spm_dir().join(key_of(RESOLVED2))
+    ));
+}
+
+#[test]
+fn relink_of_an_unchanged_tree_writes_nothing_and_is_fast() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, folder) = linked_tree(&e);
+    let rec_file = h.records_dir().join(format!("{id}.json"));
+    let stamp = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
+    let (r0, l0, d0) = (
+        stamp(&rec_file),
+        stamp(&folder.join("SourcePackages")),
+        stamp(&folder),
+    );
+    let before = (names(&h.spm_dir()), fs::read(&rec_file).unwrap());
+
+    const N: u32 = 1000;
+    let start = std::time::Instant::now();
+    for _ in 0..N {
+        relink_tree(&h, &id);
+    }
+    let mean = start.elapsed() / N;
+    eprintln!("relink_tree, unchanged: {mean:?} per call over {N} calls");
+
+    assert_eq!(
+        (
+            stamp(&rec_file),
+            stamp(&folder.join("SourcePackages")),
+            stamp(&folder)
+        ),
+        (r0, l0, d0)
+    );
+    assert_eq!(before, (names(&h.spm_dir()), fs::read(&rec_file).unwrap()));
+    assert!(mean < std::time::Duration::from_millis(5), "{mean:?}");
+}
+
+#[test]
+fn derived_data_path_without_source_packages_gets_the_shared_link() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    let root = e.dd.parent().unwrap().join("my dd");
+
+    link_derived_data_path(&h, &id, &root);
+    assert!(is_link_to(&root.join("SourcePackages"), &shared(&h)));
+
+    // An existing folder without SourcePackages gets the link too.
+    let root2 = e.dd.parent().unwrap().join("dd2");
+    fs::create_dir_all(root2.join("Build")).unwrap();
+    link_derived_data_path(&h, &id, &root2);
+    assert!(is_link_to(&root2.join("SourcePackages"), &shared(&h)));
+    assert!(root2.join("Build").is_dir());
+}
+
+#[test]
+fn derived_data_path_with_source_packages_is_untouched() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    let root = e.dd.parent().unwrap().join("dd");
+    let sp = real_packages(&root);
+    link_derived_data_path(&h, &id, &root);
+    assert!(fs::symlink_metadata(&sp).unwrap().is_dir());
+    assert!(sp.join("marker").is_file());
+
+    let root2 = e.dd.parent().unwrap().join("dd2");
+    fs::create_dir_all(&root2).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", root2.join("SourcePackages")).unwrap();
+    link_derived_data_path(&h, &id, &root2);
+    assert!(is_link_to(
+        &root2.join("SourcePackages"),
+        Path::new("/nonexistent")
+    ));
+}
+
+#[test]
+fn derived_data_path_never_seeds_or_links_without_a_shared_folder() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    fs::remove_dir_all(shared(&h)).unwrap();
+    let root = e.dd.parent().unwrap().join("dd");
+    link_derived_data_path(&h, &id, &root);
+    assert!(fs::symlink_metadata(&root).is_err(), "root not created");
+    assert!(!h.spm_dir().exists() || names(&h.spm_dir()).is_empty());
+}
+
+#[test]
+fn derived_data_path_does_nothing_when_sharing_is_disabled() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    disable(&h);
+    let root = e.dd.parent().unwrap().join("dd");
+    link_derived_data_path(&h, &id, &root);
+    assert!(fs::symlink_metadata(&root).is_err());
 }
