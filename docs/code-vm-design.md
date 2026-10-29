@@ -37,9 +37,26 @@ So compressing after a 10-minute wait would capture most of the idle time, and o
 - Compressing took 77 s and restoring took 50 s, about 130 MB/s.
 - System time dominates (46 s and 44 s): restore is bound by per-file filesystem calls, not by zstd. Rehydrating whole build trees per prompt is too slow, so the delta must stay small or be stored in a form that restores without creating every file again.
 
+**Storage benchmark.** These runs used two real Xcode DerivedData folders from two branches of the Flipcash iOS app: A (6.06 GiB) and B (6.27 GiB, 110,822 files). Load average was 6–100 during the runs; without sudo the file cache could not be purged, so every timing is warm-cache.
+
+| Step | Result |
+|---|---|
+| One base image attached twice with two shadow files | works, each mount keeps its own writes, no sudo needed |
+| `hdiutil attach -shadow` | 0.41–0.61 s over 10 runs (1.74 s on the first, cold run) |
+| `hdiutil detach` | 0.15–0.30 s typically; 0.9, 2.1 and 10.3 s when load spiked |
+| Content delta B over A (`rsync --checksum`) | 24,062 files and 4.17 GB changed; shadow file 4.43 GiB |
+| zstd -3 of that shadow | 1.09 GiB (4.1x), compress 2.7 s, restore 7.2 s |
+| (a) tar\|zstd of B: restore into an empty dir | 53–76 s for 2.08 GiB compressed |
+| (c) `ditto --hfsCompression` | left files uncompressed (no `compressed` flag, same size on disk), so (c) is still untested |
+
+What this means for the design:
+- **Restoring a single file beats restoring many files.** Decompressing the whole shadow (4.43 GiB) took 7.2 s, against 53–76 s to untar a similar amount of build output as separate files. The tar route (a) can't meet the budget for build output at any realistic size.
+- **An uncompressed shadow costs only the attach.** Re-attaching a shadow left on disk takes about 0.4–0.6 s, inside the 2 s p50 budget. The disk saving then comes from sharing the base, not from compressing it.
+- **Compressing the shadow is for long waits.** At the measured speed, about 0.65 GB/s, a compressed shadow restores within the 3–4 s p95 target only up to about 2–2.5 GB. A larger shadow should stay uncompressed until the tree has been idle much longer than T.
+- **Branches drift far from a shared base.** Two branches' builds differed in 4.17 of 6.5 GB, so a long-lived branch tree ends up with most of a build in its delta. The base has to be refreshed, or a branch's own last build used as its base.
+
 **Still unmeasured:**
 - How large the delta over a warm base is after a typical turn's edit and incremental build. This needs real builds.
-- How fast the delta restores when stored as one image file instead of a tar of files.
 
 ## Design
 
