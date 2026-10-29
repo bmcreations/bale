@@ -9,6 +9,10 @@ pub mod ops;
 pub mod par;
 pub mod paths;
 pub mod registry;
+pub mod spm;
+#[cfg(target_os = "macos")]
+pub mod spm_link;
+pub(crate) mod spm_lock;
 pub mod store;
 pub mod trace;
 
@@ -62,6 +66,11 @@ impl BaleHome {
     /// DerivedData roots learned from `-derivedDataPath`, one path per line.
     pub fn dd_roots_file(&self) -> PathBuf {
         self.0.join("dd-roots")
+    }
+
+    /// Shared Swift packages folders, one `<key>` directory each.
+    pub fn spm_dir(&self) -> PathBuf {
+        self.0.join("spm")
     }
 
     /// Where the local usage trace is kept (see [`trace`]).

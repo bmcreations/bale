@@ -93,9 +93,21 @@ pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, Stri
 fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
     let start = Instant::now();
     let mut records = Registry::open(home.clone()).all_lenient()?;
-    let adopted = adopt_missed(home, &records, dry_run);
+    let (adopted, mains) = adopt_missed(home, &records, dry_run);
     if adopted.iter().any(|_| !dry_run) {
         records = Registry::open(home.clone()).all_lenient()?;
+    }
+    // Before any tree's `up` can remove the build output a shared folder is cloned from.
+    #[cfg(target_os = "macos")]
+    if !dry_run {
+        seed_shared_packages(home, &records, mains);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = mains;
+    // A tree removed before its first build leaves its pre-made folder behind.
+    #[cfg(target_os = "macos")]
+    if !dry_run {
+        drop_stubs_of_missing_trees(home, &records);
     }
     // Xcode's shared DerivedData is listed once and each folder in it sized
     // once, however many trees it belongs to.
@@ -144,7 +156,10 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
         }
     }
     #[cfg(target_os = "macos")]
-    rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
+    {
+        rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
+        rows.extend(spm_gc_rows(home, dry_run));
+    }
     let now = SystemTime::now();
     crate::trace::record_builds(home, &builds, now);
     let mut fields = Map::new();
@@ -177,7 +192,8 @@ const ADOPT_LIMIT: Duration = Duration::from_secs(20);
 /// on disk but have no record, one row each (`would adopt` on `dry_run`,
 /// when nothing is registered). `git worktree list` runs once per repo, on
 /// up to [`crate::par::THREADS`] threads, and a repo whose listing fails or
-/// misses [`ADOPT_LIMIT`] is skipped. Registering is `up::register`, so its
+/// misses [`ADOPT_LIMIT`] is skipped. The second value is the main checkout of
+/// each repo that listed. Registering is `up::register`, so its
 /// refusals (the main checkout, a gitfile that is not a linked worktree's)
 /// apply, and the record starts without `restore_hook`: sweep never stashes
 /// an adopted tree until a hook has restored it once.
@@ -185,7 +201,7 @@ fn adopt_missed(
     home: &BaleHome,
     records: &[(String, Result<Record>)],
     dry_run: bool,
-) -> Vec<(String, Action, String)> {
+) -> (Vec<(String, Action, String)>, Vec<PathBuf>) {
     let mut repos: Vec<PathBuf> = Vec::new();
     for record in records.iter().filter_map(|(_, r)| r.as_ref().ok()) {
         if !repos.contains(&record.repo_common_dir) {
@@ -196,7 +212,11 @@ fn adopt_missed(
     let listed = list_worktrees(&repos, deadline);
     let registry = Registry::open(home.clone());
     let mut rows = Vec::new();
+    let mut mains = Vec::new();
     for info in listed.iter().flatten().flatten() {
+        if info.is_main && !info.bare && !info.prunable {
+            mains.extend(crate::paths::canonicalize(&info.path).ok());
+        }
         if info.is_main || info.bare || info.prunable {
             continue;
         }
@@ -216,7 +236,55 @@ fn adopt_missed(
             }
         }
     }
-    rows
+    (rows, mains)
+}
+
+/// For each record whose checkout is gone, removes the pre-made DerivedData
+/// folders it still names if they were never built in.
+#[cfg(target_os = "macos")]
+fn drop_stubs_of_missing_trees(home: &BaleHome, records: &[(String, Result<Record>)]) {
+    let registry = Registry::open(home.clone());
+    for record in records.iter().filter_map(|(_, r)| r.as_ref().ok()) {
+        let path = record.path.clone();
+        let gone = fs::symlink_metadata(&record.path)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if !gone || record.spm.is_empty() {
+            continue;
+        }
+        let Ok(Some(_lock)) = crate::lock::WorkspaceLock::try_acquire(home, &record.id) else {
+            continue;
+        };
+        // The snapshot may be stale by now; act on what is recorded under the lock.
+        let Ok(Some(mut record)) = registry.get(&record.id) else {
+            continue;
+        };
+        if record.path != path || record.spm.is_empty() {
+            continue;
+        }
+        if crate::spm_link::drop_stubs(&mut record) {
+            let _ = registry.put(&record);
+        }
+    }
+}
+
+/// Seeds the shared Swift packages folder for every registered tree and every
+/// main checkout in `mains` whose own `SourcePackages` is finished and whose
+/// key has no shared folder yet. The trees keep their folders.
+#[cfg(target_os = "macos")]
+fn seed_shared_packages(
+    home: &BaleHome,
+    records: &[(String, Result<Record>)],
+    mut trees: Vec<PathBuf>,
+) {
+    let Some(dd_root) = global_root() else { return };
+    trees.extend(
+        records
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .filter(|r| !matches!(r.level, Level::Cold | Level::Cooling | Level::Opening))
+            .map(|r| r.path.clone()),
+    );
+    crate::spm_link::seed_from_trees(home, &trees, &dd_root);
 }
 
 /// `git worktree list` for each repo in `repos`, in order; `None` for a repo
@@ -265,6 +333,23 @@ fn reap_rows(
     };
     let trees: Vec<PathBuf> = roots.iter().flatten().chain(paths).cloned().collect();
     super::reap::reap_orphans(home, global, &trees, cfg.reap_grace, dry_run)
+        .into_iter()
+        .map(|(dir, result)| (dir, Action::Reap, result))
+        .collect()
+}
+
+/// The rows for shared Swift packages folders removed (or that `dry_run`
+/// would remove). Runs whether or not `share_swift_packages` is on.
+#[cfg(target_os = "macos")]
+fn spm_gc_rows(home: &BaleHome, dry_run: bool) -> Vec<(String, Action, String)> {
+    let cfg = match load_config(home, None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::trace::warn(&e);
+            return Vec::new();
+        }
+    };
+    super::spm_gc::collect(home, cfg.reap_grace, dry_run)
         .into_iter()
         .map(|(dir, result)| (dir, Action::Reap, result))
         .collect()
@@ -680,6 +765,7 @@ mod tests {
             idle_cold: Duration::from_secs(7 * 86400),
             idle_stash: Duration::from_secs(600),
             reap_grace: Duration::from_secs(3600),
+            share_swift_packages: true,
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
             regenerable_extra: Vec::new(),

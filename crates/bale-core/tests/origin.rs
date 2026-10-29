@@ -86,6 +86,7 @@ fn new_fields_roundtrip() {
         }),
         stash: None,
         restore_hook: false,
+        spm: Vec::new(),
     };
     reg.put(&r).unwrap();
     assert_eq!(reg.get(&r.id).unwrap(), Some(r));

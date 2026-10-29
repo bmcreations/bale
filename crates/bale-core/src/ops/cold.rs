@@ -116,6 +116,9 @@ fn cold_untraced(
     let mut record = registry
         .get(id)?
         .with_context(|| format!("record for {id} vanished"))?;
+    // `up` relinked the folders for the next build; a cold tree has none.
+    #[cfg(target_os = "macos")]
+    crate::spm_link::drop_stubs(&mut record);
     // The branch may have changed since registration; open restores this one.
     record.branch = git::current_branch(&root)?;
     // Lets a cold tree still describe itself; best effort, never a refusal.
@@ -1369,6 +1372,7 @@ fn no_extras() -> Config {
         idle_cold: Duration::ZERO,
         idle_stash: Duration::ZERO,
         reap_grace: Duration::from_secs(3600),
+        share_swift_packages: true,
         stash_min_bytes: 0,
         patch_max_depth: 0,
         regenerable_extra: Vec::new(),

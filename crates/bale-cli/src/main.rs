@@ -947,6 +947,7 @@ mod tests {
             scope: None,
             stash: None,
             restore_hook: false,
+            spm: Vec::new(),
         };
         assert!(show_text(&r, None).contains("origin:   cursor\n"));
         r.origin = Some(origin("s1"));

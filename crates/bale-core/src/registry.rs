@@ -69,6 +69,25 @@ pub struct Record {
     /// build against empty files. Core never clears it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub restore_hook: bool,
+    /// The DerivedData folders bale pre-made for this tree's Swift projects,
+    /// each linked to a shared packages folder. Records written before this
+    /// field existed load with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spm: Vec<SpmLink>,
+}
+
+/// One pre-made DerivedData folder: `folder` holds a `SourcePackages` link to
+/// the shared folder `key`, made for the `Package.resolved` at `resolved` as
+/// it was (`mtime`, `size`) when linked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpmLink {
+    /// The `.xcodeproj` or `.xcworkspace` that owns `resolved`.
+    pub project: PathBuf,
+    pub resolved: PathBuf,
+    pub mtime: SystemTime,
+    pub size: u64,
+    pub key: String,
+    pub folder: PathBuf,
 }
 
 /// A tree's stash, as the record tracks it.

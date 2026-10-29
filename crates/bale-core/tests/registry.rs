@@ -22,6 +22,7 @@ fn record(id: &str) -> Record {
         scope: None,
         stash: None,
         restore_hook: false,
+        spm: Vec::new(),
     }
 }
 
@@ -146,4 +147,31 @@ fn level_name_matches_stored_name() {
             format!("\"{}\"", level.name())
         );
     }
+}
+
+#[test]
+fn record_without_spm_field_loads_with_no_links() {
+    let mut v = serde_json::to_value(record("abc")).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("spm").is_none());
+    let r: Record = serde_json::from_value(v).unwrap();
+    assert!(r.spm.is_empty());
+}
+
+#[test]
+fn spm_links_roundtrip() {
+    let t = tempfile::tempdir().unwrap();
+    let reg = Registry::open(BaleHome(t.path().to_path_buf()));
+    let mut r = record("abc");
+    r.spm.push(bale_core::registry::SpmLink {
+        project: "/repo-wt/App.xcodeproj".into(),
+        resolved:
+            "/repo-wt/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+                .into(),
+        mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+        size: 42,
+        key: "0123456789abcdef".into(),
+        folder: "/dd/App-xyz".into(),
+    });
+    reg.put(&r).unwrap();
+    assert_eq!(reg.get("abc").unwrap(), Some(r));
 }

@@ -147,6 +147,9 @@ fn collect(
         }
         if !dry_run {
             delete_saved(home, &g, id)?;
+            // Its pre-made DerivedData folders go with the record that names them.
+            #[cfg(target_os = "macos")]
+            crate::spm_link::drop_stubs(&mut record.clone());
             registry.remove(id)?;
         }
         report.removed.push(id.to_string());

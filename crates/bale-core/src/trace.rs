@@ -466,6 +466,40 @@ pub fn reaped(home: &BaleHome, bytes: u64, removed: bool, duration: Duration) {
     emit(home, "op", fields);
 }
 
+/// Writes the `op` line for one shared packages folder (or leftover temp
+/// clone) the sweep removed, `outcome` `ok` or `error`; `bytes_freed` is what
+/// it held when `ok`. Like [`reaped`], it names no path. Best-effort.
+pub fn spm_gc(home: &BaleHome, bytes: u64, removed: bool, duration: Duration) {
+    let mut fields = Map::new();
+    fields.insert("op".into(), "spm_gc".into());
+    fields.insert("id".into(), Value::Null);
+    fields.insert(
+        "outcome".into(),
+        if removed { "ok" } else { "error" }.into(),
+    );
+    if !removed {
+        fields.insert("reason".into(), "io".into());
+    }
+    fields.insert("duration_ms".into(), ms(duration).into());
+    insert_context(&mut fields);
+    fields.insert("bytes_freed".into(), removed.then_some(bytes).into());
+    emit(home, "op", fields);
+}
+
+/// Writes the `op` line for a sweep whose shared packages cleanup was
+/// skipped because it could not tell what is still linked: outcome `skipped`
+/// and `reason` (an error kind, no path). Best-effort.
+pub fn spm_gc_skipped(home: &BaleHome, reason: &str) {
+    let mut fields = Map::new();
+    fields.insert("op".into(), "spm_gc".into());
+    fields.insert("id".into(), Value::Null);
+    fields.insert("outcome".into(), "skipped".into());
+    fields.insert("reason".into(), reason.into());
+    insert_context(&mut fields);
+    fields.insert("bytes_freed".into(), Value::Null);
+    emit(home, "op", fields);
+}
+
 /// Writes the `op` line for an operation whose target was gone before it
 /// could run: outcome and reason `missing`, the target's `path`, and its
 /// id when a record for that path exists. Best-effort.

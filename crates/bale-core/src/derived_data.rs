@@ -163,9 +163,143 @@ pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
+/// Xcode's DerivedData folder name for a project or workspace path:
+/// `<stem with spaces as _>-<28 letters>`. The letters come from the MD5 of
+/// the NFD-normalised path (a leading `/private` dropped before `/tmp/`,
+/// `/var/` or `/etc/`), each big-endian u64 half written as 14 base-26
+/// digits `a`-`z`. Pure: reads no files.
+pub fn folder_name(project: &Path) -> String {
+    use md5::{Digest, Md5};
+    use unicode_normalization::UnicodeNormalization;
+
+    let full = project.to_string_lossy();
+    let path = match full.strip_prefix("/private") {
+        Some(rest)
+            if rest.starts_with("/tmp/")
+                || rest.starts_with("/var/")
+                || rest.starts_with("/etc/") =>
+        {
+            rest
+        }
+        _ => &full,
+    };
+    let nfd: String = path.nfd().collect();
+    let digest = Md5::digest(nfd.as_bytes());
+
+    let mut hash = String::with_capacity(28);
+    for half in digest.chunks_exact(8) {
+        let mut n = u64::from_be_bytes(half.try_into().expect("8-byte chunk"));
+        let mut letters = [b'a'; 14];
+        for slot in letters.iter_mut().rev() {
+            *slot = b'a' + (n % 26) as u8;
+            n /= 26;
+        }
+        hash.extend(letters.iter().map(|&b| b as char));
+    }
+
+    let stem = Path::new(nfd.as_str())
+        .file_stem()
+        .map(|s| s.to_string_lossy().replace(' ', "_"))
+        .unwrap_or_default();
+    format!("{stem}-{hash}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const P: &str = "/tmp/claude-501/-Users-bmc--t3-desktop-scratch-2026-10-28-worktrees-are-antiquated-dont-compress-300b5ddc/de2aa02c-f01d-4f79-8a6e-1aa14293a224/scratchpad";
+
+    fn name_of(rel: &str) -> String {
+        folder_name(Path::new(&format!("{P}/{rel}")))
+    }
+
+    #[test]
+    fn folder_name_matches_recorded_xcode_names() {
+        assert_eq!(
+            name_of("t0/ios/Code.xcodeproj"),
+            "Code-akujzjaeriyzdfecyhmsqsaxboch"
+        );
+        assert_eq!(
+            name_of("t12/gen/with space dir/Demo.xcodeproj"),
+            "Demo-dmnmyroyujtqlrdmydpdvhpiidhk"
+        );
+        assert_eq!(
+            name_of("t12/gen/stemspace/Demo App.xcodeproj"),
+            "Demo_App-cmbsorhiyxauyidmwlwxnybpjmxs"
+        );
+        assert_eq!(
+            name_of("t12/gen/wsp/Outer.xcworkspace"),
+            "Outer-atnnlkfqebpatwcgsyerokqdshud"
+        );
+    }
+
+    #[test]
+    fn folder_name_hashes_the_nfd_path() {
+        // Stem is NFD on disk: e + U+0301.
+        assert_eq!(
+            name_of("t12/gen/odd/a-b.c e\u{301}+d(1).xcodeproj"),
+            "a-b.c_e\u{301}+d(1)-ezlayyundjcdkzghoipzfouyojcv"
+        );
+        // NFC input (U+00E9) gives the NFD stem and NFD hash.
+        assert_eq!(
+            name_of("t12/gen/nfc/caf\u{e9}.xcodeproj"),
+            "cafe\u{301}-glisvtzkzqzaosggenyztsoanxjr"
+        );
+    }
+
+    #[test]
+    fn folder_name_strips_private_only_before_tmp_var_etc() {
+        let a = folder_name(Path::new("/private/tmp/x/A.xcodeproj"));
+        assert_eq!(a, folder_name(Path::new("/tmp/x/A.xcodeproj")));
+        let v = folder_name(Path::new("/private/var/x/A.xcodeproj"));
+        assert_eq!(v, folder_name(Path::new("/var/x/A.xcodeproj")));
+        let e = folder_name(Path::new("/private/etc/x/A.xcodeproj"));
+        assert_eq!(e, folder_name(Path::new("/etc/x/A.xcodeproj")));
+        for p in ["/privatefoo/x/A.xcodeproj", "/private/Users/x/A.xcodeproj"] {
+            assert_ne!(folder_name(Path::new(p)), a, "{p}");
+        }
+        assert_ne!(
+            folder_name(Path::new("/private/Users/x/A.xcodeproj")),
+            folder_name(Path::new("/Users/x/A.xcodeproj"))
+        );
+        assert_ne!(
+            folder_name(Path::new("/privatefoo/x/A.xcodeproj")),
+            folder_name(Path::new("/foo/x/A.xcodeproj"))
+        );
+    }
+
+    /// Reads (never writes) the real DerivedData folders and checks each
+    /// folder's name against the one computed from its `WorkspacePath`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "macos")]
+    fn folder_name_matches_live_derived_data() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join("Library/Developer/Xcode/DerivedData");
+        let (mut ok, mut skipped) = (0, 0);
+        let mut bad = Vec::new();
+        for entry in fs::read_dir(&root).unwrap().flatten() {
+            let dir = entry.path();
+            let Some(ws) = DdDir::read(dir.clone()).workspace().map(Path::to_path_buf) else {
+                skipped += 1;
+                continue;
+            };
+            let got = folder_name(&ws);
+            let want = entry.file_name().to_string_lossy().into_owned();
+            if got == want {
+                ok += 1;
+            } else {
+                bad.push(format!("{want} (WorkspacePath {})", ws.display()));
+            }
+        }
+        eprintln!(
+            "live check: {ok} matched, {skipped} skipped, {} mismatched",
+            bad.len()
+        );
+        assert!(bad.is_empty(), "mismatches: {bad:#?}");
+    }
 
     #[test]
     fn learn_root_appends_once_per_path() {
