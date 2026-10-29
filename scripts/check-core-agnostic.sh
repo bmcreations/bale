@@ -19,7 +19,7 @@ hits=$(find crates/bale-core/src -name '*.rs' | sort | while IFS= read -r f; do
         /^#\[cfg\(test\)\][[:space:]]*$/ { pending = 1; next }
         { print f ":" FNR ": " $0 }
     ' "$f"
-done | grep -iE 'claude|conductor|cursor|codex' || true)
+done | grep -iE 'claude|conductor|cursor|codex|t3code|(^|[^a-z0-9_])t3([^a-z0-9_]|$)' || true)
 if [ -n "$hits" ]; then
     echo "bale-core names a tool outside its tests:" >&2
     echo "$hits" >&2
