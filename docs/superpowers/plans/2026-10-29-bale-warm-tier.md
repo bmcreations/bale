@@ -25,7 +25,7 @@
 
 ## Review Focus
 
-1. **A file rewritten while the tree was stashed** (a Codex thread in T3 has no pre-prompt hook and may build): unstash must keep the new file, not overwrite it with the stashed version. bale tells them apart by inode and size (Task 6 rules). Test in Task 6.
+1. **A file rewritten while the tree was stashed** (a Codex thread in T3 has no pre-prompt hook and may build): unstash must keep the new file, not overwrite it with the stashed version. bale tells them apart by inode and size (Task 6 rules). Test in Task 6. Known limit, accepted: if a restore crashes and a build then rewrites one of those files in place before the rerun, the rerun can't tell it from a half-written file and overwrites it; the next build rebuilds it.
 2. **mtime drift:** if a restored file's mtime differs from the original, Xcode and Gradle rebuild it, turning a 1 s restore into a 45 s build. Test that mode and mtime round-trip exactly in Task 6.
 3. **Crash between writing blobs and truncating files, or mid-restore:** a rerun must finish the job, nothing may be truncated before its blob and the manifest are durable, and a half-written file must not be mistaken for a newer one. Tests in Tasks 5 and 6.
 4. **A busy tree** (build running, Xcode holding files): stash must refuse rather than truncate files a process has open. Test in Task 5.
@@ -253,7 +253,7 @@ Add `filetime = "0.2"` as a dev-dependency (and as a normal dependency for Task 
 
 Steps of `stash`, in order:
 1. Take the workspace lock; skip with a reason if held. Skip if the record's level is not `Hot` or `Baled`, or if `stash` is `Some` with `restored: false` (already stashed).
-2. Build dirs = `regenerable_dirs(root, detect(root), cfg)`. Skip with `"busy: <holders>"` if `busy_holders_many(dirs, ignore_pids)` finds any holder.
+2. Stash dirs: a stub must only ever sit where the build treats the file as its own output, because a build that reads an empty input produces a wrong result rather than an error. So the stash dirs are a subset of `regenerable_dirs(root, detect(root), cfg)`: for Xcode, `Build/` inside each DerivedData dir (not `SourcePackages/`, `SDKExplicitPrecompiledModules/` or `ModuleCache.noindex/`, which hold inputs or module caches; Task 0 fixture: `Build/` 5.71 GB of 8.0 GB in files ≥ 1 MiB, `SourcePackages/` 1.73 GB); for Gradle, each `**/build/` dir (not `.gradle/` or `.kotlin/`). Add `pub fn stash_dirs(root, kinds, cfg) -> Vec<PathBuf>` to `detect.rs` with tests for both. Skip with `"busy: <holders>"` if `busy_holders_many(dirs, ignore_pids)` finds any holder.
 3. Candidates: regular files (not symlinks, `nlink == 1`) under those dirs with size ≥ `stash_min_bytes`. Extended attributes need no handling: truncating in place keeps them, and the only one Task 0 found on build output is `com.apple.provenance`.
 4. Base lookup: if `stash` is `Some(restored: true)`, read that manifest and map `rel -> hash`; that hash is the patch base for the same `rel`.
 5. Hash candidates through the index (`par_map`, 8-way), then `put` each (in parallel); count `reused` when the blob already existed.
@@ -301,7 +301,7 @@ Restore rules:
   - **Missing:** create the file and restore it. It gets a new inode, so the next build relinks it; that is correct but slow, so count it in the report as `recreated`.
 - Restore in place: add the owner write bit if needed, open the existing file for writing, truncate to 0, and stream the blob into it through `Store::read_to`, hashing as it writes. On a hash mismatch, truncate the file back to 0, keep the store and manifest, and return an error naming the file. Then set mode and mtime (`filetime::set_file_mtime`, nanosecond precision).
 - Entries that share a hash are each written from the blob. Cloning would give them new inodes, which costs a relink.
-- Run up to 8 entries at a time, and also cap bytes in flight at 2 GiB (file size plus patch base size of each running entry); an entry waits when it would exceed the cap.
+- Run up to 8 entries at a time, and also cap resident bytes at 2 GiB: with streaming, only each running entry's patch base is held in memory, so the cap counts base sizes. An entry waits when it would exceed the cap.
 - On success set `restored = true`, `restoring = false`, and save. A failure mid-way leaves `restoring: true`; a rerun finishes the job under the rules above.
 
 - [ ] **Step 1: Write the failing tests**
@@ -359,7 +359,7 @@ Live manifests are the `stash.commitment` of every record. Live blobs = every en
 
 Policy changes in `decide` (keep the existing order: cold first):
 - `Hot` or `Baled`, not stashed, `idle_for >= cfg.idle_stash` → `Action::Stash`, unless a cold or up action applies first.
-- A stashed tree never gets `Action::Up`: stashing replaces deleting build output. It still goes cold at `idle_cold`; cold must unstash nothing, and Task 5's manifest stays until GC (cold's existing removal of build dirs deletes the small files; the stashed blobs are dropped by GC once the cold record's stash is cleared — clear `record.stash` in `cold` when it removes the build dirs).
+- Stash sits between hot and `up`, it doesn't replace `up`: a stashed tree still gets `Action::Up` at `idle_baled` (4 h) and `Action::Cold` at `idle_cold` (7 days). Warm leaves about 3.7 GB per Flipcash tree (9.4 GB minus 5.7 GB stashable under `Build/`), so 7–12 trees left at warm would hold 26–44 GB. `up` and `cold` both remove the build dirs, so both clear `record.stash`; the blobs go at the next GC.
 - `up` on a stashed tree (manual `bale up`): clear `record.stash` when it removes the build dirs, the same as `cold`, so a later unstash doesn't write dylibs into an emptied DerivedData. Add a test: stash, `up`, then `unstash` returns `Ok(None)`.
 - Trace: add a `stash` line `{id, files, bytes, stored_bytes, secs}` and an `unstash` line with the same fields plus `kept_newer`, so the replay can measure real restore times.
 
@@ -367,8 +367,9 @@ Policy changes in `decide` (keep the existing order: cold first):
 
 ```rust
 #[test] fn decide_stashes_after_idle_stash()      // Hot, 11 min, clean -> Stash; 9 min -> Keep
-#[test] fn decide_never_ups_a_stashed_tree()      // Baled, has_regen, stashed, 5 h -> Keep
+#[test] fn decide_ups_a_stashed_tree_at_idle_baled() // Hot, has_regen, stashed, 5 h -> Up; 30 min -> Keep (already stashed)
 #[test] fn decide_cold_beats_stash()              // idle 8 days clean -> Cold
+#[test] fn sweep_up_clears_stash()                 // stashed fixture idle 5 h -> build dirs gone, record.stash None
 #[test] fn sweep_stashes_and_traces()             // fixture tree idle 11 min -> files stashed, trace has one `stash` line
 ```
 
@@ -423,7 +424,7 @@ No code; this checks the plan against the restore budget on real build output be
 - Create: `docs/bench/2026-10-warm-tier.md` (results), script under the session scratchpad, not in the repo
 
 - [ ] **Step 1:** `cargo build --release`. Using a temp `BALE_HOME` (never `~/.bale`, never `~/.local/bin/bale`), `bale adopt` the clone from Task 0 (rebuild it first if the scratch dir was cleared).
-- [ ] **Step 2:** Run `bale stash` then `bale unstash` 5 times; record stash and restore seconds, stored bytes, and disk freed (`du -sk .dd` before and after stash).
+- [ ] **Step 2:** Run `bale stash` then `bale unstash` 5 times; record stash and restore seconds, stored bytes, and disk freed as the `df` change across the stash (not `du`: Xcode keeps some dylibs as clones of each other, so `du` overstates the saving). Record `tmutil listlocalsnapshots /` with it, since a local snapshot keeps truncated blocks allocated.
 - [ ] **Step 3:** Make the leaf edit from the spec's calibration (`Flipcash/UI/EnterAmountView.swift` string), incremental build, stash, unstash; record times and stored bytes (expect tens of MB from patching).
 - [ ] **Step 4:** After unstash, run the incremental build again with no edit and record its time. **Expected:** about the same as a no-op build before stashing (seconds). A full rebuild means mtimes or content did not round-trip: stop and report.
 - [ ] **Step 5:** Write the numbers to `docs/bench/2026-10-warm-tier.md`, delete the clone and the temp home, commit — `docs: add warm tier acceptance results`.
