@@ -12,6 +12,7 @@ pub mod registry;
 pub mod spm;
 #[cfg(target_os = "macos")]
 pub mod spm_link;
+pub(crate) mod spm_lock;
 pub mod store;
 pub mod trace;
 

@@ -382,3 +382,91 @@ fn a_folder_a_process_holds_is_left() {
     let _ = child.wait();
     assert!(k.exists(), "{rows:?}");
 }
+
+/// Holds `spm/.lock` with `flock(op)` until dropped, as a linking hook does.
+fn hold(e: &Env, op: i32) -> fs::File {
+    use std::os::fd::AsRawFd;
+    fs::create_dir_all(e.fx.home().spm_dir()).unwrap();
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.fx.home().spm_dir().join(".lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) }, 0);
+    f
+}
+
+fn skip_rows(e: &Env) -> Vec<(String, String)> {
+    sweep(&e.fx.home(), false)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.1 == Action::Reap && r.2.starts_with("skipped"))
+        .map(|r| (r.0, r.2))
+        .collect()
+}
+
+#[test]
+fn a_hook_holding_the_lock_makes_gc_skip_and_say_so() {
+    let e = env();
+    let k = e.shared("aaaa", 2);
+    let lock = hold(&e, libc::LOCK_SH);
+    let skipped = skip_rows(&e);
+    drop(lock);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(k.exists());
+    let ops = e.op_lines();
+    assert_eq!(ops[0]["outcome"], "skipped");
+    assert_eq!(ops[0]["reason"], "locked");
+}
+
+#[test]
+fn a_leftover_gc_folder_is_removed_without_waiting_for_the_grace() {
+    let e = env();
+    let left = e.shared(".gc-aaaa-1-0", 0);
+    let live = e.shared("bbbb", 0);
+    let rows = e.rows(false);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(!left.exists() && live.exists());
+}
+
+#[test]
+fn a_corrupt_record_is_named_in_the_skip_row() {
+    let e = env();
+    let k = e.shared("aaaa", 2);
+    let wt = e.fx.add_worktree("wt", "wt");
+    let id = register(&e.fx.home(), &wt).unwrap().id;
+    let rec = e.fx.home().records_dir().join(format!("{id}.json"));
+    assert!(rec.exists(), "{}", rec.display());
+    fs::write(&rec, "not json").unwrap();
+    let skipped = skip_rows(&e);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].1.contains("corrupt record"), "{skipped:?}");
+    assert!(k.exists());
+}
+
+#[test]
+fn a_link_under_a_trees_build_derived_data_survives() {
+    let e = env();
+    let k = e.shared("aaaa", 2);
+    let wt = e.fx.add_worktree("wt", "wt");
+    register(&e.fx.home(), &wt).unwrap();
+    link_in(&wt.join("build/DerivedData"), "Proj-abc", &k);
+    assert!(e.rows(false).is_empty());
+    assert!(k.exists());
+}
+
+#[test]
+fn one_unreadable_folder_in_a_tree_does_not_disable_gc() {
+    let e = env();
+    let old = e.shared("aaaa", 2);
+    let wt = e.fx.add_worktree("wt", "wt");
+    register(&e.fx.home(), &wt).unwrap();
+    let locked = wt.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let rows = sweep(&e.fx.home(), false).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!old.exists(), "{rows:?}");
+    assert!(!old.exists());
+}

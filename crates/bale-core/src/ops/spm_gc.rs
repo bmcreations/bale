@@ -8,24 +8,31 @@
 //!   `spm/<key>`. Links are looked for in Xcode's shared DerivedData, in every
 //!   learned `-derivedDataPath` root that exists (without asking whether it
 //!   looks like DerivedData: a fresh one holds only the link), in each
-//!   registered tree's own top-level folders, and in the folders and keys the
-//!   records name. Both `<root>/SourcePackages` and
+//!   registered tree's own folders (`<tree>/<child>` as a root, and
+//!   `<tree>/<child>/DerivedData` for `build/DerivedData`), and in the folders
+//!   and keys the records name. Both `<root>/SourcePackages` and
 //!   `<root>/<child>/SourcePackages` are checked.
 //! * Keys are compared by file name under the canonical `spm/`, so `/var`
 //!   and `/private/var` spellings of one folder agree.
-//! * If any listing fails for a reason other than "not found", nothing is
-//!   deleted this sweep.
+//! * If any listing fails for a reason other than "not found", or a record
+//!   can't be read, nothing is deleted this sweep and the row says why. The
+//!   one exception is a permission error on a folder directly in a tree.
 //! * A candidate must also be older than `grace` (itself and what is directly
-//!   in it), have no process holding it, and show no reference in a second
-//!   scan made right before it is removed.
+//!   in it) and have no process holding it.
 //! * Nothing follows a link: `remove_entry` and `remove_stub` remove links
 //!   themselves, and spm entries that are not real directories are ignored.
 //!
-//! There is no lock shared with hooks that link (`link_tree`,
-//! `link_derived_data_path`, `relink_tree`): the second scan and the grace
-//! period narrow that race but do not close it. The window left is a hook
-//! linking an old, unreferenced folder in the instant between the second scan
-//! and the removal.
+//! The race with hooks that link (`link_tree`, `link_derived_data_path`,
+//! `relink_tree`) is closed by `spm/.lock` (see [`crate::spm_lock`]). A hook
+//! holds it shared while it checks for `spm/<key>` and makes the link. The
+//! sweep takes it exclusive without waiting, scans for references once more,
+//! and renames each unreferenced `spm/<key>` to `spm/.gc-<key>-<pid>-<n>`;
+//! then it lets go. A hook then either linked before the rename (and the
+//! rescan saw the link) or finds no `spm/<key>`. The deletion of the renamed
+//! folders, which takes seconds, happens outside the lock. A `.gc-*` left by a
+//! sweep that died is deleted by the next one, with no grace period. If a hook
+//! holds the lock, the sweep skips the cleanup. If the sweep holds it, the
+//! hook links nothing and the tree builds unshared.
 //!
 //! The cleanup runs whether or not `share_swift_packages` is on, so turning
 //! the feature off still lets the folders it made go away.
@@ -45,14 +52,40 @@ use crate::BaleHome;
 /// Sizing a folder before it is removed stops after this long.
 const SIZING_LIMIT: Duration = Duration::from_secs(30);
 
-/// Why a scan could not say what is linked: the error kind, for the trace.
-struct ScanError(io::ErrorKind);
+/// Why the cleanup could not say what is still linked.
+struct ScanError {
+    /// For the trace; names no path.
+    reason: String,
+    /// For the sweep's row.
+    detail: String,
+}
 
 type Scan<T> = Result<T, ScanError>;
 
 impl From<io::Error> for ScanError {
     fn from(e: io::Error) -> Self {
-        ScanError(e.kind())
+        ScanError {
+            reason: format!("{:?}", e.kind()),
+            detail: format!("could not read a folder it needs to check: {e}"),
+        }
+    }
+}
+
+impl ScanError {
+    fn new(reason: &str, detail: String) -> Self {
+        ScanError {
+            reason: reason.into(),
+            detail,
+        }
+    }
+
+    /// Writes the trace line and the row for a cleanup that did not run.
+    fn skip(&self, home: &BaleHome, rows: &mut Vec<(String, String)>) {
+        crate::trace::spm_gc_skipped(home, &self.reason);
+        rows.push((
+            home.spm_dir().display().to_string(),
+            format!("skipped: {}", self.detail),
+        ));
     }
 }
 
@@ -65,107 +98,175 @@ fn or_missing<T>(r: io::Result<T>) -> Scan<Option<T>> {
     }
 }
 
+type Records = Vec<(String, anyhow::Result<Record>)>;
+
 /// `(folder or key, result)` for each shared folder, temp clone or stub
-/// removed (or, on `dry_run`, that would be) or that failed.
+/// removed (or, on `dry_run`, that would be) or that failed, and one row
+/// naming `spm/` when the cleanup could not run.
 pub(crate) fn collect(home: &BaleHome, grace: Duration, dry_run: bool) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let registry = Registry::open(home.clone());
-    let Ok(records) = registry.all_lenient() else {
-        crate::trace::spm_gc_skipped(home, "registry");
-        return rows;
-    };
     let now = SystemTime::now();
-    drop_gone_stubs(home, &records, grace, now, dry_run, &mut rows);
-    // Stubs may have been the last references; read the records again.
-    let Ok(records) = registry.all_lenient() else {
-        crate::trace::spm_gc_skipped(home, "registry");
-        return rows;
-    };
-    let spm = home.spm_dir();
-    let entries = match or_missing(fs::read_dir(&spm)) {
-        Ok(Some(e)) => e,
-        Ok(None) => return rows,
-        Err(ScanError(kind)) => {
-            crate::trace::spm_gc_skipped(home, &format!("{kind:?}"));
+    match registry.all_lenient() {
+        Ok(records) => drop_gone_stubs(home, &records, grace, now, dry_run, &mut rows),
+        Err(e) => {
+            ScanError::new("registry", format!("cannot list the records: {e:#}"))
+                .skip(home, &mut rows);
             return rows;
         }
-    };
-    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            crate::trace::spm_gc_skipped(home, "read_dir");
-            return rows;
-        };
-        // A symlink or file in spm/ is not ours to remove or follow.
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let tmp = entry.file_name().to_string_lossy().starts_with(".tmp-");
-        candidates.push((entry.path(), tmp));
     }
-    candidates.sort();
-    // Cheap checks first; the reference scan only when something is old enough.
-    candidates.retain(|(dir, _)| newest_change(dir).is_some_and(|t| age(t, now) >= grace));
-    if candidates.is_empty() {
-        return rows;
-    }
-    let refs = match References::scan(home, &records) {
-        Ok(r) => r,
-        Err(ScanError(kind)) => {
-            crate::trace::spm_gc_skipped(home, &format!("{kind:?}"));
-            return rows;
-        }
-    };
-    for (dir, tmp) in candidates {
-        let name = dir.file_name().map(OsString::from).unwrap_or_default();
-        if !tmp && refs.keys.contains(&name) {
-            continue;
-        }
-        if let Some(row) = remove_candidate(home, &records, &dir, tmp, &name, dry_run) {
-            rows.push((dir.display().to_string(), row));
-        }
+    if let Err(e) = run(home, &registry, grace, now, dry_run, &mut rows) {
+        e.skip(home, &mut rows);
     }
     rows
 }
 
-/// Removes `dir` after the last checks; `None` when it is kept.
-fn remove_candidate(
+fn run(
     home: &BaleHome,
-    records: &[(String, anyhow::Result<Record>)],
-    dir: &Path,
-    tmp: bool,
-    name: &OsString,
+    registry: &Registry,
+    grace: Duration,
+    now: SystemTime,
     dry_run: bool,
-) -> Option<String> {
-    match busy_holders(dir, &[]) {
-        Ok(h) if !h.is_empty() => return None,
-        Ok(_) => {}
-        Err(e) => return Some(format!("error: {e:#}")),
-    }
-    let start = Instant::now();
-    let bytes = crate::trace::size_tree(dir, &[], start + SIZING_LIMIT).tree;
-    let size = crate::human_bytes(bytes);
-    let why = if tmp {
-        "left over from a clone"
-    } else {
-        "nothing links to it"
+    rows: &mut Vec<(String, String)>,
+) -> Scan<()> {
+    let Some(entries) = or_missing(fs::read_dir(home.spm_dir()))? else {
+        return Ok(());
     };
-    if dry_run {
-        return Some(format!("would remove {size}: {why}"));
-    }
-    // A hook may have linked it while the checks ran.
-    if !tmp {
-        match References::scan(home, records) {
-            Ok(r) if !r.keys.contains(name) => {}
-            _ => return None,
+    // Stubs may have been the last references; read the records afresh.
+    let records = registry
+        .all_lenient()
+        .map_err(|e| ScanError::new("registry", format!("cannot list the records: {e:#}")))?;
+    let mut keys: Vec<PathBuf> = Vec::new();
+    let mut leftovers: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        // A symlink or file in spm/ is not ours to remove or follow.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = newest_change(&entry.path()).is_some_and(|t| age(t, now) >= grace);
+        if name.starts_with(".gc-") {
+            leftovers.push(entry.path());
+        } else if name.starts_with(".tmp-") {
+            if old {
+                leftovers.push(entry.path());
+            }
+        } else if old {
+            keys.push(entry.path());
         }
     }
-    let result = remove_entry(dir);
-    crate::trace::spm_gc(home, bytes, result.is_ok(), start.elapsed());
-    Some(match result {
-        Ok(()) => format!("removed {size}: {why}"),
-        Err(e) => format!("error: removing {}: {e}", dir.display()),
-    })
+    keys.sort();
+    // Nothing to decide: skip the scans and the lock.
+    if keys.is_empty() {
+        return remove_all(home, leftovers, dry_run, rows);
+    }
+    let first = References::scan(home, &records)?;
+    keys.retain(|k| !first.contains(k));
+    let held = idle(&keys)?;
+    let held: Vec<PathBuf> = keys
+        .into_iter()
+        .zip(held)
+        .filter_map(|(k, h)| h.then_some(k))
+        .collect();
+    let mut condemned = leftovers;
+    if dry_run {
+        condemned.extend(held);
+    } else if !held.is_empty() {
+        let Some(_lock) = crate::spm_lock::try_lock(home, crate::spm_lock::Mode::Exclusive) else {
+            return Err(ScanError::new(
+                "locked",
+                "a hook is linking shared packages".into(),
+            ));
+        };
+        // Records and DerivedData as they are now that no hook can link.
+        let records = registry
+            .all_lenient()
+            .map_err(|e| ScanError::new("registry", format!("cannot list the records: {e:#}")))?;
+        let second = References::scan(home, &records)?;
+        for dir in held.into_iter().filter(|k| !second.contains(k)) {
+            match condemn(&dir) {
+                Ok(gc) => condemned.push(gc),
+                Err(e) => rows.push((
+                    dir.display().to_string(),
+                    format!("error: renaming {}: {e}", dir.display()),
+                )),
+            }
+        }
+    }
+    remove_all(home, condemned, dry_run, rows)
+}
+
+/// For each of `dirs`, whether no process holds it, from one scan.
+fn idle(dirs: &[PathBuf]) -> Scan<Vec<bool>> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let canon: Vec<PathBuf> = dirs
+        .iter()
+        .map(crate::paths::canonicalize)
+        .collect::<io::Result<_>>()?;
+    let holders = crate::busy::busy_holders_many(&canon, &[])
+        .map_err(|e| ScanError::new("busy", format!("cannot tell which are in use: {e:#}")))?;
+    Ok(holders.iter().map(|h| h.is_empty()).collect())
+}
+
+/// Renames `spm/<key>` to `spm/.gc-<key>-<pid>-<n>` and returns the new path.
+fn condemn(dir: &Path) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    let gc = dir.with_file_name(format!(
+        ".gc-{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::rename(dir, &gc)?;
+    Ok(gc)
+}
+
+/// Removes the folders in `dirs` that no process holds, one row and one trace
+/// line each; on `dry_run` only the rows.
+fn remove_all(
+    home: &BaleHome,
+    dirs: Vec<PathBuf>,
+    dry_run: bool,
+    rows: &mut Vec<(String, String)>,
+) -> Scan<()> {
+    let idle = idle(&dirs)?;
+    for (dir, idle) in dirs.into_iter().zip(idle) {
+        if !idle {
+            continue;
+        }
+        let start = Instant::now();
+        let bytes = crate::trace::size_tree(&dir, &[], start + SIZING_LIMIT).tree;
+        let size = crate::human_bytes(bytes);
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let why = if name.starts_with(".tmp-") {
+            "left over from a clone"
+        } else if name.starts_with(".gc-") {
+            "set aside for removal"
+        } else {
+            "nothing links to it"
+        };
+        if dry_run {
+            rows.push((
+                dir.display().to_string(),
+                format!("would remove {size}: {why}"),
+            ));
+            continue;
+        }
+        let result = remove_entry(&dir);
+        crate::trace::spm_gc(home, bytes, result.is_ok(), start.elapsed());
+        rows.push((
+            dir.display().to_string(),
+            match result {
+                Ok(()) => format!("removed {size}: {why}"),
+                Err(e) => format!("error: removing {}: {e}", dir.display()),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Removes the pre-made folders the records name that are still untouched
@@ -173,7 +274,7 @@ fn remove_candidate(
 /// has changed in them for `grace`, and forgets them in the record.
 fn drop_gone_stubs(
     home: &BaleHome,
-    records: &[(String, anyhow::Result<Record>)],
+    records: &Records,
     grace: Duration,
     now: SystemTime,
     dry_run: bool,
@@ -255,8 +356,13 @@ struct References {
 }
 
 impl References {
+    /// Whether something links to the folder `dir` directly under `spm/`.
+    fn contains(&self, dir: &Path) -> bool {
+        dir.file_name().is_some_and(|n| self.keys.contains(n))
+    }
+
     /// Every source of links; an error when any of them cannot be read.
-    fn scan(home: &BaleHome, records: &[(String, anyhow::Result<Record>)]) -> Scan<References> {
+    fn scan(home: &BaleHome, records: &Records) -> Scan<References> {
         let spm = home.spm_dir();
         let mut spms = vec![spm.clone()];
         spms.extend(crate::paths::canonicalize(&spm).ok());
@@ -272,11 +378,14 @@ impl References {
         for line in text.lines().filter(|l| !l.is_empty()) {
             refs.scan_root(Path::new(line))?;
         }
-        for (_, record) in records {
+        for (id, record) in records {
             // A record that can't be read may hold any reference.
-            let Ok(record) = record else {
-                return Err(ScanError(io::ErrorKind::InvalidData));
-            };
+            let record = record.as_ref().map_err(|e| {
+                ScanError::new(
+                    "corrupt_record",
+                    format!("corrupt record {id}: {:#}", e.root_cause()),
+                )
+            })?;
             refs.scan_tree(&record.path)?;
             for l in &record.spm {
                 // A folder that is gone no longer keeps its key.
@@ -311,17 +420,29 @@ impl References {
         Ok(())
     }
 
-    /// A tree's own top-level folders as DerivedData roots: `<tree>/.dd`,
-    /// `<tree>/derived`, whatever its builds were pointed at.
+    /// A tree's own folders as DerivedData roots: `<tree>`, each
+    /// `<tree>/<child>` (such as `.dd`), and `<tree>/<child>/DerivedData`
+    /// (such as `build/DerivedData`). A child the user can't read is skipped:
+    /// a tree holds many folders, and one of them being locked must not stop
+    /// the cleanup. Anything deeper that fails still does.
     fn scan_tree(&mut self, tree: &Path) -> Scan<()> {
-        self.scan_root(tree)?;
+        self.scan_link(&tree.join("SourcePackages"))?;
         let Some(entries) = or_missing(fs::read_dir(tree))? else {
             return Ok(());
         };
         for entry in entries {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                self.scan_root(&entry.path())?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let child = entry.path();
+            match self.scan_root(&child) {
+                Err(ScanError { reason, .. }) if reason == "PermissionDenied" => continue,
+                other => other?,
+            }
+            let derived = child.join("DerivedData");
+            if or_missing(fs::symlink_metadata(&derived))?.is_some_and(|m| m.is_dir()) {
+                self.scan_root(&derived)?;
             }
         }
         Ok(())
@@ -363,5 +484,24 @@ impl References {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condemning_moves_the_key_out_of_sight_with_its_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("abcd");
+        fs::create_dir_all(dir.join("checkouts")).unwrap();
+        fs::write(dir.join("checkouts/f"), "x").unwrap();
+        let gc = condemn(&dir).unwrap();
+        assert!(fs::symlink_metadata(&dir).is_err(), "spm/<key> is gone");
+        let name = gc.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".gc-abcd-"), "{name}");
+        assert_eq!(gc.parent(), dir.parent());
+        assert!(gc.join("checkouts/f").is_file());
     }
 }

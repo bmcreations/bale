@@ -113,6 +113,7 @@ fn names(dir: &Path) -> Vec<String> {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != ".lock")
         .collect();
     v.sort();
     v
@@ -751,4 +752,77 @@ fn relink_that_cannot_proceed_is_not_retried_until_the_next_edit() {
     relink_tree(&h, &id);
     assert_eq!(fs::read(&rec_file).unwrap(), before);
     assert!(!h.spm_dir().join(key_of(RESOLVED2)).exists());
+}
+
+/// Holds `spm/.lock` with `flock(op)` until dropped, as sweep's GC does.
+fn hold_spm_lock(h: &BaleHome, op: i32) -> fs::File {
+    use std::os::fd::AsRawFd;
+    fs::create_dir_all(h.spm_dir()).unwrap();
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(h.spm_dir().join(".lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) }, 0);
+    f
+}
+
+#[test]
+fn register_links_nothing_while_gc_holds_the_lock() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let lock = hold_spm_lock(&h, libc::LOCK_EX);
+    let rec = register(&h, &wt).unwrap();
+    assert!(rec.spm.is_empty());
+    assert!(!dd_of(&e, &proj).exists(), "the tree builds unshared");
+    drop(lock);
+}
+
+#[test]
+fn register_links_while_another_hook_holds_the_lock_shared() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let _other = hold_spm_lock(&h, libc::LOCK_SH);
+    let rec = register(&h, &wt).unwrap();
+    assert_eq!(rec.spm.len(), 1);
+    assert!(is_link_to(
+        &dd_of(&e, &proj).join("SourcePackages"),
+        &shared(&h)
+    ));
+}
+
+#[test]
+fn derived_data_path_links_nothing_while_gc_holds_the_lock() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    let root = e.dd.parent().unwrap().join("my dd");
+    let lock = hold_spm_lock(&h, libc::LOCK_EX);
+    link_derived_data_path(&h, &id, &root);
+    assert!(!root.exists());
+    drop(lock);
+    link_derived_data_path(&h, &id, &root);
+    assert!(is_link_to(&root.join("SourcePackages"), &shared(&h)));
+}
+
+#[test]
+fn relink_does_nothing_while_gc_holds_the_lock_and_retries_later() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+    let lock = hold_spm_lock(&h, libc::LOCK_EX);
+    relink_tree(&h, &id);
+    assert!(is_link_to(&folder.join("SourcePackages"), &shared(&h)));
+    assert_eq!(record(&h, &id).spm[0].key, key());
+    drop(lock);
+    relink_tree(&h, &id);
+    assert_eq!(record(&h, &id).spm[0].key, key_of(RESOLVED2));
 }

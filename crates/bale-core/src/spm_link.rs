@@ -17,6 +17,7 @@ use crate::derived_data::folder_name;
 use crate::lock::WorkspaceLock;
 use crate::registry::{Record, Registry, SpmLink};
 use crate::spm::{finished, key, resolved_files, seed, xcode_build, Resolved};
+use crate::spm_lock::{try_lock, Mode};
 use crate::BaleHome;
 
 /// `share_swift_packages` from the machine config; off when it can't be read.
@@ -85,6 +86,11 @@ pub(crate) fn link_tree(
     }
     let files = resolved_files(tree);
     let Some(build) = (!files.is_empty()).then(xcode_build).flatten() else {
+        return Vec::new();
+    };
+    // Held until the last link exists: the sweep must not remove a folder
+    // between the check for it and the link to it.
+    let Some(_spm_lock) = try_lock(home, Mode::Shared) else {
         return Vec::new();
     };
     let mut made = Vec::new();
@@ -261,6 +267,11 @@ pub fn relink_tree(home: &BaleHome, id: &str) {
     let Ok(Some(_lock)) = WorkspaceLock::try_acquire(home, id) else {
         return;
     };
+    // Not taken above: a hook with nothing to relink never touches it. Without
+    // it the relink waits for the next hook.
+    let Some(_spm_lock) = try_lock(home, Mode::Shared) else {
+        return;
+    };
     let Ok(Some(mut record)) = registry.get(id) else {
         return;
     };
@@ -286,17 +297,23 @@ pub fn link_derived_data_path(home: &BaleHome, id: &str, root: &Path) {
     let Ok(Some(record)) = Registry::open(home.clone()).get(id) else {
         return;
     };
-    let Some(shared) = record
+    let keys: Vec<PathBuf> = record
         .spm
         .iter()
         .map(|l| home.spm_dir().join(&l.key))
-        .find(|p| is_real_dir(p))
-    else {
-        return;
-    };
-    if !enabled(home) {
+        .collect();
+    // Nothing to link to: leave `spm/` and its lock alone.
+    if !keys.iter().any(|p| is_real_dir(p)) || !enabled(home) {
         return;
     }
+    // Held until the link exists; see `link_tree`. The folder is looked for
+    // again under it, since the sweep may have set it aside meanwhile.
+    let Some(_spm_lock) = try_lock(home, Mode::Shared) else {
+        return;
+    };
+    let Some(shared) = keys.into_iter().find(|p| is_real_dir(p)) else {
+        return;
+    };
     let made_root = !root.exists() && fs::create_dir_all(root).is_ok();
     if std::os::unix::fs::symlink(&shared, &sp).is_err() && made_root {
         let _ = fs::remove_dir(root);
