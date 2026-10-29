@@ -4,7 +4,7 @@
 
 **Goal:** When a tree has been idle for 10 minutes, move the large files out of its build output into bale's own content-addressed store, and put them back before the next prompt within the restore budget.
 
-**Architecture:** A store under `$BALE_HOME/store` holds zstd blobs keyed by the SHA-256 of their content. A changed file is stored as a `--patch-from`-style delta against the blob the same path held at the tree's previous stash. `bale stash` writes a per-tree manifest, then deletes the stashed files. `bale unstash` rebuilds them in parallel, checks each hash, and restores mode and mtime so incremental builds stay incremental. The sweep stashes idle trees. Claude Code's `UserPromptSubmit` and `PreToolUse` hooks unstash before the agent acts. Cold trees served over NFS are the next plan, not this one.
+**Architecture:** A store under `$BALE_HOME/store` holds zstd blobs keyed by the SHA-256 of their content. A changed file is stored as a `--patch-from`-style delta against the blob the same path held at the tree's previous stash. `bale stash` writes a per-tree manifest, then truncates each stashed file to 0 bytes in place, keeping its inode. `bale unstash` writes the bytes back into the same files in parallel, checks each hash, and restores mode and mtime. Xcode compares inodes for the intermediate binaries it links from, so a restore that kept bytes and mtime but changed the inode relinked all 16 binaries (Task 0). The sweep stashes idle trees. Claude Code's `UserPromptSubmit` and `PreToolUse` hooks unstash before the agent acts. Cold trees served over NFS are the next plan, not this one.
 
 **Tech Stack:** Rust 2021, existing `bale-core` / `bale-hooks` / `bale-cli` crates, `zstd-safe` (new), `sha2`, `walkdir`, `serde_json`.
 
@@ -19,20 +19,23 @@
 - Stash only build-output directories (`detect::regenerable_dirs`). Never touch source files, `.git`, or anything outside the tree. `~/.gradle/caches` is out of scope.
 - The `Stop` hook must return within milliseconds; it only records the turn end (spec, Lifecycle).
 - No new file format outside `$BALE_HOME/store` and the record. No external `zstd` binary at runtime.
-- Platform-neutral code; macOS is the only platform tested in this plan. `clonefile` use goes through `std::fs::copy`, which clones on APFS.
+- Platform-neutral code; macOS is the only platform tested in this plan.
+- A stashed file keeps its inode for its whole life: stash truncates it, unstash writes into it. Never delete, rename over, or clone into a stashed path (Task 0: any new inode costs a 45 s relink on Flipcash).
 - Commits as Brandon McAnsh <git@bmcreations.dev>, no trailers.
 
 ## Review Focus
 
-1. **A file rewritten while the tree was stashed** (a Codex thread in T3 has no pre-prompt hook and may build): unstash must keep the new file, not overwrite it with the stashed version. Test in Task 6.
+1. **A file rewritten while the tree was stashed** (a Codex thread in T3 has no pre-prompt hook and may build): unstash must keep the new file, not overwrite it with the stashed version. bale tells them apart by inode and size (Task 6 rules). Test in Task 6.
 2. **mtime drift:** if a restored file's mtime differs from the original, Xcode and Gradle rebuild it, turning a 1 s restore into a 45 s build. Test that mode and mtime round-trip exactly in Task 6.
-3. **Crash between writing blobs and deleting files, or mid-restore:** a rerun must finish the job, and nothing may be deleted before its blob and the manifest are durable. Tests in Tasks 5 and 6.
-4. **A busy tree** (build running, Xcode holding files): stash must refuse rather than delete files a process has open. Test in Task 5.
+3. **Crash between writing blobs and truncating files, or mid-restore:** a rerun must finish the job, nothing may be truncated before its blob and the manifest are durable, and a half-written file must not be mistaken for a newer one. Tests in Tasks 5 and 6.
+4. **A busy tree** (build running, Xcode holding files): stash must refuse rather than truncate files a process has open. Test in Task 5.
 5. **GC deleting a blob that a patch still needs:** a base blob stays alive while any live blob patches against it. Test in Task 7.
 
 ---
 
 ### Task 0: Check that Xcode accepts a rewritten output (blocks Task 1)
+
+**Done 2026-10-29.** Results in `docs/bench/2026-10-warm-tier.md`: a new inode relinks, the same inode doesn't, build output carries only `com.apple.provenance` (re-added by macOS), and `std::fs::copy` clones. The tasks below already include the outcome. The steps are kept as a record of the method.
 
 The plan deletes a stashed file and later writes a new one with the same bytes, mode and mtime. If Xcode's build system compares the inode as well, every restored dylib gets relinked and a 2 s restore turns into a full link step. Gradle compares content, so only Xcode needs this check.
 
@@ -180,11 +183,11 @@ Assert exact `BlobMeta.depth` and `base` values as listed.
 
 **Interfaces:**
 - Produces:
-  - `pub struct Entry { pub rel: PathBuf, pub hash: Hash, pub size: u64, pub mode: u32, pub mtime_ns: i128 }` (`rel` is relative to the tree root)
+  - `pub struct Entry { pub rel: PathBuf, pub hash: Hash, pub size: u64, pub mode: u32, pub mtime_ns: i128, pub ino: u64 }` (`rel` is relative to the tree root; `ino` is the inode the stub keeps, used to tell bale's stub from a file a build recreated)
   - `pub struct StashManifest { pub tree_id: String, pub created_unix: i64, pub entries: Vec<Entry> }`
-  - `impl StashManifest { pub fn commitment(&self) -> Hash }` — SHA-256 over entries sorted by `rel`, each serialised as `rel\0hash\0size\0mode\0mtime_ns\n`
+  - `impl StashManifest { pub fn commitment(&self) -> Hash }` — SHA-256 over entries sorted by `rel`, each serialised as `rel\0hash\0size\0mode\0mtime_ns\n` (`ino` is left out: it identifies the stub, not the content)
   - `Store::write_manifest(&self, m: &StashManifest) -> Result<Hash>` (file `manifests/<commitment>.json`, temp + fsync + rename), `Store::read_manifest(&self, c: &Hash) -> Result<StashManifest>` (verifies the commitment), `Store::list_manifests(&self) -> Result<Vec<Hash>>`, `Store::remove_manifest(&self, c: &Hash) -> Result<()>`
-  - `Record.stash: Option<StashState>` with `pub struct StashState { pub commitment: Hash, pub at_unix: i64, pub restored: bool }`, `#[serde(default, skip_serializing_if = "Option::is_none")]` like the neighbouring fields. `restored: true` means the files are back but the manifest is kept as the patch base for the next stash.
+  - `Record.stash: Option<StashState>` with `pub struct StashState { pub commitment: Hash, pub at_unix: i64, pub restored: bool, #[serde(default)] pub restoring: bool }`, `#[serde(default, skip_serializing_if = "Option::is_none")]` like the neighbouring fields. `restored: true` means the files are back but the manifest is kept as the patch base for the next stash.
   - `Config` gains `pub idle_stash: Duration` (key `idle_stash_minutes`, default 10), `pub stash_min_bytes: u64` (key `stash_min_bytes`, default 1048576), `pub patch_max_depth: u32` (key `patch_max_depth`, default 4).
 
 - [ ] **Step 1: Write the failing tests**
@@ -251,27 +254,27 @@ Add `filetime = "0.2"` as a dev-dependency (and as a normal dependency for Task 
 Steps of `stash`, in order:
 1. Take the workspace lock; skip with a reason if held. Skip if the record's level is not `Hot` or `Baled`, or if `stash` is `Some` with `restored: false` (already stashed).
 2. Build dirs = `regenerable_dirs(root, detect(root), cfg)`. Skip with `"busy: <holders>"` if `busy_holders_many(dirs, ignore_pids)` finds any holder.
-3. Candidates: regular files (not symlinks, `nlink == 1`) under those dirs with size ≥ `stash_min_bytes`. Leave files that carry extended attributes in place (count them in the report's skipped reason only in debug output); this avoids losing xattrs we do not restore.
+3. Candidates: regular files (not symlinks, `nlink == 1`) under those dirs with size ≥ `stash_min_bytes`. Extended attributes need no handling: truncating in place keeps them, and the only one Task 0 found on build output is `com.apple.provenance`.
 4. Base lookup: if `stash` is `Some(restored: true)`, read that manifest and map `rel -> hash`; that hash is the patch base for the same `rel`.
 5. Hash candidates through the index (`par_map`, 8-way), then `put` each (in parallel); count `reused` when the blob already existed.
 6. Write the manifest, set `record.stash = Some(StashState { commitment, at_unix: now, restored: false })`, save the record. Only now:
-7. Delete each candidate whose current stat still matches the index entry (a file that changed during steps 5–6 stays). Save the index.
+7. Truncate each candidate whose current stat still matches the index entry to 0 bytes in place (`set_len(0)` on a handle opened for writing; add the owner write bit first if the file is read-only, as some SPM checkout files are, then restore the mode). A file that changed during steps 5–6 is left alone and removed from the manifest before step 6 is rewritten. Save the index.
 8. Remove the previous manifest if it was a `restored: true` base (its blobs stay until GC decides).
 
 - [ ] **Step 1: Write the failing tests** (use a temp `BaleHome` and a fixture tree with a `.dd` dir detected as Xcode output, like the existing `tests/up.rs` fixtures)
 
 ```rust
-#[test] fn stashes_only_large_build_files()          // 2 MiB + 3 MiB files in .dd are gone; 4 KiB file in .dd and a 5 MiB source file outside build dirs remain; report.files == 2
+#[test] fn stashes_only_large_build_files()          // 2 MiB + 3 MiB files in .dd are 0 bytes with their inodes unchanged; 4 KiB file in .dd and a 5 MiB source file outside build dirs remain; report.files == 2
 #[test] fn second_stash_patches_against_first()      // stash, unstash (Task 6 not yet: simulate by writing files back and setting restored: true), modify 100 bytes of one file, stash again -> that blob's meta.base == old hash, depth 1
 #[test] fn refuses_busy_tree()                       // hold a .dd file open in a child process (`sleep` with redirect, as tests/cold.rs does) -> Skipped("busy: ...") and all files present
-#[test] fn crash_before_delete_leaves_files_and_rerun_completes() // inject failure after manifest write via a test hook (cfg(test) env var BALE_TEST_FAIL_AT=stash-delete) -> files still present, record.stash set; rerun stash() returns Stashed and files are gone
+#[test] fn crash_before_delete_leaves_files_and_rerun_completes() // inject failure after manifest write via a test hook (cfg(test) env var BALE_TEST_FAIL_AT=stash-delete) -> files still full size, record.stash set; rerun stash() returns Stashed and files are 0 bytes
 #[test] fn file_changed_during_stash_is_kept()       // use BALE_TEST_FAIL_AT-style pause hook or modify between index and delete via a test-only callback -> that file remains
 ```
 
 - [ ] **Step 2–4:** fail, implement, pass. Then `cargo test -p bale-core`.
 - [ ] **Step 5: Commit** — `feat(core): add stash for large build-output files`
 
-Note on step 1 of `crash_before_delete...`: a rerun with `stash` already `Some(restored: false)` must not skip; it re-deletes whatever manifest entries are still present and unchanged. Adjust rule 1 accordingly: skip only when no manifest entry is still present on disk.
+Note on step 1 of `crash_before_delete...`: a rerun with `stash` already `Some(restored: false)` must not skip; it re-truncates whatever manifest entries are still full size and unchanged. Adjust rule 1 accordingly: skip only when every manifest entry is already a 0-byte stub.
 
 ---
 
@@ -285,23 +288,31 @@ Note on step 1 of `crash_before_delete...`: a rerun with `stash` already `Some(r
 **Interfaces:**
 - Consumes: Task 2–5 types.
 - Produces:
-  - `pub struct UnstashReport { pub files: usize, pub bytes: u64, pub kept_newer: usize, pub secs: f64 }`
+  - `pub struct UnstashReport { pub files: usize, pub bytes: u64, pub kept_newer: usize, pub recreated: usize, pub secs: f64 }`
   - `pub fn unstash(home: &BaleHome, id: &str) -> Result<Option<UnstashReport>>` (`None` when the tree is not stashed; must cost one record read in that case, since every prompt calls it)
   - `pub fn unstash_path(home: &BaleHome, cwd: &Path) -> Result<Option<UnstashReport>>` — maps a path inside a tree to its record (longest registered `path` prefix) and calls `unstash`
 
 Restore rules:
-- Group entries by hash. For each hash, decompress once into `<dir>/.bale-tmp-<rand>`, verify SHA-256, set mode and mtime (`filetime::set_file_mtime` with nanosecond precision), rename into place. Further entries with the same hash are `std::fs::copy` of the first restored file (an APFS clone) followed by the same mode/mtime set.
-- If a file already exists at `rel`, leave it, count `kept_newer`.
-- Run groups in parallel, up to 8 at a time, and also cap bytes in flight at 2 GiB (sum of file size plus base size for running groups); a group waits when it would exceed the cap. Write through `Store::read_to` into the temp file, not through `read`.
-- On success set `record.stash.restored = true` and save. A failure mid-way leaves `restored: false`; a rerun restores the rest (present files are skipped by the rule above).
+- Before writing anything, set `record.stash.restoring = true` and save.
+- Classify each entry by the file at `rel`:
+  - **Stub:** same inode as `entry.ino` and size 0. Restore it.
+  - **Half-written:** same inode, size not 0, and `restoring` was already true when this run started (an earlier run stopped mid-way). Restore it, unless its size and SHA-256 already match the entry.
+  - **Newer:** different inode, or size not 0 while `restoring` was false. Leave it and count `kept_newer`.
+  - **Missing:** create the file and restore it. It gets a new inode, so the next build relinks it; that is correct but slow, so count it in the report as `recreated`.
+- Restore in place: add the owner write bit if needed, open the existing file for writing, truncate to 0, and stream the blob into it through `Store::read_to`, hashing as it writes. On a hash mismatch, truncate the file back to 0, keep the store and manifest, and return an error naming the file. Then set mode and mtime (`filetime::set_file_mtime`, nanosecond precision).
+- Entries that share a hash are each written from the blob. Cloning would give them new inodes, which costs a relink.
+- Run up to 8 entries at a time, and also cap bytes in flight at 2 GiB (file size plus patch base size of each running entry); an entry waits when it would exceed the cap.
+- On success set `restored = true`, `restoring = false`, and save. A failure mid-way leaves `restoring: true`; a rerun finishes the job under the rules above.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-#[test] fn round_trip_restores_bytes_mode_and_mtime() // after stash+unstash, every file's bytes, permissions and mtime (ns) equal the pre-stash values
-#[test] fn duplicate_content_is_restored_once_and_cloned() // two identical 2 MiB files in different dirs -> both restored, store read once (count via a test counter or by checking report)
-#[test] fn newer_file_at_path_is_kept()               // after stash, write a new file at one stashed path -> unstash keeps its content; kept_newer == 1
-#[test] fn rerun_after_partial_restore_completes()    // BALE_TEST_FAIL_AT=unstash-mid after first group -> Err; rerun -> Ok, all files present and correct
+#[test] fn round_trip_restores_bytes_mode_mtime_and_inode() // after stash+unstash, every file's bytes, permissions, mtime (ns) and inode equal the pre-stash values
+#[test] fn read_only_file_round_trips()               // a 0o444 2 MiB file: stash and unstash succeed, mode is 0o444 again
+#[test] fn duplicate_content_keeps_both_inodes()     // two identical 2 MiB files in different dirs -> both restored with their original inodes
+#[test] fn newer_file_at_path_is_kept()               // after stash, replace one stub with a new file (new inode) and write into another stub in place -> both kept; kept_newer == 2
+#[test] fn missing_file_is_recreated()                // delete one stub -> restored with correct bytes; recreated == 1
+#[test] fn rerun_after_partial_restore_completes()    // BALE_TEST_FAIL_AT=unstash-mid leaves one file half-written -> Err; rerun -> Ok, that file rewritten, all bytes correct, kept_newer == 0
 #[test] fn not_stashed_is_none()                      // unstash on a hot tree returns Ok(None)
 #[test] fn unstash_path_finds_tree_from_subdir()
 ```
