@@ -429,25 +429,51 @@ mod warm {
     fn decide_stashes_after_idle_stash() {
         for level in [Level::Hot, Level::Baled] {
             assert_eq!(
-                decide(level, mins(11), false, false, false, &cfg()),
+                decide(level, mins(11), false, false, false, true, &cfg()),
                 Action::Stash
             );
             assert_eq!(
-                decide(level, mins(9), false, false, false, &cfg()),
+                decide(level, mins(9), false, false, false, true, &cfg()),
                 Action::Keep
             );
         }
     }
 
     #[test]
+    fn decide_never_stashes_when_not_allowed() {
+        for level in [Level::Hot, Level::Baled] {
+            assert_eq!(
+                decide(level, mins(11), false, false, false, false, &cfg()),
+                Action::Keep
+            );
+            assert_eq!(
+                decide(level, hours(5), false, true, false, false, &cfg()),
+                Action::Up
+            );
+        }
+        assert_eq!(
+            decide(
+                Level::Hot,
+                Duration::from_secs(8 * 86400),
+                false,
+                true,
+                false,
+                false,
+                &cfg()
+            ),
+            Action::Cold
+        );
+    }
+
+    #[test]
     fn decide_ups_a_stashed_tree_at_idle_baled() {
         assert_eq!(
-            decide(Level::Hot, hours(5), false, true, true, &cfg()),
+            decide(Level::Hot, hours(5), false, true, true, true, &cfg()),
             Action::Up
         );
         // Already stashed: nothing more to do until up is due.
         assert_eq!(
-            decide(Level::Hot, mins(30), false, true, true, &cfg()),
+            decide(Level::Hot, mins(30), false, true, true, true, &cfg()),
             Action::Keep
         );
     }
@@ -455,7 +481,7 @@ mod warm {
     #[test]
     fn decide_up_beats_stash() {
         assert_eq!(
-            decide(Level::Hot, hours(5), false, true, false, &cfg()),
+            decide(Level::Hot, hours(5), false, true, false, true, &cfg()),
             Action::Up
         );
     }
@@ -469,6 +495,7 @@ mod warm {
                 false,
                 true,
                 false,
+                true,
                 &cfg()
             ),
             Action::Cold
@@ -517,6 +544,13 @@ mod warm {
         let reg = Registry::open(fx.home());
         let mut rec = reg.get(id).unwrap().unwrap();
         rec.stash.as_mut().unwrap().restoring = true;
+        reg.put(&rec).unwrap();
+    }
+
+    fn allow_stash(fx: &Fixture, id: &str) {
+        let reg = Registry::open(fx.home());
+        let mut rec = reg.get(id).unwrap().unwrap();
+        rec.restore_hook = true;
         reg.put(&rec).unwrap();
     }
 
@@ -612,6 +646,7 @@ mod warm {
         let fx = Fixture::new();
         let wt = xcode_worktree(&fx);
         let id = register(&fx.home(), &wt).unwrap().id;
+        allow_stash(&fx, &id);
         global_config(&fx.home(), "idle_stash_minutes = 0\n");
 
         let rows = sweep(&fx.home(), false).unwrap();
@@ -636,10 +671,25 @@ mod warm {
     }
 
     #[test]
+    fn sweep_keeps_an_idle_tree_no_restore_hook_covers() {
+        let fx = Fixture::new();
+        let wt = xcode_worktree(&fx);
+        let id = register(&fx.home(), &wt).unwrap().id;
+        global_config(&fx.home(), "idle_stash_minutes = 0\n");
+
+        let rows = sweep(&fx.home(), false).unwrap();
+        assert_eq!(row(&rows, &id).1, Action::Keep, "{rows:?}");
+        assert_eq!(fs::metadata(wt.join(BIG)).unwrap().len(), (2 * MIB) as u64);
+        let rec = record(&fx, &id);
+        assert!(rec.stash.is_none() && !rec.restore_hook);
+    }
+
+    #[test]
     fn restored_tree_is_stashed_again() {
         let fx = Fixture::new();
         let wt = xcode_worktree(&fx);
         let id = register(&fx.home(), &wt).unwrap().id;
+        allow_stash(&fx, &id);
         global_config(&fx.home(), "idle_stash_minutes = 0\n");
         sweep(&fx.home(), false).unwrap();
         let restored = unstash(&fx.home(), &id).unwrap().unwrap();
@@ -657,6 +707,7 @@ mod warm {
         let wt = xcode_worktree(&fx);
         let id = register(&fx.home(), &wt).unwrap().id;
         // Nothing reaches the size floor.
+        allow_stash(&fx, &id);
         global_config(
             &fx.home(),
             "idle_stash_minutes = 0\nstash_min_bytes = 1073741824\n",

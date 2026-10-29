@@ -3714,6 +3714,37 @@ fn hook_pre_tool_bumps_activity() {
 }
 
 #[test]
+fn pre_tool_hook_lets_the_next_sweep_stash() {
+    let env = Env::new();
+    let wt = stash_tree(&env);
+    fs::write(
+        env.bale_home().join("config.toml"),
+        "idle_stash_minutes = 0\n",
+    )
+    .unwrap();
+    let home = bale_core::BaleHome(env.bale_home());
+    let reg = bale_core::registry::Registry::open(home);
+    let id = tree_id(&wt);
+
+    // No restoring hook has run: the sweep leaves the build outputs alone.
+    assert!(!reg.get(&id).unwrap().unwrap().restore_hook);
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(len_of(&wt.join(BIG_A)), 2 * MIB as u64);
+    assert!(reg.get(&id).unwrap().unwrap().stash.is_none());
+
+    let out = pre_tool_hook(&env, &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(reg.get(&id).unwrap().unwrap().restore_hook);
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(len_of(&wt.join(BIG_A)), 0);
+    let rec = reg.get(&id).unwrap().unwrap();
+    assert!(rec.stash.is_some() && rec.restore_hook);
+}
+
+#[test]
 fn hook_pre_tool_unstashes_tree() {
     let env = Env::new();
     let wt = stash_tree(&env);

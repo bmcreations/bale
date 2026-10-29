@@ -64,6 +64,11 @@ pub struct Record {
     /// Set while the tree's large build files live in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stash: Option<StashState>,
+    /// A hook that restores stashed files has run for this tree. `sweep`
+    /// stashes only such trees, since a stashed tree no hook restores would
+    /// build against empty files. Core never clears it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restore_hook: bool,
 }
 
 /// A tree's stash, as the record tracks it.

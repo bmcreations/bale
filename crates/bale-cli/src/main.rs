@@ -944,6 +944,7 @@ mod tests {
             pinned: false,
             scope: None,
             stash: None,
+            restore_hook: false,
         };
         assert!(show_text(&r, None).contains("origin:   cursor\n"));
         r.origin = Some(origin("s1"));

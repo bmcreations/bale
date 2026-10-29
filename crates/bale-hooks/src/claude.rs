@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use bale_core::git::{self, Git};
 use bale_core::lock::WorkspaceLock;
-use bale_core::ops::meta::{set_origin, touch};
+use bale_core::ops::meta::{set_origin, touch, touch_restoring};
 use bale_core::ops::new::{new_workspace, workspace_path};
 use bale_core::ops::unstash::{
     needs_restore, take_failure_marker, tree_containing, unstash_with, LockTimeout, UnstashOpts,
@@ -362,7 +362,7 @@ pub fn prompt(home: &BaleHome) -> ExitCode {
         };
         // Before the restore starts, so a sweep cannot stash the tree again
         // right after the prompt.
-        if let Err(e) = touch(home, &path) {
+        if let Err(e) = touch_restoring(home, &path) {
             eprintln!("bale: not recorded as activity: {e:#}");
         }
         if !pending {
@@ -424,7 +424,7 @@ pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-        if let Err(e) = touch(home, &path) {
+        if let Err(e) = touch_restoring(home, &path) {
             eprintln!("bale: not recorded as activity: {e:#}");
         }
         ExitCode::SUCCESS

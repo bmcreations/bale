@@ -87,6 +87,7 @@ Codex and T3 Code trees record the tool as their origin with no session or title
 
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
+The sweep's stash step only stashes trees where Claude Code's restore hook (`prompt` or `pre-tool`) has run, because no other tool restores stashed files; `bale stash` by hand works on any tree.
 
 Known limitations:
 
