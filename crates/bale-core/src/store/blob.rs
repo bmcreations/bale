@@ -194,7 +194,8 @@ impl Store {
 
     /// Streams the content of `hash` to `dst` and returns the bytes written.
     /// Only the base is held in memory. A corrupt blob is reported after the
-    /// bytes were written, so write to a temp file and rename on success.
+    /// bytes were written, so the caller must undo what it wrote (unstash
+    /// truncates the file back to 0; it never renames over a stashed path).
     pub fn read_to(&self, hash: &Hash, dst: &mut impl Write) -> Result<u64> {
         let meta = self.meta(hash)?;
         let base = meta.base.as_ref().map(|b| self.read(b)).transpose()?;
