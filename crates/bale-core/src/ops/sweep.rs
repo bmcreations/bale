@@ -104,6 +104,11 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     }
     #[cfg(not(target_os = "macos"))]
     let _ = mains;
+    // A tree removed before its first build leaves its pre-made folder behind.
+    #[cfg(target_os = "macos")]
+    if !dry_run {
+        drop_stubs_of_missing_trees(home, &records);
+    }
     // Xcode's shared DerivedData is listed once and each folder in it sized
     // once, however many trees it belongs to.
     let global = global_root().map(|g| index(&g)).unwrap_or_default();
@@ -229,6 +234,27 @@ fn adopt_missed(
         }
     }
     (rows, mains)
+}
+
+/// For each record whose checkout is gone, removes the pre-made DerivedData
+/// folders it still names if they were never built in.
+#[cfg(target_os = "macos")]
+fn drop_stubs_of_missing_trees(home: &BaleHome, records: &[(String, Result<Record>)]) {
+    let registry = Registry::open(home.clone());
+    for record in records.iter().filter_map(|(_, r)| r.as_ref().ok()) {
+        let gone = fs::symlink_metadata(&record.path)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if !gone || record.spm.is_empty() {
+            continue;
+        }
+        let Ok(Some(_lock)) = crate::lock::WorkspaceLock::try_acquire(home, &record.id) else {
+            continue;
+        };
+        let mut record = record.clone();
+        if crate::spm_link::drop_stubs(&mut record) {
+            let _ = registry.put(&record);
+        }
+    }
 }
 
 /// Seeds the shared Swift packages folder for every registered tree and every

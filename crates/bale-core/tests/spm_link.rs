@@ -5,6 +5,7 @@
 mod support;
 
 use bale_core::derived_data::folder_name;
+use bale_core::ops::cold::cold;
 use bale_core::ops::sweep::sweep;
 use bale_core::ops::up::{register, up};
 use bale_core::BaleHome;
@@ -324,4 +325,83 @@ fn sweep_seeds_from_the_main_checkout_of_a_known_repo() {
     sweep(&h, false).unwrap();
     assert_eq!(fs::read_to_string(shared(&h).join("marker")).unwrap(), "m");
     assert!(fs::symlink_metadata(&main_sp).unwrap().is_dir());
+}
+
+/// Registers a worktree with sharing off, then puts `build` into the folder
+/// `up` will look at; returns (id, folder).
+fn up_over(e: &Env, build: impl Fn(&Path, &Path)) -> PathBuf {
+    let h = e.fx.home();
+    make_shared(&h);
+    disable(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    let folder = dd_of(e, &proj);
+    fs::create_dir_all(&folder).unwrap();
+    build(&folder, &shared(&h));
+    up(&h, &id).unwrap();
+    folder
+}
+
+#[test]
+fn up_keeps_a_folder_xcode_has_started_to_fill() {
+    let e = env();
+    let folder = up_over(&e, |f, s| {
+        std::os::unix::fs::symlink(s, f.join("SourcePackages")).unwrap();
+        fs::create_dir_all(f.join("Build")).unwrap();
+    });
+    assert_eq!(names(&folder), ["Build", "SourcePackages"]);
+}
+
+#[test]
+fn up_keeps_a_folder_with_a_real_source_packages() {
+    let e = env();
+    let folder = up_over(&e, |f, _| {
+        real_packages(f);
+    });
+    assert!(folder.join("SourcePackages/marker").is_file());
+}
+
+#[test]
+fn cold_removes_the_premade_folder() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    let folder = dd_of(&e, &proj);
+    assert!(folder.exists());
+    cold(&h, &id).unwrap();
+    assert!(fs::symlink_metadata(&folder).is_err());
+    assert!(shared(&h).join("marker").is_file());
+    let rec = bale_core::registry::Registry::open(h)
+        .get(&id)
+        .unwrap()
+        .unwrap();
+    assert!(rec.spm.is_empty());
+}
+
+#[test]
+fn sweep_removes_the_premade_folder_of_a_tree_that_is_gone() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let wt = e.fx.add_worktree("wt", "f");
+    let proj = project(&wt);
+    let id = register(&h, &wt).unwrap().id;
+    let folder = dd_of(&e, &proj);
+    assert!(folder.exists());
+    fs::remove_dir_all(&wt).unwrap();
+
+    sweep(&h, true).unwrap();
+    assert!(folder.exists(), "dry run removes nothing");
+    sweep(&h, false).unwrap();
+    assert!(fs::symlink_metadata(&folder).is_err());
+    assert!(shared(&h).join("marker").is_file());
+    let rec = bale_core::registry::Registry::open(h)
+        .get(&id)
+        .unwrap()
+        .unwrap();
+    assert!(rec.spm.is_empty());
 }

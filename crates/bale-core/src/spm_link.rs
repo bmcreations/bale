@@ -151,3 +151,16 @@ pub(crate) fn seed_from_trees(home: &BaleHome, trees: &[PathBuf], dd_root: &Path
         }
     }
 }
+
+/// Removes the pre-made folders `record.spm` names that are still untouched
+/// stubs, and forgets the entries whose folder is gone. For a tree that is
+/// going cold or whose checkout no longer exists, where `resolved_files` has
+/// nothing to read. Returns whether `record.spm` changed.
+pub(crate) fn drop_stubs(record: &mut Record) -> bool {
+    let before = record.spm.len();
+    for l in &record.spm {
+        let _ = crate::ops::up::remove_stub(&l.folder);
+    }
+    record.spm.retain(|l| exists(&l.folder));
+    record.spm.len() != before
+}

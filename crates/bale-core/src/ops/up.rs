@@ -610,6 +610,34 @@ pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes `dir` if it is a folder bale pre-made: a real directory holding
+/// exactly one entry, `SourcePackages`, which is a symlink. Returns whether it
+/// did. Anything else, such as a folder Xcode has started to fill, is left
+/// alone. The link is removed with `remove_file` and the folder with
+/// `remove_dir`, so a file Xcode adds in between makes the removal fail
+/// instead of deleting it, and the shared folder is never followed.
+pub(crate) fn remove_stub(dir: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let mut entries = fs::read_dir(dir)?;
+    let Some(only) = entries.next().transpose()? else {
+        return Ok(false);
+    };
+    if entries.next().is_some()
+        || only.file_name() != "SourcePackages"
+        || !fs::symlink_metadata(only.path())?.file_type().is_symlink()
+    {
+        return Ok(false);
+    }
+    fs::remove_file(only.path())?;
+    fs::remove_dir(dir)?;
+    Ok(true)
+}
+
 /// Removes DerivedData folders under `dd_root` built from this worktree and
 /// returns a message per folder that could not be probed or removed. A folder
 /// a process holds is left alone. Missing `dd_root` is not a failure.
@@ -633,16 +661,11 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
         }
     }
     // A folder bale pre-made for a project that never built has no
-    // `info.plist`, so the match above can't see it; find it by name. The
-    // link inside is removed, not followed.
+    // `info.plist`, so the match above can't see it; find it by name. This
+    // pass deliberately runs even when `share_swift_packages` is false: stubs
+    // made while it was on still need cleaning up.
     for r in crate::spm::resolved_files(root) {
         let dir = dd_root.join(crate::derived_data::folder_name(&r.project));
-        let is_stub = fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir())
-            && fs::symlink_metadata(dir.join("info.plist"))
-                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
-        if !is_stub {
-            continue;
-        }
         match busy_holders(&dir, ignore) {
             Ok(h) if !h.is_empty() => continue,
             Ok(_) => {}
@@ -651,7 +674,7 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
                 continue;
             }
         }
-        if let Err(e) = remove_entry(&dir) {
+        if let Err(e) = remove_stub(&dir) {
             failures.push(format!("{}: {e}", dir.display()));
         }
     }
