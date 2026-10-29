@@ -5,6 +5,27 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
+/// Points HOME at an empty temp dir, once per test binary, unless it already
+/// lies in the temp dir (a test set it). `sweep` reads and, for orphaned
+/// DerivedData, deletes under the user's home; a test must never reach the
+/// real one. Tests that need a particular HOME set it themselves.
+fn isolate_home() {
+    let temp = bale_core::paths::canonicalize(std::env::temp_dir()).unwrap_or_default();
+    let in_temp = bale_core::paths::home_dir()
+        .and_then(|h| bale_core::paths::canonicalize(h).ok())
+        .is_some_and(|h| h.starts_with(&temp));
+    if in_temp {
+        return;
+    }
+    static HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = TempDir::new().expect("tempdir");
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
+        dir
+    });
+}
+
 /// A temp git repo with one commit on `main`; the path contains a space and `é`.
 pub struct Fixture {
     tmp: TempDir,
@@ -32,6 +53,7 @@ impl Fixture {
     }
 
     fn init(tmp: TempDir) -> Fixture {
+        isolate_home();
         let repo = tmp.path().join("my repo é");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
