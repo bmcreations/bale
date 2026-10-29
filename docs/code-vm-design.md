@@ -117,6 +117,13 @@ FSKit can serve a path-backed filesystem since macOS 26 (`FSPathURLResource`), b
 - **No copy-on-write available** (ext4, NTFS): the tree is a plain worktree, and tier 1 governs it.
 - **Build output must live in the tree.** Xcode's shared DerivedData is keyed by workspace path, so a tree cloned to a new path gets a new, empty DerivedData folder and builds from scratch. A bale tree builds with `-derivedDataPath` inside the tree, so the clone carries the base's build. Each tree's build output is stored and restored at that tree's own path only.
 
+### Tiers
+
+File sizes in two Flipcash iOS DerivedData folders (9.41 and 9.32 GB): about 600 files over 1 MB hold 6.4–6.5 GB; 4,650–4,790 files of 128 KB–1 MB hold 1.5 GB; 111,000–116,000 files of 128 KB or less hold 1.4–1.5 GB.
+
+- **Warm (idle longer than T).** bale stores files over 1 MB in its store and deletes them from the tree; small files stay. A tree keeps about 3 GB of its 9.4 GB. Restore writes about 600 files back in parallel with no mount; at the measured 1.6–4.3 GB/s that is roughly 1.5–4 s for 6.4 GB, warm cache, not yet measured as one run.
+- **Cold (idle for hours).** bale stores everything and deletes the build directories. Opening the tree mounts them from the store (NFSv3 loopback, 0.05 s) while a background job writes the files for real, then unmounts and puts the real directory in place.
+
 ### Lifecycle per turn (Claude Code)
 
 1. `Stop`: bale records that the turn ended and starts a timer for this tree. Nothing else runs; the hook must return within milliseconds.
