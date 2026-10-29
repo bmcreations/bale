@@ -441,7 +441,8 @@ pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
 /// Keeps the tree's shared Swift packages link current before a tool runs:
 /// relinks when a `Package.resolved` changed, and links the folder a Bash
 /// command's `-derivedDataPath` names. Best-effort and silent; the unchanged
-/// case is one record read and one stat per linked project.
+/// case is one record read and one stat per linked project. A tree with
+/// several projects uses the first project's key for `-derivedDataPath`.
 #[cfg(target_os = "macos")]
 fn share_packages(home: &BaleHome, payload: &Value, cwd: &Path, id: &str) {
     bale_core::spm_link::relink_tree(home, id);

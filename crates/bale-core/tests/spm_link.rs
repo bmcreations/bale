@@ -721,3 +721,34 @@ fn derived_data_path_does_nothing_when_sharing_is_disabled() {
     link_derived_data_path(&h, &id, &root);
     assert!(fs::symlink_metadata(&root).is_err());
 }
+
+#[test]
+fn relink_that_cannot_proceed_is_not_retried_until_the_next_edit() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, proj, folder) = linked_tree(&e);
+    fs::remove_dir_all(shared(&h)).unwrap();
+    fs::write(resolved_of(&proj), RESOLVED2).unwrap();
+
+    relink_tree(&h, &id);
+
+    let l = record(&h, &id).spm[0].clone();
+    assert_eq!(l.key, key(), "old key kept");
+    assert_eq!(l.size, RESOLVED2.len() as u64);
+    assert_eq!(
+        l.mtime,
+        fs::metadata(resolved_of(&proj))
+            .unwrap()
+            .modified()
+            .unwrap()
+    );
+    assert!(fs::symlink_metadata(folder.join("SourcePackages")).is_ok());
+    // Second call: fast path, so the record file is not rewritten.
+    let rec_file = h.records_dir().join(format!("{id}.json"));
+    let before = fs::read(&rec_file).unwrap();
+    // A held lock would make a retry bail out silently, so check the record
+    // is unchanged and the fast-path predicate is false via an unchanged stamp.
+    relink_tree(&h, &id);
+    assert_eq!(fs::read(&rec_file).unwrap(), before);
+    assert!(!h.spm_dir().join(key_of(RESOLVED2)).exists());
+}

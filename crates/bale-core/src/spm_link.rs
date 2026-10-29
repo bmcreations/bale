@@ -217,11 +217,15 @@ fn relink_one(home: &BaleHome, l: &mut SpmLink, build: &str) -> bool {
             } else {
                 None
             };
-            let Some(target) = target else { return false };
-            if repoint(&sp, &target).is_err() {
-                return false;
+            // Nothing to link to (old folder gone, or the seed failed) or
+            // the rename failed: keep the old key and link, but record the
+            // new mtime and size so later hooks take the fast path until
+            // the next edit or sweep instead of retrying every call.
+            if let Some(target) = target {
+                if repoint(&sp, &target).is_ok() {
+                    l.key = k2;
+                }
             }
-            l.key = k2;
         }
     }
     l.mtime = mtime;
@@ -239,6 +243,11 @@ fn relink_one(home: &BaleHome, l: &mut SpmLink, build: &str) -> bool {
 /// folder when it doesn't exist. Only a symlink into `spm/` is repointed. The
 /// record is written under the workspace lock; a locked tree is skipped and
 /// retried by the next hook. Every failure is swallowed.
+///
+/// The K2 seed clone runs synchronously in the hook and can pause the tool
+/// call for seconds, once per `Package.resolved` change. When a relink can't
+/// proceed (no K2 and no K1 to clone, or the clone fails), the recorded mtime
+/// and size are still refreshed so it isn't retried until the next edit.
 pub fn relink_tree(home: &BaleHome, id: &str) {
     let registry = Registry::open(home.clone());
     match registry.get(id) {
