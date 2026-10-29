@@ -177,7 +177,15 @@ impl Run<'_> {
         prev: Option<StashState>,
         opts: &StashOpts,
     ) -> Result<StashOutcome> {
-        let rels = candidates(&self.root, &self.dirs, cfg.stash_min_bytes);
+        // A dir inside a nested repo or submodule is out: the root's git
+        // can't say which of its files are tracked.
+        self.dirs.retain(|d| {
+            d.strip_prefix(&self.root)
+                .is_ok_and(|rel| !super::up::in_nested_repo(&self.root, rel))
+        });
+        let seen_by_git = git_visible(&self.root, &self.dirs)?;
+        let mut rels = candidates(&self.root, &self.dirs, cfg.stash_min_bytes);
+        rels.retain(|r| !seen_by_git.contains(r));
         if rels.is_empty() {
             return Ok(StashOutcome::Skipped("nothing to stash".into()));
         }
@@ -379,13 +387,55 @@ impl Run<'_> {
     }
 }
 
+/// Files under `dirs` that git tracks or sees as untracked and not ignored,
+/// relative to `root`, from one `git ls-files` per 100 dirs. Such a file is
+/// source as far as git is concerned, so stash never stubs it.
+fn git_visible(root: &Path, dirs: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
+    let mut out = BTreeSet::new();
+    let specs: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| d.strip_prefix(root).ok())
+        .map(|rel| format!(":(literal){}", super::up::slashed(rel)))
+        .collect();
+    for chunk in specs.chunks(100) {
+        let mut args = vec![
+            "--no-optional-locks",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let listed = crate::git::Git::at(root).run(&args)?;
+        out.extend(
+            listed
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    Ok(out)
+}
+
 /// Regular files with a single link, at least `min` bytes, under `dirs`,
 /// as paths relative to `root`. Paths that are not valid UTF-8 are left out:
 /// the manifest can't store them.
 fn candidates(root: &Path, dirs: &[PathBuf], min: u64) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in dirs {
-        for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
+        let walk = WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            // A nested repo below a stash dir: its files are not the root
+            // git's to judge, so leave them alone.
+            .filter_entry(|e| {
+                !(e.depth() > 0
+                    && e.file_type().is_dir()
+                    && fs::symlink_metadata(e.path().join(".git")).is_ok())
+            });
+        for entry in walk.flatten() {
             if !entry.file_type().is_file() {
                 continue;
             }

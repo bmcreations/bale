@@ -422,3 +422,24 @@ fn interrupted_unstash_is_not_restashed() {
     );
     assert_eq!(len(&wt.join(A)), (2 * MIB) as u64);
 }
+
+#[test]
+fn git_tracked_build_files_are_not_stashed() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("wt", "feature");
+    fs::write(wt.join(".gitignore"), "build/\n").unwrap();
+    fs::write(wt.join("settings.gradle.kts"), "").unwrap();
+    put(&wt, "app/build/tracked.bin", &noise(2 * MIB, 21));
+    support::git(&wt, &["add", "-f", "app/build/tracked.bin"]);
+    support::git(&wt, &["commit", "-qm", "track a build file"]);
+    put(&wt, "app/build/loose.bin", &noise(2 * MIB, 22));
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let r = stashed(stash(&fx.home(), &id, &[]).unwrap());
+    assert_eq!(r.files, 1);
+    assert_eq!(len(&wt.join("app/build/tracked.bin")), (2 * MIB) as u64);
+    assert_eq!(len(&wt.join("app/build/loose.bin")), 0);
+    let m = manifest(&fx.home(), &id);
+    assert_eq!(m.entries.len(), 1);
+    assert_eq!(m.entries[0].rel, Path::new("app/build/loose.bin"));
+}
