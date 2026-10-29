@@ -1,3 +1,6 @@
+//! Inode and mode checks run through every test here, so the file is Unix-only.
+#![cfg(unix)]
+
 mod support;
 
 use bale_core::ops::stash::{stash, stash_with, StashOpts, StashOutcome, StashReport};
