@@ -168,8 +168,7 @@ pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
 /// the NFD-normalised path (a leading `/private` dropped before `/tmp/`,
 /// `/var/` or `/etc/`), each big-endian u64 half written as 14 base-26
 /// digits `a`-`z`. Pure: reads no files.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn folder_name(project: &Path) -> String {
+pub fn folder_name(project: &Path) -> String {
     use md5::{Digest, Md5};
     use unicode_normalization::UnicodeNormalization;
 

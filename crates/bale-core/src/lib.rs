@@ -10,6 +10,8 @@ pub mod par;
 pub mod paths;
 pub mod registry;
 pub mod spm;
+#[cfg(target_os = "macos")]
+pub(crate) mod spm_link;
 pub mod store;
 pub mod trace;
 

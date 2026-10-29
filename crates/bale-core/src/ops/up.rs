@@ -137,9 +137,11 @@ pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> 
         );
     }
     let common = git::common_dir(&root)?;
-    let info = git::worktrees(&root)?
-        .into_iter()
+    let listed = git::worktrees(&root)?;
+    let info = listed
+        .iter()
         .find(|w| crate::paths::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == root)
+        .cloned()
         .with_context(|| {
             format!(
                 "{} is not a worktree of {}",
@@ -206,11 +208,36 @@ pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> 
                 scope: None,
                 stash: None,
                 restore_hook: false,
+                spm: Vec::new(),
             }
         }
     };
+    #[cfg(target_os = "macos")]
+    let record = {
+        let mut record = record;
+        link_swift_packages(home, &mut record, &listed);
+        record
+    };
     registry.put(&record)?;
     Ok(record)
+}
+
+/// Links the tree's new Swift projects to shared packages, seeding a shared
+/// folder from the repo's other worktrees (the list `register` already read)
+/// when the key has none. Best effort: a failure leaves the record as it was.
+#[cfg(target_os = "macos")]
+fn link_swift_packages(home: &BaleHome, record: &mut Record, listed: &[git::WorktreeInfo]) {
+    let Some(dd_root) = crate::derived_data::global_root() else {
+        return;
+    };
+    let siblings: Vec<PathBuf> = listed
+        .iter()
+        .filter(|w| !w.bare && !w.prunable)
+        .filter_map(|w| crate::paths::canonicalize(&w.path).ok())
+        .filter(|p| *p != record.path)
+        .collect();
+    let made = crate::spm_link::link_tree(home, &record.path, &dd_root, &siblings);
+    crate::spm_link::merge_links(record, made);
 }
 
 /// Turns a CLI argument into a workspace id. An existing path whose record is
@@ -336,15 +363,16 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
     record.trash.clear();
     #[cfg(target_os = "macos")]
     {
-        let failures = crate::paths::home_dir()
-            .map(|h| {
-                remove_derived_data(
-                    &root,
-                    &h.join("Library/Developer/Xcode/DerivedData"),
-                    ignore,
-                )
-            })
+        let dd_root = crate::derived_data::global_root();
+        let failures = dd_root
+            .as_deref()
+            .map(|dd| remove_derived_data(&root, dd, ignore))
             .unwrap_or_default();
+        // The tree's next build starts from a fresh folder, so link it now.
+        if let Some(dd) = &dd_root {
+            let made = crate::spm_link::link_tree(home, &root, dd, &[]);
+            crate::spm_link::merge_links(&mut record, made);
+        }
         if !failures.is_empty() {
             record.note = Some(format!("{DD_NOTE}{}", failures.join("; ")));
         } else if record
@@ -592,6 +620,29 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
         return failures;
     }
     for dir in crate::derived_data::derived_data_for(root, dd_root) {
+        match busy_holders(&dir, ignore) {
+            Ok(h) if !h.is_empty() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                failures.push(format!("{}: {e:#}", dir.display()));
+                continue;
+            }
+        }
+        if let Err(e) = remove_entry(&dir) {
+            failures.push(format!("{}: {e}", dir.display()));
+        }
+    }
+    // A folder bale pre-made for a project that never built has no
+    // `info.plist`, so the match above can't see it; find it by name. The
+    // link inside is removed, not followed.
+    for r in crate::spm::resolved_files(root) {
+        let dir = dd_root.join(crate::derived_data::folder_name(&r.project));
+        let is_stub = fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir())
+            && fs::symlink_metadata(dir.join("info.plist"))
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
+        if !is_stub {
+            continue;
+        }
         match busy_holders(&dir, ignore) {
             Ok(h) if !h.is_empty() => continue,
             Ok(_) => {}

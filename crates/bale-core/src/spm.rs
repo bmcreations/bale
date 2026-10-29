@@ -1,8 +1,8 @@
 //! Shared Swift packages: finding a tree's `Package.resolved` files and the
 //! key that names the shared packages folder for one of them.
 
-// Nothing calls these until seeding and the hooks land.
-#![allow(dead_code)]
+// The hooks (Task 6) and GC (Task 7) are the other callers; off macOS nothing is.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use crate::derived_data::is_derived_data_root;
 use crate::detect::{GRADLE_DIRS, SWIFT_DIRS};

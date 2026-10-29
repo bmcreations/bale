@@ -18,6 +18,9 @@ pub struct Config {
     pub idle_stash: Duration,
     /// How long orphaned Xcode DerivedData must be untouched before sweep reaps it.
     pub reap_grace: Duration,
+    /// Link new trees to one shared Swift packages folder per `Package.resolved`.
+    /// Read from the machine `config.toml` only.
+    pub share_swift_packages: bool,
     pub stash_min_bytes: u64,
     pub patch_max_depth: u32,
     pub regenerable_extra: Vec<String>,
@@ -32,6 +35,7 @@ struct RawConfig {
     idle_cold_days: Option<u64>,
     idle_stash_minutes: Option<u64>,
     reap_grace_minutes: Option<u64>,
+    share_swift_packages: Option<bool>,
     stash_min_bytes: Option<u64>,
     patch_max_depth: Option<u32>,
     regenerable: Option<Vec<String>>,
@@ -77,6 +81,7 @@ pub fn load_config(home: &BaleHome, repo_root: Option<&Path>) -> Result<Config> 
         idle_cold: Duration::from_secs(days * 86400),
         idle_stash: Duration::from_secs(minutes * 60),
         reap_grace: Duration::from_secs(reap_minutes * 60),
+        share_swift_packages: machine.share_swift_packages.unwrap_or(true),
         stash_min_bytes: repo
             .stash_min_bytes
             .or(machine.stash_min_bytes)
@@ -133,6 +138,30 @@ mod tests {
         fs::write(h.path().join("config.toml"), "reap_grace_minutes = 5\n").unwrap();
         let c = load_config(&BaleHome(h.path().into()), None).unwrap();
         assert_eq!(c.reap_grace, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn share_swift_packages_defaults_on_and_reads_the_machine_file_only() {
+        let h = tempfile::tempdir().unwrap();
+        let r = tempfile::tempdir().unwrap();
+        let home = BaleHome(h.path().into());
+        assert!(load_config(&home, None).unwrap().share_swift_packages);
+        fs::write(
+            r.path().join(".bale.toml"),
+            "share_swift_packages = false\n",
+        )
+        .unwrap();
+        assert!(
+            load_config(&home, Some(r.path()))
+                .unwrap()
+                .share_swift_packages
+        );
+        fs::write(
+            h.path().join("config.toml"),
+            "share_swift_packages = false\n",
+        )
+        .unwrap();
+        assert!(!load_config(&home, None).unwrap().share_swift_packages);
     }
 
     #[test]

@@ -1369,6 +1369,7 @@ fn no_extras() -> Config {
         idle_cold: Duration::ZERO,
         idle_stash: Duration::ZERO,
         reap_grace: Duration::from_secs(3600),
+        share_swift_packages: true,
         stash_min_bytes: 0,
         patch_max_depth: 0,
         regenerable_extra: Vec::new(),

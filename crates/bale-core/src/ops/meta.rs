@@ -127,6 +127,7 @@ mod tests {
             scope: None,
             stash: None,
             restore_hook: false,
+            spm: Vec::new(),
         }
     }
 
