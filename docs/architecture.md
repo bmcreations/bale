@@ -158,7 +158,7 @@ nothing in it changed within `reap_grace`.
 
 ## Not built
 
-This file started as the "Code VM" design (`git log --follow docs/architecture.md`), which planned more than
+This file replaces the "Code VM" design (`git log -- docs/code-vm-design.md`), which planned more than
 shipped. Not built: a shared per-repo base that new trees clone from, reflinked or mounted trees,
 `bale wait`/`bale resume`, and a policy for which of a turn's changes to keep. Cold deletes the checkout
 rather than mounting it from the store, and the prompt hook restores in the background rather than
