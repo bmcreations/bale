@@ -169,6 +169,26 @@ pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> 
     roots
 }
 
+/// The learned roots (see [`learn_root`]) that are DerivedData built from the
+/// tree at `root`: each passes [`is_derived_data_root`] and
+/// [`belongs_to_tree`], and neither lies inside the other, so a root inside
+/// the tree is left to `up`'s in-tree pass and no root holding the tree is
+/// ever named.
+#[cfg(target_os = "macos")]
+pub(crate) fn learned_for(home: &BaleHome, root: &Path) -> Vec<PathBuf> {
+    let tree = workspace_key(root);
+    learned_roots(home)
+        .into_iter()
+        .filter(|dir| {
+            let key = workspace_key(dir);
+            !key.starts_with(&tree)
+                && !tree.starts_with(&key)
+                && is_derived_data_root(dir)
+                && belongs_to_tree(dir, root)
+        })
+        .collect()
+}
+
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
 pub(crate) fn global_root() -> Option<PathBuf> {
     crate::paths::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))

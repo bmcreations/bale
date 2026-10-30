@@ -344,7 +344,11 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
             let (dirs, real) = bale_able(home, &root)?;
             kept = real;
             // Xcode's build logs go with its DerivedData; record them first.
-            crate::trace::harvest(home, id, &crate::derived_data::all_for(&root, &dirs));
+            #[allow(unused_mut)]
+            let mut built = crate::derived_data::all_for(&root, &dirs);
+            #[cfg(target_os = "macos")]
+            built.extend(crate::derived_data::learned_for(home, &root));
+            crate::trace::harvest(home, id, &built);
             let moves = trash_names(&dirs);
             record.trash = moves.iter().map(|(_, to)| to.clone()).collect();
             record.level = Level::Baling;
@@ -362,12 +366,14 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
     remove_trash(&root, &record.trash)?;
     record.trash.clear();
     #[cfg(target_os = "macos")]
-    {
+    let removed = {
         let dd_root = crate::derived_data::global_root();
-        let failures = dd_root
+        let mut failures = dd_root
             .as_deref()
             .map(|dd| remove_derived_data(&root, dd, ignore))
             .unwrap_or_default();
+        let (removed, learned_failures) = remove_learned(home, &root, ignore);
+        failures.extend(learned_failures);
         // The tree's next build starts from a fresh folder, so link it now.
         if let Some(dd) = &dd_root {
             let made = crate::spm_link::link_tree(home, &root, dd, &[]);
@@ -382,13 +388,21 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
         {
             record.note = None;
         }
-    }
+        removed
+    };
 
     // The stubs went with the dirs; a later unstash must not refill them.
     // The blobs are left to GC.
     record.stash = None;
     record.level = Level::Baled;
     registry.put(&record)?;
+    // As for the shared root above: the next build in a removed
+    // `-derivedDataPath` root starts from the shared packages. This reads
+    // the links from the record just written.
+    #[cfg(target_os = "macos")]
+    for dir in &removed {
+        crate::spm_link::link_derived_data_path(home, id, dir);
+    }
     Ok(UpReport {
         outcome: Outcome::Done(Level::Baled),
         kept,
@@ -439,6 +453,11 @@ struct MoveFailure {
 /// ignored, or they sit in a submodule or nested repo (any dir from below
 /// `root` down to the candidate has a `.git` entry), whose files the root's
 /// git can't see. Both sorted; trash dirs are left out.
+///
+/// On macOS an Xcode DerivedData root at most two levels below `root` (such
+/// as `.dd` or `build/dd`, built with `-derivedDataPath`) is build output
+/// even when git does not ignore it: only a tracked file or a nested repo
+/// keeps it.
 pub(crate) fn bale_able(home: &BaleHome, root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     bale_able_from(root, regenerable(home, root)?)
 }
@@ -455,31 +474,28 @@ pub(crate) fn bale_able_from(
         .map(|d| d.strip_prefix(root).unwrap_or(d).to_path_buf())
         .collect();
     let mut real: Vec<bool> = rels.iter().map(|rel| in_nested_repo(root, rel)).collect();
-    let asked: Vec<usize> = (0..rels.len()).filter(|&i| !real[i]).collect();
-    for chunk in asked.chunks(100) {
-        let mut args: Vec<String> = [
-            "--no-optional-locks",
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-        ]
-        .map(String::from)
-        .to_vec();
-        args.extend(
-            chunk
+    let (tracked_only, asked): (Vec<usize>, Vec<usize>) = (0..rels.len())
+        .filter(|&i| !real[i])
+        .partition(|&i| cfg!(target_os = "macos") && shallow_derived_data(&dirs[i], &rels[i]));
+    for (set, untracked_too) in [(asked, true), (tracked_only, false)] {
+        for chunk in set.chunks(100) {
+            let mut args: Vec<&str> = vec!["--no-optional-locks", "ls-files", "-z", "--cached"];
+            if untracked_too {
+                args.extend(["--others", "--exclude-standard"]);
+            }
+            args.push("--");
+            let specs: Vec<String> = chunk
                 .iter()
-                .map(|&i| format!(":(literal){}", slashed(&rels[i]))),
-        );
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = git::Git::at(root).run(&args)?;
-        for listed in out.split('\0').filter(|p| !p.is_empty()) {
-            let listed = Path::new(listed);
-            // Candidates never nest, so a path lies under at most one.
-            if let Some(&i) = chunk.iter().find(|&&i| listed.starts_with(&rels[i])) {
-                real[i] = true;
+                .map(|&i| format!(":(literal){}", slashed(&rels[i])))
+                .collect();
+            args.extend(specs.iter().map(String::as_str));
+            let out = git::Git::at(root).run(&args)?;
+            for listed in out.split('\0').filter(|p| !p.is_empty()) {
+                let listed = Path::new(listed);
+                // Candidates never nest, so a path lies under at most one.
+                if let Some(&i) = chunk.iter().find(|&&i| listed.starts_with(&rels[i])) {
+                    real[i] = true;
+                }
             }
         }
     }
@@ -488,6 +504,14 @@ pub(crate) fn bale_able_from(
         trash.into_iter().map(|(d, _)| d).collect(),
         kept.into_iter().map(|(d, _)| d).collect(),
     ))
+}
+
+/// Whether `dir`, at `rel` below the tree, is a real (not linked) Xcode
+/// DerivedData root at most two levels down.
+fn shallow_derived_data(dir: &Path, rel: &Path) -> bool {
+    rel.components().count() <= 2
+        && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        && crate::derived_data::is_derived_data_root(dir)
 }
 
 /// Whether a dir between `root` (exclusive) and `root/rel` (inclusive) has a
@@ -643,9 +667,48 @@ pub(crate) fn is_stub(dir: &Path) -> bool {
         && fs::symlink_metadata(only.path()).is_ok_and(|m| m.file_type().is_symlink())
 }
 
+/// `Ok` when no process (outside `ignore`) holds `dir`; otherwise the
+/// message `up` records for it: who holds it, or why that is unknown.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn idle(dir: &Path, ignore: &[u32]) -> Result<(), String> {
+    match busy_holders(dir, ignore) {
+        Ok(h) if h.is_empty() => Ok(()),
+        Ok(h) => {
+            let who: Vec<String> = h
+                .iter()
+                .map(|h| format!("pid {} {}", h.pid, h.command))
+                .collect();
+            Err(format!("{}: in use by {}", dir.display(), who.join(", ")))
+        }
+        Err(e) => Err(format!("{}: {e:#}", dir.display())),
+    }
+}
+
+/// Removes the learned `-derivedDataPath` roots built from the tree at
+/// `root` (see [`crate::derived_data::learned_for`]), returning those removed
+/// and a message per root that a process holds or that could not be probed
+/// or removed. Their `dd-roots` lines stay; reap drops dead ones.
+#[cfg(target_os = "macos")]
+fn remove_learned(home: &BaleHome, root: &Path, ignore: &[u32]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failures = Vec::new();
+    for dir in crate::derived_data::learned_for(home, root) {
+        if let Err(why) = idle(&dir, ignore) {
+            failures.push(why);
+            continue;
+        }
+        match remove_entry(&dir) {
+            Ok(()) => removed.push(dir),
+            Err(e) => failures.push(format!("{}: {e}", dir.display())),
+        }
+    }
+    (removed, failures)
+}
+
 /// Removes DerivedData folders under `dd_root` built from this worktree and
-/// returns a message per folder that could not be probed or removed. A folder
-/// a process holds is left alone. Missing `dd_root` is not a failure.
+/// returns a message per folder that could not be probed or removed, or that
+/// a process holds (such a folder is left alone). Missing `dd_root` is not a
+/// failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<String> {
     let mut failures = Vec::new();
@@ -653,13 +716,9 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
         return failures;
     }
     for dir in crate::derived_data::derived_data_for(root, dd_root) {
-        match busy_holders(&dir, ignore) {
-            Ok(h) if !h.is_empty() => continue,
-            Ok(_) => {}
-            Err(e) => {
-                failures.push(format!("{}: {e:#}", dir.display()));
-                continue;
-            }
+        if let Err(why) = idle(&dir, ignore) {
+            failures.push(why);
+            continue;
         }
         if let Err(e) = remove_entry(&dir) {
             failures.push(format!("{}: {e}", dir.display()));
@@ -675,13 +734,9 @@ fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<Strin
         if !is_stub(&dir) {
             continue;
         }
-        match busy_holders(&dir, ignore) {
-            Ok(h) if !h.is_empty() => continue,
-            Ok(_) => {}
-            Err(e) => {
-                failures.push(format!("{}: {e:#}", dir.display()));
-                continue;
-            }
+        if let Err(why) = idle(&dir, ignore) {
+            failures.push(why);
+            continue;
         }
         if let Err(e) = remove_stub(&dir) {
             failures.push(format!("{}: {e}", dir.display()));

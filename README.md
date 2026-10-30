@@ -89,14 +89,17 @@ By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 d
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
 The sweep's stash step only stashes trees where Claude Code's restore hook (`prompt` or `pre-tool`) has run, because no other tool restores stashed files; `bale stash` by hand works on any tree.
 On macOS the sweep also checks Claude Code's session scratchpads (`/tmp/claude-<uid>/<project>/<session>/scratchpad`) for Xcode DerivedData folders at most two levels deep, and deletes one once its project has been gone for an hour and no process holds it. Set `BALE_CLAUDE_TMP` to look under another folder instead of `/tmp`.
+`bale up` on macOS also removes the tree's `-derivedDataPath` folders that bale has learned (from a hook or a scratchpad) and that no process holds, then links each one back to the tree's shared Swift packages.
 
 Known limitations:
 
 - Removing Xcode DerivedData that lives inside a worktree also removes its `SourcePackages/checkouts`.
   Local edits to a package checkout are lost; Xcode fetches it again on the next resolve.
 - bale treats a directory in a Xcode or SwiftPM tree as DerivedData only when it holds an `info.plist`
-  with a `WorkspacePath` and a `Build` directory, and git ignores all of it. On a case-insensitive
-  filesystem the names `info.plist` and `Build` also match other letter cases.
+  with a `WorkspacePath` and a `Build` directory, and git ignores all of it. On macOS one at most two
+  levels into the tree (`.dd`, `build/dd`) goes even when git doesn't ignore it, unless git tracks a
+  file in it. On a case-insensitive filesystem the names `info.plist` and `Build` also match other
+  letter cases.
 - After a tree goes cold, `git worktree add` at the same path fails with "missing but locked worktree",
   so a tool's own unarchive or re-create at that path may fail. Use `bale open <path>` to bring the tree
   back instead.
