@@ -19,11 +19,11 @@ larger and hold 890 MiB. Those 103 are what gets shared.
 | `w3`, `w4`, store already filled | 206 | 81,494,952 -> 83,316,048 KiB | 1,778 MiB |
 
 The second run is the clean one. `df` was sampled every 10 s for 90 s on each side: it moved by less than
-80 MiB before sharing, and stayed within 30 MiB of the new figure for the first 60 s after. 1,778 MiB is two
+80 MiB before sharing, and after sharing it stayed within 5 MiB for 40 s and within 45 MiB for 60 s. 1,778 MiB is two
 copies of 889 MiB. The first run's dip came during or just after the build that ended a minute earlier, so
 it doesn't say whether APFS was late freeing the blocks or the build was still settling.
 
-Sharing 206 files took 8.6 to 10.4 s, most of it `git hash-object` on each file.
+Sharing 206 files took 8.6 to 10.4 s. That wasn't profiled; the script starts one `git hash-object` per file.
 
 ## Git
 
@@ -39,10 +39,12 @@ After `git update-index --refresh`, `git status --porcelain` was empty in all fo
 | Full, before sharing | 102 s | 1,106 (1,533 from cache) |
 | No change, before sharing | 6 s | 30 |
 | No change, after sharing | 17 s | 30, the same 30 |
+| No change, again | 3 s | 30 |
 
 The 30 tasks in both no-change builds are CMake configure and KMP dependency checks that run every time.
 Of 467 files under the scanner's `.cxx` and `build` and the app's `build/outputs`, none had a different
-mtime after the build that followed sharing. The extra 11 s wasn't investigated.
+mtime after the build that followed sharing. The extra 11 s happened once: the next no-change build took
+3 s.
 
 ## Git LFS
 
@@ -65,5 +67,6 @@ Tracked blobs of 1 MiB or more at `HEAD`, across trees on disk, counting every c
 | iOS | 13 | 7 | 1.23 GiB |
 | bale, agent-team, code, loupe, loupe-private | 1 to 12 | 0 | 0 |
 
-This assumes no copies share blocks today. The `w3`/`w4` run supports that for checkouts written by
+13 of the 14 Android trees are baled, so the sweep could share them right away; the hot one waits until
+`up` bales it. This assumes no copies share blocks today. The `w3`/`w4` run supports that for checkouts written by
 `git worktree add`.

@@ -106,11 +106,14 @@ Android checkout. The iOS checkouts hold 0.14 GiB of source each, so they gain l
 
 ### Result (2026-10-30)
 
-All five passed; details in `docs/bench/2026-10-shared-checkout.md`.
+All five passed. The new-checkout path (`--no-checkout`, `checkout-index`) wasn't exercised and is the
+first thing to prototype; details in `docs/bench/2026-10-shared-checkout.md`.
 
 1. Sharing `vendor/opencv` across two fresh worktrees freed 1,778 MiB by `df`, two copies of 889 MiB.
 2. `git status` was clean in every tree, 0.02 to 0.03 s on the second call.
 3. The Gradle build after sharing ran the same 30 tasks as a no-change build and rewrote no output file.
+   That tree was hot and freshly built, which the sweep rule above never touches, so for Gradle repos the
+   baled-only rule could be relaxed. Xcode is still untested.
 4. Android trees would free 11.89 GiB and iOS trees 1.23 GiB (7 large blobs repeated across 13 trees), more
    than the estimate above. No other repo here has a large tracked file in two trees.
 5. Sharing a 1 GiB LFS file between two worktrees freed 2,062 MiB, with `git status`, `git lfs status` and
