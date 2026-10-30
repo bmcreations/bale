@@ -1,19 +1,75 @@
 # bale
 
-`bale` compresses idle agent git worktrees. A worktree that has sat idle loses its regenerable build
-output ("baled"); one that has sat idle longer has its uncommitted work and ignored files saved and its
-checkout deleted ("cold"). `bale open` brings a cold worktree back.
+bale keeps agent worktrees from filling your disk.
 
-Design: `docs/superpowers/specs/2026-10-27-bale-design.md`. Tool hooks:
-`docs/superpowers/specs/2026-10-28-bale-multi-tool-hooks-design.md`.
+Run four coding agents at once and you have a dozen worktrees, each with its own build output. One
+Flipcash iOS worktree's DerivedData is 9.4 GiB, so a dozen of them is over 100 GiB. Deleting worktrees
+by hand loses uncommitted work, and deleting build output means waiting for a full rebuild the next
+time an agent picks the tree up.
 
-## Build
+bale hooks into the agent tools, notices which trees are idle, and shrinks them in steps. A stashed or
+baled tree fills back in when an agent uses it again; a cold one comes back with `bale open`.
+
+![bale's worktree lifecycle: hot, stashed, baled and cold](docs/images/lifecycle.svg)
+
+## What it does
+
+- **Stashes build output between prompts.** Ten minutes after a Claude Code session goes quiet, bale
+  compresses the tree's large build files into a deduplicated zstd store and empties them in place. On
+  the next prompt the hook writes them back into the same inodes before any tool runs, so Xcode sees
+  nothing changed. On a Flipcash iOS tree, a stash freed 5.0 GiB and stored 979 MiB, and the build after
+  the restore compiled and linked nothing ([bench](docs/bench/2026-10-warm-tier.md)).
+- **Bales idle trees.** After 4 hours idle, bale deletes the tree's regenerable build output: Xcode
+  DerivedData (including folders an agent pointed `-derivedDataPath` at), Gradle's `build`, `.gradle`,
+  `.kotlin` and `.cxx`, SwiftPM's `.build`, and any directory you list under `regenerable` in
+  `.bale.toml`. Source and git state stay untouched; the next build regenerates it.
+- **Takes abandoned trees cold.** After 7 days idle, bale saves the tree's uncommitted work and ignored
+  files and deletes the checkout. `bale open` puts it back at the same path. It refuses a tree that a
+  process still holds.
+- **Shares Swift packages across worktrees.** Trees of the same repo link one `SourcePackages` copy,
+  which saved about 2.1 GiB per extra tree on Flipcash ([bench](docs/bench/2026-10-shared-packages.md)).
+- **Cleans up after agents that are gone.** DerivedData left in a finished session's scratchpad is
+  deleted once its project has been gone for an hour and nothing holds it.
+- **Stays out of the way.** A hook call on a tree that isn't stashed takes about 20 ms. Setup hooks never
+  fail the tool, and `bale pin` keeps the sweep away from a tree you want left alone.
+
+## What it looks like
+
+`bale history` reads bale's local trace and shows, per day, the lowest free space and what each step
+freed. This is one Mac running several agent sessions, 2026-10-28 to 2026-10-30:
+
+```
+DAY (UTC)   SWEEPS            LOWEST FREE          UP        COLD        REAP      SPM_GC          GC
+2026-10-28      14      40.4 GiB at 18:13    20.2 GiB     2.8 GiB           -           -           -
+2026-10-29     114      31.8 GiB at 15:08    30.9 GiB   144.9 MiB           -     4.5 GiB           -
+2026-10-30     182      21.3 GiB at 04:49    58.8 GiB           -    35.7 GiB    18.2 GiB           -
+
+freed 171.2 GiB (cold 2.9 GiB, reap 35.7 GiB, spm_gc 22.7 GiB, up 109.9 GiB)
+lowest free 21.3 GiB at 2026-10-30 04:49 UTC
+Freed bytes count each removal, so output that is rebuilt and removed again counts twice.
+```
+
+`bale history --html chart.html` draws the same data as a chart.
+
+## Quick start
 
 ```
 cargo build --release -p bale-cli
+cp target/release/bale ~/.local/bin/
+bale install                 # sweep every 5 minutes (launchd on macOS)
+bale install --hooks claude  # or codex, t3; git, conductor, cursor also take --repo <repo>
+bale ls                      # registered trees and their levels
 ```
 
-The binary is `target/release/bale`. `bale <command> --help` lists the exact flags of every command below.
+`bale <command> --help` lists every command's flags. New worktrees register through the hooks. To bring
+in worktrees that already exist, run `bale migrate <repo>` to see the plan and `bale migrate <repo>
+--apply` to adopt them.
+
+bale runs day to day on macOS. CI runs the tests on macOS, Linux and Windows; nothing has been run on
+Windows outside CI yet.
+
+Design: `docs/superpowers/specs/2026-10-27-bale-design.md`. Tool hooks:
+`docs/superpowers/specs/2026-10-28-bale-multi-tool-hooks-design.md`.
 
 ## Install and uninstall
 
