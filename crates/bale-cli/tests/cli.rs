@@ -4018,3 +4018,174 @@ fn reinstall_replaces_the_old_bash_matcher() {
         "my-guard check"
     );
 }
+
+// Pre-tool hook: registers the linked worktree a command works in.
+
+const SPM_BUILD: &str = "TESTBUILD1";
+
+/// A fake Xcode (DEVELOPER_DIR) and Xcode's DerivedData under the temp HOME,
+/// so `register` can pre-make a tree's DerivedData folder.
+#[cfg(target_os = "macos")]
+fn fake_xcode(env: &Env) -> PathBuf {
+    let x = env.tmp.path().join("xcode");
+    fs::create_dir_all(x.join("Developer")).unwrap();
+    fs::write(
+        x.join("version.plist"),
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>ProductBuildVersion</key><string>{SPM_BUILD}</string></dict></plist>"),
+    )
+    .unwrap();
+    fs::create_dir_all(env.home().join("Library/Developer/Xcode/DerivedData")).unwrap();
+    x.join("Developer")
+}
+
+/// An Xcode project in `tree` pinned by `resolved`; makes the shared
+/// packages folder of its key and returns (project, shared folder).
+#[cfg(target_os = "macos")]
+fn spm_project(env: &Env, tree: &Path, resolved: &str) -> (PathBuf, PathBuf) {
+    let project = tree.join("App.xcodeproj");
+    let dir = project.join("project.xcworkspace/xcshareddata/swiftpm");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Package.resolved"), resolved).unwrap();
+    // The key: sha256(Package.resolved, NUL, Xcode build), first 8 bytes.
+    let input = env.tmp.path().join("key-input");
+    let mut bytes = resolved.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(SPM_BUILD.as_bytes());
+    fs::write(&input, bytes).unwrap();
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let key = String::from_utf8_lossy(&out.stdout)[..16].to_string();
+    let shared = bale_core::BaleHome(env.bale_home()).spm_dir().join(key);
+    fs::create_dir_all(&shared).unwrap();
+    (project, shared)
+}
+
+#[cfg(target_os = "macos")]
+fn pre_tool_command(env: &Env, cwd: &Path, command: &str, developer_dir: &Path) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let payload = serde_json::json!({
+        "session_id": "sess-1",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    })
+    .to_string();
+    let mut cmd = Command::cargo_bin("bale").unwrap();
+    cmd.args(["hook", "claude", "pre-tool"]).current_dir(cwd);
+    env.isolate(&mut cmd);
+    cmd.env("DEVELOPER_DIR", developer_dir);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pre_tool_registers_the_worktree_a_command_cds_into() {
+    let env = Env::new();
+    let xcode = fake_xcode(&env);
+    let a = env.add_worktree("tree-a");
+    let (project_a, shared_a) = spm_project(
+        &env,
+        &a,
+        r#"{"pins":[{"identity":"a","state":{"revision":"ra"}}],"version":3}"#,
+    );
+    let out = env.bale_env(
+        &env.repo,
+        &["adopt", a.to_str().unwrap()],
+        &[("DEVELOPER_DIR", &xcode)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let dd_root = env.home().join("Library/Developer/Xcode/DerivedData");
+    let folder_a = dd_root.join(bale_core::derived_data::folder_name(&canon(&project_a)));
+    assert_eq!(
+        fs::read_link(folder_a.join("SourcePackages")).unwrap(),
+        shared_a
+    );
+    // Made with plain `git worktree add`: bale has never heard of it.
+    let b = env.add_worktree("tree-b");
+    let (project_b, shared_b) = spm_project(
+        &env,
+        &b,
+        r#"{"pins":[{"identity":"a","state":{"revision":"rb"}}],"version":3}"#,
+    );
+    assert_eq!(env.registered(), vec![canon(&a)]);
+
+    let command = format!("cd {}; grep -rn foo .", b.display());
+    let out = pre_tool_command(&env, &a, &command, &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "{}",
+        stderr(&out)
+    );
+
+    let mut registered = env.registered();
+    registered.sort();
+    assert_eq!(registered, vec![canon(&a), canon(&b)]);
+    let ls = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&ls.stdout).unwrap();
+    let rec_b = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| Path::new(r["path"].as_str().unwrap()) == canon(&b))
+        .unwrap();
+    assert_eq!(rec_b["origin"]["tool"], "claude");
+    assert_eq!(rec_b["origin"]["session"], "sess-1");
+
+    // Its DerivedData folder is pre-made with the shared packages link.
+    let folder = dd_root.join(bale_core::derived_data::folder_name(&canon(&project_b)));
+    assert_eq!(
+        fs::read_link(folder.join("SourcePackages")).unwrap(),
+        shared_b
+    );
+
+    // A -derivedDataPath build from A, after `cd B`, gets B's packages, not A's.
+    let dd = env.tmp.path().join("scratch/dd-b");
+    let command = format!(
+        "cd {}; xcodebuild -scheme App -derivedDataPath {} build",
+        b.display(),
+        dd.display()
+    );
+    let out = pre_tool_command(&env, &a, &command, &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_link(dd.join("SourcePackages")).unwrap(), shared_b);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pre_tool_does_not_register_a_main_checkout_or_a_shell_variable() {
+    let env = Env::new();
+    let xcode = fake_xcode(&env);
+    let a = env.add_worktree("tree-a");
+    let out = env.bale(&env.repo, &["adopt", a.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let b = env.add_worktree("tree-b");
+
+    for command in [
+        format!("cd {}; git status", env.repo.display()),
+        "R=/x; cd $R; git status".to_string(),
+        format!("cd \"$(dirname {})/tree-b\"", b.display()),
+    ] {
+        let out = pre_tool_command(&env, &a, &command, &xcode);
+        assert!(out.status.success(), "{command}: {}", stderr(&out));
+        assert!(out.stderr.is_empty(), "{command}: {}", stderr(&out));
+        assert_eq!(env.registered(), vec![canon(&a)], "{command}");
+    }
+}
