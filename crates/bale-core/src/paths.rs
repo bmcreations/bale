@@ -29,6 +29,27 @@ pub fn home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
+/// The real user id of this process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// The subfolders of `dir` that are not symlinks, listed until `deadline`;
+/// none when `dir` can't be read.
+pub fn plain_subdirs(dir: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .take_while(|_| std::time::Instant::now() < deadline)
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

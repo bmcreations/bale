@@ -9,10 +9,60 @@ use crate::BaleHome;
 /// folder with a missing or unparseable plist, or no `WorkspacePath`, is
 /// never matched.
 pub fn derived_data_for(workspace: &Path, dd_root: &Path) -> Vec<PathBuf> {
+    owned_under(workspace, dd_root, &Trees::default())
+}
+
+/// The registered trees, for deciding which one owns a DerivedData folder
+/// (see [`DdDir::owned_by`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Trees {
+    /// Each readable record's path, as [`workspace_key`].
+    roots: Vec<PathBuf>,
+    /// Some record did not parse (or the registry could not be listed), so
+    /// a registered tree may be missing from `roots`.
+    unreadable: bool,
+}
+
+impl Trees {
+    /// The trees in `home`'s registry.
+    pub(crate) fn registered(home: &BaleHome) -> Trees {
+        match crate::registry::Registry::open(home.clone()).all_lenient() {
+            Ok(records) => Trees::from_keys(
+                &records
+                    .into_iter()
+                    .map(|(_, r)| r.ok().map(|r| workspace_key(&r.path)))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(_) => Trees {
+                roots: Vec::new(),
+                unreadable: true,
+            },
+        }
+    }
+
+    /// From tree roots as [`workspace_key`], `None` for a record that did
+    /// not parse.
+    pub(crate) fn from_keys(keys: &[Option<PathBuf>]) -> Trees {
+        Trees {
+            roots: keys.iter().flatten().cloned().collect(),
+            unreadable: keys.iter().any(Option::is_none),
+        }
+    }
+
+    /// Whether `path` lies inside one of the trees.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn hold(&self, path: &Path) -> bool {
+        self.roots.iter().any(|t| path.starts_with(t))
+    }
+}
+
+/// [`derived_data_for`], keeping only the folders [`DdDir::owned_by`] the
+/// tree at `workspace` given the registered `trees`.
+pub(crate) fn owned_under(workspace: &Path, dd_root: &Path, trees: &Trees) -> Vec<PathBuf> {
     let ws = workspace_key(workspace);
     index(dd_root)
         .into_iter()
-        .filter(|d| d.built_from(&ws))
+        .filter(|d| d.owned_by(&ws, trees))
         .map(|d| d.dir)
         .collect()
 }
@@ -46,6 +96,39 @@ impl DdDir {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn workspace(&self) -> Option<&Path> {
         self.workspace.as_deref()
+    }
+
+    /// True when this folder was built from the tree whose [`workspace_key`]
+    /// is `ws` and from none of `trees` nested inside it: a folder belongs to
+    /// the deepest registered tree holding its project. When some record
+    /// did not parse, a project inside a linked checkout nested in `ws` (a
+    /// dir strictly below `ws` with a `.git` file) is not `ws`'s either,
+    /// since that checkout may be the unreadable tree.
+    pub(crate) fn owned_by(&self, ws: &Path, trees: &Trees) -> bool {
+        self.built_from(ws)
+            && !trees
+                .roots
+                .iter()
+                .any(|t| t != ws && t.starts_with(ws) && self.built_from(t))
+            && !(trees.unreadable && self.in_nested_checkout(ws))
+    }
+
+    /// Whether the project lies in a dir strictly below `ws` (the project
+    /// itself included) that holds a `.git` file, as a linked worktree does.
+    /// A `.git` file also marks a submodule, so those match too; that errs
+    /// toward keeping the folder, the safe direction.
+    fn in_nested_checkout(&self, ws: &Path) -> bool {
+        [&self.workspace, &self.canonical]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.strip_prefix(ws).ok())
+            .any(|rel| {
+                let mut dir = ws.to_path_buf();
+                rel.components().any(|c| {
+                    dir.push(c);
+                    fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.file_type().is_file())
+                })
+            })
     }
 
     /// True when the project this folder was built from lies inside the
@@ -112,9 +195,13 @@ pub(crate) fn belongs_to_tree(dir: &Path, root: &Path) -> bool {
 
 /// Appends `root` to `<bale home>/dd-roots` unless a line already names it.
 /// Each line is a DerivedData root itself, the folder holding `info.plist`.
+/// A `root` that exists is stored canonical, and a line that resolves to it
+/// counts as naming it, so `/tmp/x` and `/private/tmp/x` make one line.
 pub fn learn_root(home: &BaleHome, root: &Path) -> io::Result<()> {
+    let root = crate::paths::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let line = root.to_string_lossy();
-    if line.contains('\n') || learned_roots(home).iter().any(|r| r == root) {
+    let named = |r: &PathBuf| *r == root || crate::paths::canonicalize(r).is_ok_and(|c| c == root);
+    if line.contains('\n') || learned_roots(home).iter().any(named) {
         return Ok(());
     }
     fs::create_dir_all(&home.0)?;
@@ -139,27 +226,78 @@ pub fn learned_roots(home: &BaleHome) -> Vec<PathBuf> {
     roots
 }
 
+/// The DerivedData roots among the plain folders at most two levels under
+/// each of `dirs`: `dir/<a>` or, when `<a>` is not a root, `dir/<a>/<b>`. A
+/// root is not looked inside, and no symlink is followed, `dirs` themselves
+/// included. Listing stops at `deadline`, keeping what it found so far.
+#[cfg(target_os = "macos")]
+pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for dir in dirs {
+        if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for child in crate::paths::plain_subdirs(dir, deadline) {
+            if is_derived_data_root(&child) {
+                roots.push(child);
+                continue;
+            }
+            for grandchild in crate::paths::plain_subdirs(&child, deadline) {
+                if is_derived_data_root(&grandchild) {
+                    roots.push(grandchild);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// The learned roots (see [`learn_root`]) that are DerivedData built from the
+/// tree at `root`: each is a real directory passing [`is_derived_data_root`]
+/// and [`DdDir::owned_by`] against the registered `trees` (as
+/// [`workspace_key`]). A root inside the tree is left to `up`'s in-tree
+/// pass, one inside another of `trees` is that tree's, and no root holding
+/// the tree is ever named.
+#[cfg(target_os = "macos")]
+pub(crate) fn learned_for(home: &BaleHome, root: &Path, trees: &Trees) -> Vec<PathBuf> {
+    let tree = workspace_key(root);
+    learned_roots(home)
+        .into_iter()
+        .filter(|dir| {
+            let key = workspace_key(dir);
+            !key.starts_with(&tree)
+                && !tree.starts_with(&key)
+                && !trees.hold(&key)
+                && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+                && is_derived_data_root(dir)
+                && DdDir::read(dir.clone()).owned_by(&tree, trees)
+        })
+        .collect()
+}
+
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
 pub(crate) fn global_root() -> Option<PathBuf> {
     crate::paths::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
 }
 
-/// The folders in Xcode's shared DerivedData built from the tree at `root`.
-pub(crate) fn global_for(root: &Path) -> Vec<PathBuf> {
+/// The folders in Xcode's shared DerivedData the tree at `root` owns given
+/// the registered `trees` (see [`DdDir::owned_by`]).
+pub(crate) fn global_owned(root: &Path, trees: &Trees) -> Vec<PathBuf> {
     global_root()
-        .map(|g| derived_data_for(root, &g))
+        .map(|g| owned_under(root, &g, trees))
         .unwrap_or_default()
 }
 
 /// Every Xcode DerivedData root that belongs to the tree at `root`: the
-/// in-tree ones among its regenerable `regen` dirs, then the shared ones.
-pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
+/// in-tree ones among its regenerable `regen` dirs, then the shared ones
+/// not owned by one of the registered `trees` nested inside it.
+pub(crate) fn all_for(root: &Path, regen: &[PathBuf], trees: &Trees) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = regen
         .iter()
         .filter(|d| is_derived_data_root(d))
         .cloned()
         .collect();
-    roots.extend(global_for(root));
+    roots.extend(global_owned(root, trees));
     roots
 }
 
@@ -317,6 +455,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn learn_root_stores_one_line_for_aliases_of_a_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let home = BaleHome(t.path().join("bale"));
+        let dir = t.path().join("dd");
+        fs::create_dir_all(&dir).unwrap();
+        let link = t.path().join("dd-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let canonical = crate::paths::canonicalize(&dir).unwrap();
+        // As typed (`/var/..` on macOS), through a link, then canonical.
+        learn_root(&home, &dir).unwrap();
+        learn_root(&home, &link).unwrap();
+        learn_root(&home, &canonical).unwrap();
+        assert_eq!(learned_roots(&home), vec![canonical]);
+    }
+
+    #[test]
     fn learned_roots_skips_blank_and_repeated_lines() {
         let h = tempfile::tempdir().unwrap();
         let home = BaleHome(h.path().to_path_buf());
@@ -325,5 +480,80 @@ mod tests {
             learned_roots(&home),
             vec![PathBuf::from("/x"), PathBuf::from("/y")]
         );
+    }
+
+    /// A DerivedData root at `dir`: an `info.plist` naming `/gone/App.xcodeproj`, plus `Build/`.
+    #[cfg(target_os = "macos")]
+    fn fake_root(dir: &Path) {
+        fs::create_dir_all(dir.join("Build")).unwrap();
+        fs::write(
+            dir.join("info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>/gone/App.xcodeproj</string></dict></plist>\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_finds_roots_one_and_two_levels_down() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd-ios"));
+        fake_root(&pad.join("wt-ios/.dd"));
+        fs::create_dir_all(pad.join("notes")).unwrap();
+        // Three levels down is past the walk.
+        fake_root(&pad.join("a/b/dd"));
+        let mut found = roots_in(
+            std::slice::from_ref(&pad),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        found.sort();
+        assert_eq!(found, vec![pad.join("dd-ios"), pad.join("wt-ios/.dd")]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_does_not_descend_into_a_root() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd"));
+        fake_root(&pad.join("dd/inner"));
+        let found = roots_in(
+            std::slice::from_ref(&pad),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(found, vec![pad.join("dd")]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_follows_no_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        fake_root(&elsewhere.join("dd"));
+        let pad = t.path().join("scratchpad");
+        fs::create_dir_all(&pad).unwrap();
+        // A link to a root, and a link to a folder holding one.
+        std::os::unix::fs::symlink(elsewhere.join("dd"), pad.join("dd-link")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, pad.join("wt-link")).unwrap();
+        // A scratchpad that is itself a link is not walked either.
+        let linked_pad = t.path().join("linked-pad");
+        std::os::unix::fs::symlink(&elsewhere, &linked_pad).unwrap();
+        let found = roots_in(
+            &[pad, linked_pad],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_stops_at_the_deadline() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd"));
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(roots_in(&[pad], past).is_empty());
     }
 }

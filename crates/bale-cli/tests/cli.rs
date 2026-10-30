@@ -50,6 +50,8 @@ impl Env {
         cmd.env("HOME", self.home())
             .env("USERPROFILE", self.home())
             .env("BALE_HOME", self.bale_home())
+            // Never the real `/tmp/claude-<uid>`: sweep would reap its build folders.
+            .env("BALE_CLAUDE_TMP", self.tmp.path().join("tmp"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home().join(".gitconfig"))
             .env("LC_ALL", "C")
@@ -3669,6 +3671,43 @@ fn sweep_reaps_a_derived_data_root_the_hook_learned() {
     assert!(!dd.exists());
 }
 
+/// A build folder in a Claude Code scratchpad that no hook saw is found by
+/// sweep and reaped once its project is gone; the scratchpad's other files stay.
+#[cfg(target_os = "macos")]
+#[test]
+fn sweep_reaps_a_gone_projects_build_folder_in_a_claude_scratchpad() {
+    let env = Env::new();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    let pad = env.tmp.path().join(format!(
+        "tmp/claude-{}/-proj/session/scratchpad",
+        uid.trim()
+    ));
+    let dd = pad.join("wt-ios/.dd");
+    fs::create_dir_all(dd.join("Build/Products")).unwrap();
+    fs::write(dd.join("Build/Products/out"), vec![0u8; 4096]).unwrap();
+    let missing = env.home().join("deleted-wt/App.xcodeproj");
+    fs::write(
+        dd.join("info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>{}</string></dict></plist>\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+    fs::write(pad.join("notes.md"), "keep").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [dd.clone(), dd.join("info.plist"), dd.join("Build")] {
+        fs::File::open(p).unwrap().set_modified(old).unwrap();
+    }
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("reap  reaped"), "{}", stdout(&out));
+    assert!(!dd.exists());
+    assert!(pad.join("notes.md").exists() && pad.join("wt-ios").is_dir());
+}
+
 #[cfg(unix)]
 #[test]
 fn pre_tool_ignores_a_derived_data_path_it_cannot_write() {
@@ -4017,4 +4056,221 @@ fn reinstall_replaces_the_old_bash_matcher() {
         v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         "my-guard check"
     );
+}
+
+// Pre-tool hook: registers the linked worktree a command works in.
+
+const SPM_BUILD: &str = "TESTBUILD1";
+
+/// A fake Xcode (DEVELOPER_DIR) and Xcode's DerivedData under the temp HOME,
+/// so `register` can pre-make a tree's DerivedData folder.
+#[cfg(target_os = "macos")]
+fn fake_xcode(env: &Env) -> PathBuf {
+    let x = env.tmp.path().join("xcode");
+    fs::create_dir_all(x.join("Developer")).unwrap();
+    fs::write(
+        x.join("version.plist"),
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>ProductBuildVersion</key><string>{SPM_BUILD}</string></dict></plist>"),
+    )
+    .unwrap();
+    fs::create_dir_all(env.home().join("Library/Developer/Xcode/DerivedData")).unwrap();
+    x.join("Developer")
+}
+
+/// An Xcode project in `tree` pinned by `resolved`; makes the shared
+/// packages folder of its key and returns (project, shared folder).
+#[cfg(target_os = "macos")]
+fn spm_project(env: &Env, tree: &Path, resolved: &str) -> (PathBuf, PathBuf) {
+    let project = tree.join("App.xcodeproj");
+    let dir = project.join("project.xcworkspace/xcshareddata/swiftpm");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("Package.resolved"), resolved).unwrap();
+    // The key: sha256(Package.resolved, NUL, Xcode build), first 8 bytes.
+    let input = env.tmp.path().join("key-input");
+    let mut bytes = resolved.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(SPM_BUILD.as_bytes());
+    fs::write(&input, bytes).unwrap();
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let key = String::from_utf8_lossy(&out.stdout)[..16].to_string();
+    let shared = bale_core::BaleHome(env.bale_home()).spm_dir().join(key);
+    fs::create_dir_all(&shared).unwrap();
+    (project, shared)
+}
+
+#[cfg(target_os = "macos")]
+fn pre_tool_command(env: &Env, cwd: &Path, command: &str, developer_dir: &Path) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let payload = serde_json::json!({
+        "session_id": "sess-1",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    })
+    .to_string();
+    let mut cmd = Command::cargo_bin("bale").unwrap();
+    cmd.args(["hook", "claude", "pre-tool"]).current_dir(cwd);
+    env.isolate(&mut cmd);
+    cmd.env("DEVELOPER_DIR", developer_dir);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pre_tool_registers_the_worktree_a_command_cds_into() {
+    let env = Env::new();
+    let xcode = fake_xcode(&env);
+    let a = env.add_worktree("tree-a");
+    let (project_a, shared_a) = spm_project(
+        &env,
+        &a,
+        r#"{"pins":[{"identity":"a","state":{"revision":"ra"}}],"version":3}"#,
+    );
+    let out = env.bale_env(
+        &env.repo,
+        &["adopt", a.to_str().unwrap()],
+        &[("DEVELOPER_DIR", &xcode)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let dd_root = env.home().join("Library/Developer/Xcode/DerivedData");
+    let folder_a = dd_root.join(bale_core::derived_data::folder_name(&canon(&project_a)));
+    assert_eq!(
+        fs::read_link(folder_a.join("SourcePackages")).unwrap(),
+        shared_a
+    );
+    // Made with plain `git worktree add`: bale has never heard of it.
+    let b = env.add_worktree("tree-b");
+    let (project_b, shared_b) = spm_project(
+        &env,
+        &b,
+        r#"{"pins":[{"identity":"a","state":{"revision":"rb"}}],"version":3}"#,
+    );
+    assert_eq!(env.registered(), vec![canon(&a)]);
+
+    let command = format!("cd {}; grep -rn foo .", b.display());
+    let out = pre_tool_command(&env, &a, &command, &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "{}",
+        stderr(&out)
+    );
+
+    let mut registered = env.registered();
+    registered.sort();
+    assert_eq!(registered, vec![canon(&a), canon(&b)]);
+    let ls = env.bale(&env.repo, &["ls", "--json"], None);
+    let v: Value = serde_json::from_slice(&ls.stdout).unwrap();
+    let rec_b = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| Path::new(r["path"].as_str().unwrap()) == canon(&b))
+        .unwrap();
+    assert_eq!(rec_b["origin"]["tool"], "claude");
+    assert_eq!(rec_b["origin"]["session"], "sess-1");
+
+    // Its DerivedData folder is pre-made with the shared packages link.
+    let folder = dd_root.join(bale_core::derived_data::folder_name(&canon(&project_b)));
+    assert_eq!(
+        fs::read_link(folder.join("SourcePackages")).unwrap(),
+        shared_b
+    );
+
+    // A -derivedDataPath build from A, after `cd B`, gets B's packages, not A's.
+    let dd = env.tmp.path().join("scratch/dd-b");
+    let command = format!(
+        "cd {}; xcodebuild -scheme App -derivedDataPath {} build",
+        b.display(),
+        dd.display()
+    );
+    let out = pre_tool_command(&env, &a, &command, &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_link(dd.join("SourcePackages")).unwrap(), shared_b);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pre_tool_does_not_register_a_main_checkout_or_a_shell_variable() {
+    let env = Env::new();
+    let xcode = fake_xcode(&env);
+    let a = env.add_worktree("tree-a");
+    let out = env.bale(&env.repo, &["adopt", a.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let b = env.add_worktree("tree-b");
+
+    for command in [
+        format!("cd {}; git status", env.repo.display()),
+        "R=/x; cd $R; git status".to_string(),
+        format!("cd \"$(dirname {})/tree-b\"", b.display()),
+    ] {
+        let out = pre_tool_command(&env, &a, &command, &xcode);
+        assert!(out.status.success(), "{command}: {}", stderr(&out));
+        assert!(out.stderr.is_empty(), "{command}: {}", stderr(&out));
+        assert_eq!(env.registered(), vec![canon(&a)], "{command}");
+    }
+}
+
+/// A tree the command names (not the cwd's) whose restore fails doesn't
+/// block the call: exit 0, nothing on stderr, an `op` line in the trace.
+#[cfg(unix)]
+#[test]
+fn pre_tool_failed_restore_of_a_named_tree_is_best_effort() {
+    let env = Env::new();
+    let a = env.add_worktree("tree-a");
+    let b = env.add_worktree("tree-b");
+    for t in [&a, &b] {
+        let out = env.bale(&env.repo, &["adopt", t.to_str().unwrap()], None);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    // B is stashed under a manifest the store doesn't have.
+    let home = bale_core::BaleHome(env.bale_home());
+    let id_b = tree_id(&b);
+    let record = home.records_dir().join(format!("{id_b}.json"));
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    v["stash"] =
+        serde_json::json!({"commitment": "ab".repeat(32), "at_unix": 0, "restored": false});
+    fs::write(&record, v.to_string()).unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": a,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": format!("cd {}; ls", b.display())},
+    })
+    .to_string();
+    let out = env.bale(&a, &["hook", "claude", "pre-tool"], Some(&payload));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+
+    let mut traced = false;
+    for e in fs::read_dir(home.trace_dir()).unwrap().flatten() {
+        for line in fs::read_to_string(e.path()).unwrap_or_default().lines() {
+            let l: Value = serde_json::from_str(line).unwrap();
+            traced |= l["kind"] == "op"
+                && l["op"] == "unstash"
+                && l["id"] == id_b.as_str()
+                && l["outcome"] == "error";
+        }
+    }
+    assert!(traced, "no unstash error line in the trace");
 }

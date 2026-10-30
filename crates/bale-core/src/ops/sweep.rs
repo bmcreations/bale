@@ -87,10 +87,28 @@ pub fn decide(
 /// `sweep` line; then prunes old trace files. Sizes and build logs are read
 /// before any tree is changed.
 pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
-    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run))
+    sweep_with(home, dry_run, |_| Vec::new())
 }
 
-fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
+/// [`sweep`], first learning the Xcode DerivedData roots at most two levels
+/// under each folder `build_dirs` lists (see
+/// [`crate::derived_data::roots_in`]), so that reaping covers build folders
+/// no hook saw made. `build_dirs` gets the deadline that also bounds the
+/// walk, and should stop listing at it. Learning is bookkeeping and happens
+/// on `dry_run` too, so its report lists the reaps a real sweep would make.
+pub fn sweep_with(
+    home: &BaleHome,
+    dry_run: bool,
+    build_dirs: impl Fn(Instant) -> Vec<PathBuf>,
+) -> Result<Vec<(String, Action, String)>> {
+    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run, &build_dirs))
+}
+
+fn sweep_traced(
+    home: &BaleHome,
+    dry_run: bool,
+    build_dirs: &dyn Fn(Instant) -> Vec<PathBuf>,
+) -> Result<Vec<(String, Action, String)>> {
     let start = Instant::now();
     let mut records = Registry::open(home.clone()).all_lenient()?;
     let (adopted, mains) = adopt_missed(home, &records, dry_run);
@@ -103,7 +121,7 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
         seed_shared_packages(home, &records, mains);
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = mains;
+    let _ = (mains, build_dirs);
     // A tree removed before its first build leaves its pre-made folder behind.
     #[cfg(target_os = "macos")]
     if !dry_run {
@@ -135,6 +153,8 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
             }
         }
     }
+    // The registered set does not change during a sweep (`up` and `cold` only move levels).
+    let trees = crate::derived_data::Trees::registered(home);
     let mut rows = adopted;
     rows.reserve(records.len());
     let mut builds = Vec::new();
@@ -142,7 +162,7 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     for ((stem, record), m) in records.into_iter().zip(measured) {
         match record {
             Ok(record) => {
-                let (action, result, edited) = sweep_one(home, &record, dry_run);
+                let (action, result, edited) = sweep_one(home, &trees, &record, dry_run);
                 trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
@@ -157,6 +177,7 @@ fn sweep_traced(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, S
     }
     #[cfg(target_os = "macos")]
     {
+        learn_build_dirs(home, build_dirs);
         rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
         rows.extend(spm_gc_rows(home, dry_run));
     }
@@ -237,6 +258,21 @@ fn adopt_missed(
         }
     }
     (rows, mains)
+}
+
+/// Listing and walking `build_dirs` for DerivedData roots stops after this long.
+#[cfg(target_os = "macos")]
+const BUILD_DIRS_LIMIT: Duration = Duration::from_secs(10);
+
+/// Learns the DerivedData roots in the folders `build_dirs` lists, giving
+/// up on both after [`BUILD_DIRS_LIMIT`]. A root that fails to be written
+/// is found again by the next sweep.
+#[cfg(target_os = "macos")]
+fn learn_build_dirs(home: &BaleHome, build_dirs: &dyn Fn(Instant) -> Vec<PathBuf>) {
+    let deadline = Instant::now() + BUILD_DIRS_LIMIT;
+    for root in crate::derived_data::roots_in(&build_dirs(deadline), deadline) {
+        let _ = crate::derived_data::learn_root(home, &root);
+    }
 }
 
 /// For each record whose checkout is gone, removes the pre-made DerivedData
@@ -428,13 +464,14 @@ fn logs_of(dd: &Path) -> Vec<BuildLog> {
 
 /// For each tree root (as [`workspace_key`]; `None` for a record that did
 /// not parse), the positions in `index` of the shared DerivedData folders
-/// built from it.
+/// it owns (see [`DdDir::owned_by`]), as `up` and `stash` see them.
 fn match_trees(index: &[DdDir], roots: &[Option<PathBuf>]) -> Vec<Vec<usize>> {
+    let trees = crate::derived_data::Trees::from_keys(roots);
     roots
         .iter()
         .map(|root| match root {
             Some(root) => (0..index.len())
-                .filter(|&i| index[i].built_from(root))
+                .filter(|&i| index[i].owned_by(root, &trees))
                 .collect(),
             None => Vec::new(),
         })
@@ -607,6 +644,7 @@ fn millis(d: Duration) -> u64 {
 /// not probed or no file remains).
 fn sweep_one(
     home: &BaleHome,
+    trees: &crate::derived_data::Trees,
     record: &Record,
     dry_run: bool,
 ) -> (Action, String, Option<SystemTime>) {
@@ -628,7 +666,7 @@ fn sweep_one(
             return (Action::Report(text.clone()), text, None);
         }
     }
-    let (action, edited) = match plan(home, record) {
+    let (action, edited) = match plan(home, trees, record) {
         Ok(planned) => planned,
         Err(e) => {
             let text = format!("{e:#}");
@@ -672,7 +710,11 @@ fn level_action(level: Level) -> Option<Action> {
 /// become `Report` rows and can never lead to `Cold`. Level-only actions
 /// load no config, so a broken config cannot block a resume or the
 /// interrupted-open hint.
-fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)> {
+fn plan(
+    home: &BaleHome,
+    trees: &crate::derived_data::Trees,
+    record: &Record,
+) -> Result<(Action, Option<SystemTime>)> {
     // Cooling may legitimately have no checkout; cold's recovery handles it.
     if matches!(record.level, Level::Cold | Level::Opening | Level::Cooling) {
         return Ok((level_action(record.level).expect("level-only action"), None));
@@ -695,10 +737,12 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
     // Only a Baled tree past the baled threshold needs to know whether its
     // output regrew; the same filter as `up` keeps sweep from re-running up
     // on a tree whose only regenerable-named dirs hold real content. Xcode
-    // builds into its shared DerivedData, which `up` also removes on macOS.
+    // builds into its shared DerivedData and learned `-derivedDataPath`
+    // roots, which `up` also removes on macOS.
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
-        && (has_shared_derived_data(&root) || !bale_able_from(&root, regen)?.0.is_empty());
+        && (has_shared_derived_data(home, trees, &root)
+            || !bale_able_from(&root, regen)?.0.is_empty());
     let edited = (changed > UNIX_EPOCH).then_some(changed);
     Ok((
         decide(
@@ -714,11 +758,26 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
     ))
 }
 
-/// Whether Xcode's shared DerivedData holds a folder built from `root`.
-/// Only macOS, the one place `up` removes those folders; elsewhere a `true`
-/// would re-run `up` on every sweep.
-fn has_shared_derived_data(root: &Path) -> bool {
-    cfg!(target_os = "macos") && !crate::derived_data::global_for(root).is_empty()
+/// Whether Xcode's shared DerivedData, or a learned `-derivedDataPath`
+/// root, holds a folder built from `root`. Only macOS, the one place `up`
+/// removes those folders; elsewhere a `true` would re-run `up` on every sweep.
+#[cfg(target_os = "macos")]
+fn has_shared_derived_data(
+    home: &BaleHome,
+    trees: &crate::derived_data::Trees,
+    root: &Path,
+) -> bool {
+    !crate::derived_data::global_owned(root, trees).is_empty()
+        || !crate::derived_data::learned_for(home, root, trees).is_empty()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_shared_derived_data(
+    _home: &BaleHome,
+    _trees: &crate::derived_data::Trees,
+    _root: &Path,
+) -> bool {
+    false
 }
 
 /// `now` minus the later of the two times; zero when that lies in the future.
@@ -844,12 +903,12 @@ mod tests {
     }
 
     #[test]
-    fn a_global_dd_dir_is_walked_once_when_several_trees_resolve_to_it() {
+    fn a_global_dd_dir_counts_for_the_deepest_tree_only_and_is_walked_once() {
         let (_tmp, index, roots) = nested_trees();
         assert_eq!(index.len(), 3);
         let matches = match_trees(&index, &roots);
-        assert_eq!(matches[0], matches[1], "{matches:?}");
-        assert_eq!(matches[0].len(), 1, "{matches:?}");
+        assert!(matches[0].is_empty(), "{matches:?}");
+        assert_eq!(matches[1].len(), 1, "{matches:?}");
 
         let walks = std::sync::Mutex::new(Vec::new());
         let global = size_global_dd(&index, &matches, &[true, true], |dir, _| {
@@ -867,7 +926,24 @@ mod tests {
             bytes: 100,
             truncated: false,
         });
-        assert_eq!(global.per_tree, vec![shared, shared]);
+        let none = Some(DdBytes {
+            bytes: 0,
+            truncated: false,
+        });
+        assert_eq!(global.per_tree, vec![none, shared]);
+    }
+
+    #[test]
+    fn an_unparsed_record_leaves_dd_of_a_nested_checkout_unmatched() {
+        let (tmp, index, roots) = nested_trees();
+        let outer = roots[0].clone();
+        // The inner tree's record did not parse.
+        let roots = vec![outer.clone(), None];
+        assert_eq!(match_trees(&index, &roots)[0].len(), 1);
+        // Once `outer/sub` has a `.git` file, it is taken for that tree.
+        let base = crate::paths::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("outer/sub/.git"), "gitdir: x\n").unwrap();
+        assert!(match_trees(&index, &roots)[0].is_empty());
     }
 
     #[test]

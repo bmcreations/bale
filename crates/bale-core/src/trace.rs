@@ -500,6 +500,19 @@ pub fn spm_gc_skipped(home: &BaleHome, reason: &str) {
     emit(home, "op", fields);
 }
 
+/// Writes the `op` line for operation `op` on tree `id` that failed where
+/// the caller carries on without it (a hook's best-effort step): outcome
+/// `error` and the error's kind as `reason`, no message or path.
+pub fn failed(home: &BaleHome, op: &str, id: &str, e: &anyhow::Error) {
+    let mut fields = Map::new();
+    fields.insert("op".into(), op.into());
+    fields.insert("id".into(), id.into());
+    fields.insert("outcome".into(), "error".into());
+    fields.insert("reason".into(), error_code(e).into());
+    insert_context(&mut fields);
+    emit(home, "op", fields);
+}
+
 /// Writes the `op` line for an operation whose target was gone before it
 /// could run: outcome and reason `missing`, the target's `path`, and its
 /// id when a record for that path exists. Best-effort.

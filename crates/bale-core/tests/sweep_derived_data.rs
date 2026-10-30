@@ -4,8 +4,8 @@
 
 mod support;
 
-use bale_core::ops::sweep::{sweep, Action};
-use bale_core::ops::up::register;
+use bale_core::ops::sweep::{sweep, sweep_with, Action};
+use bale_core::ops::up::{register, up, Outcome};
 use bale_core::registry::{Level, Registry};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -209,6 +209,41 @@ fn learned_roots_are_reaped_by_the_same_rule() {
 }
 
 #[test]
+fn scratch_build_folders_whose_project_is_gone_are_reaped() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let pad = fx
+        .repo
+        .parent()
+        .unwrap()
+        .join("scratch/proj/session/scratchpad");
+    let orphan = dd(&pad, "dd-a", Some(&gone(&fx, "wt-gone/App.xcodeproj")));
+    let nested = dd(
+        &pad.join("wt-b"),
+        ".dd",
+        Some(&gone(&fx, "wt-gone-b/App.xcodeproj")),
+    );
+    // A build folder still inside the grace period, and an agent's notes.
+    let fresh = dd(&pad, "dd-fresh", Some(&gone(&fx, "wt-gone/App.xcodeproj")));
+    let notes = pad.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("plan.md"), "keep me").unwrap();
+    for d in [&orphan, &nested] {
+        age(d, 2);
+    }
+
+    let rows = sweep_with(&fx.home(), false, |_| vec![pad.clone()]).unwrap();
+    assert_eq!(reap_rows(&rows).len(), 2, "{rows:?}");
+    assert!(!orphan.exists() && !nested.exists());
+    assert!(fresh.exists() && notes.join("plan.md").exists());
+    assert!(pad.join("wt-b").is_dir());
+    // Learned, so a later sweep reaps `dd-fresh` once its grace is up.
+    let learned = bale_core::derived_data::learned_roots(&fx.home());
+    let fresh = bale_core::paths::canonicalize(&fresh).unwrap();
+    assert!(learned.contains(&fresh), "{learned:?}");
+}
+
+#[test]
 fn baled_tree_with_regrown_shared_derived_data_is_baled_again() {
     let fx = Fixture::new();
     fs::write(fx.repo.join(".gitignore"), "App.xcworkspace/\n").unwrap();
@@ -237,4 +272,315 @@ fn baled_tree_with_regrown_shared_derived_data_is_baled_again() {
     // With the shared folder gone, the next sweep keeps the tree.
     let rows = sweep(&fx.home(), false).unwrap();
     assert_eq!(rows.iter().find(|r| r.0 == id).unwrap().1, Action::Keep);
+}
+
+#[cfg(unix)]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A worktree `name` holding an `App.xcodeproj`, so it detects as Xcode.
+fn xcode_tree(fx: &Fixture, name: &str) -> PathBuf {
+    let wt = fx.add_worktree(name, name);
+    fs::create_dir_all(wt.join("App.xcodeproj")).unwrap();
+    wt
+}
+
+/// A learned `-derivedDataPath` root `name` in a scratchpad beside the repo,
+/// built from `tree`'s `App.xcodeproj`.
+fn learned(fx: &Fixture, name: &str, tree: &Path) -> PathBuf {
+    let pad = fx
+        .repo
+        .parent()
+        .unwrap()
+        .join("scratch/proj/session/scratchpad");
+    let dir = dd(&pad, name, Some(&tree.join("App.xcodeproj")));
+    bale_core::derived_data::learn_root(&fx.home(), &dir).unwrap();
+    dir
+}
+
+#[test]
+fn up_removes_learned_roots_built_from_the_tree_only() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let other = xcode_tree(&fx, "other");
+    let mine = learned(&fx, "dd-pin", &wt);
+    let theirs = learned(&fx, "dd-other", &other);
+    // Not a DerivedData root (no `Build/`), though its plist names the tree.
+    let not_root = fx.repo.parent().unwrap().join("scratch/no-build");
+    write_plist(&not_root, Some(&wt.join("App.xcodeproj")));
+    bale_core::derived_data::learn_root(&fx.home(), &not_root).unwrap();
+
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!mine.exists(), "{}", mine.display());
+    assert!(theirs.join("Build/Products/out").exists());
+    assert!(not_root.join("info.plist").exists());
+    // The line stays; reap drops dead lines.
+    let lines = bale_core::derived_data::learned_roots(&fx.home());
+    assert_eq!(lines.len(), 3, "{lines:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn up_keeps_and_reports_a_busy_learned_root() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let busy = learned(&fx, "dd-busy", &wt);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let _child = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&busy)
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(busy.join("Build/Products/out").exists());
+    let note = Registry::open(fx.home())
+        .get(&id)
+        .unwrap()
+        .unwrap()
+        .note
+        .unwrap_or_default();
+    assert!(
+        note.contains("dd-busy") && note.contains("in use"),
+        "{note}"
+    );
+}
+
+#[test]
+fn up_relinks_a_removed_learned_root_to_shared_packages() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let mine = learned(&fx, "dd-pin", &wt);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    // The tree is linked to a shared packages folder, as `register` does.
+    let shared = fx.home().spm_dir().join("k1");
+    fs::create_dir_all(&shared).unwrap();
+    let stub = root.join("App-stub");
+    fs::create_dir_all(&stub).unwrap();
+    std::os::unix::fs::symlink(&shared, stub.join("SourcePackages")).unwrap();
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id).unwrap().unwrap();
+    rec.spm.push(bale_core::registry::SpmLink {
+        project: wt.join("App.xcodeproj"),
+        resolved: wt.join("App.xcodeproj/Package.resolved"),
+        mtime: std::time::SystemTime::now(),
+        size: 0,
+        key: "k1".into(),
+        folder: stub,
+    });
+    reg.put(&rec).unwrap();
+
+    up(&fx.home(), &id).unwrap();
+    assert!(!mine.join("Build").exists());
+    assert!(!mine.join("info.plist").exists());
+    assert_eq!(fs::read_link(mine.join("SourcePackages")).unwrap(), shared);
+}
+
+#[test]
+fn up_removes_an_unignored_derived_data_root_two_levels_into_the_tree() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let dot_dd = dd(&wt, ".dd", Some(&wt.join("App.xcodeproj")));
+    let nested = dd(&wt.join("build"), "dd", Some(&wt.join("App.xcodeproj")));
+    // Named like one, but no `info.plist`: real content, kept.
+    let plain = wt.join(".dd-notes");
+    fs::create_dir_all(plain.join("Build")).unwrap();
+    fs::write(plain.join("Build/notes.md"), "keep").unwrap();
+    // Three levels down: not covered, so git's rule still keeps it.
+    let deep = dd(&wt.join("a/b"), "dd", Some(&wt.join("App.xcodeproj")));
+    let id = register(&fx.home(), &wt).unwrap().id;
+
+    let out = up(&fx.home(), &id).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!dot_dd.exists() && !nested.exists());
+    assert!(plain.join("Build/notes.md").exists());
+    assert!(deep.join("Build/Products/out").exists());
+}
+
+#[test]
+fn up_keeps_an_in_tree_derived_data_root_holding_a_tracked_file() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let dot_dd = dd(&wt, ".dd", Some(&wt.join("App.xcodeproj")));
+    fs::write(dot_dd.join("keep.txt"), "keep\n").unwrap();
+    git(&wt, &["add", ".dd/keep.txt"]);
+    git(&wt, &["commit", "-qm", "keep"]);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    up(&fx.home(), &id).unwrap();
+    assert!(dot_dd.join("Build/Products/out").exists());
+}
+
+#[test]
+fn baled_tree_with_a_learned_root_is_baled_again() {
+    let fx = Fixture::new();
+    fs::create_dir_all(&fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "idle_baled_hours = 0\n").unwrap();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let mine = learned(&fx, "dd-pin", &wt);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id).unwrap().unwrap();
+    rec.level = Level::Baled;
+    reg.put(&rec).unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r.0 == id).unwrap().1,
+        Action::Up,
+        "{rows:?}"
+    );
+    assert!(!mine.exists());
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r.0 == id).unwrap().1,
+        Action::Keep,
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn baled_tree_with_an_unignored_in_tree_root_is_baled_again() {
+    let fx = Fixture::new();
+    fs::create_dir_all(&fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "idle_baled_hours = 0\n").unwrap();
+    let (_g, _root) = user_home(&fx);
+    let wt = xcode_tree(&fx, "wt");
+    let dot_dd = dd(&wt, ".dd", Some(&wt.join("App.xcodeproj")));
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id).unwrap().unwrap();
+    rec.level = Level::Baled;
+    reg.put(&rec).unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r.0 == id).unwrap().1,
+        Action::Up,
+        "{rows:?}"
+    );
+    assert!(!dot_dd.exists());
+}
+
+#[test]
+fn up_leaves_derived_data_of_a_registered_tree_nested_inside() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    let id_b = register(&fx.home(), &b).unwrap().id;
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+
+    let out = up(&fx.home(), &id_a).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(learned_b.join("Build/Products/out").exists());
+    assert!(global_b.join("Build/Products/out").exists());
+
+    let out = up(&fx.home(), &id_b).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!learned_b.exists() && !global_b.exists());
+}
+
+#[test]
+fn up_leaves_a_learned_root_inside_another_registered_tree() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let c = xcode_tree(&fx, "c");
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    register(&fx.home(), &c).unwrap();
+    // Built from A's project, but it lives in C.
+    let in_c = dd(&c, ".dd-a", Some(&a.join("App.xcodeproj")));
+    bale_core::derived_data::learn_root(&fx.home(), &in_c).unwrap();
+
+    up(&fx.home(), &id_a).unwrap();
+    assert!(in_c.join("Build/Products/out").exists());
+}
+
+#[test]
+fn up_with_an_unreadable_record_leaves_derived_data_of_a_nested_checkout() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    let id_b = register(&fx.home(), &b).unwrap().id;
+    // B's record no longer parses, so bale can't tell B is registered.
+    fs::write(
+        fx.home().0.join(format!("registry/{id_b}.json")),
+        "{ not json",
+    )
+    .unwrap();
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+    let global_a = dd(&root, "App-a", Some(&a.join("App.xcodeproj")));
+
+    let out = up(&fx.home(), &id_a).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(learned_b.join("Build/Products/out").exists());
+    assert!(global_b.join("Build/Products/out").exists());
+    // A's own folder still goes.
+    assert!(!global_a.exists());
+}
+
+#[test]
+fn baled_tree_is_not_baled_again_for_derived_data_of_a_nested_tree() {
+    let fx = Fixture::new();
+    fs::create_dir_all(&fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "idle_baled_hours = 0\n").unwrap();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    register(&fx.home(), &b).unwrap();
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id_a).unwrap().unwrap();
+    rec.level = Level::Baled;
+    reg.put(&rec).unwrap();
+    // Both folders are B's: the default root and a learned root.
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+
+    let rows = sweep(&fx.home(), true).unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r.0 == id_a).unwrap().1,
+        Action::Keep,
+        "{rows:?}"
+    );
+    assert!(learned_b.exists() && global_b.exists());
 }

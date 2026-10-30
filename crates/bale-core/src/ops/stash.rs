@@ -69,8 +69,8 @@ pub struct StashOpts<'a> {
 /// Why a stash gave the lock up part way: a prompt asked for the tree.
 const PROMPT_WAITING: &str = "prompt waiting";
 
-/// Stashes the large files in the tree's build-output dirs (see
-/// [`stash_dirs`]). Processes in `ignore_pids` do not count as holding the
+/// Stashes the large files in the tree's build-output dirs (`detect::stash_dirs`).
+/// Processes in `ignore_pids` do not count as holding the
 /// tree. A stash left half done by a crash is finished instead.
 pub fn stash(home: &BaleHome, id: &str, ignore_pids: &[u32]) -> Result<StashOutcome> {
     stash_with(home, id, ignore_pids, &StashOpts::default())
@@ -128,7 +128,8 @@ fn stash_inner(
         ));
     }
     let cfg = load_config(home, Some(&root))?;
-    let dirs = stash_dirs(&root, &detect(&root), &cfg);
+    let trees = crate::derived_data::Trees::registered(home);
+    let dirs = stash_dirs(&root, &detect(&root), &cfg, &trees);
     if let Some(busy) = busy(&dirs, ignore_pids)? {
         return skip(&busy);
     }

@@ -389,63 +389,354 @@ pub fn prompt(home: &BaleHome) -> ExitCode {
 }
 
 /// PreToolUse (every tool, since MCP build tools read build output too):
-/// waits for the tree's restore, the background one a prompt started or its
-/// own if it gets there first, then counts the call as activity. A tree that
-/// is not stashed costs a registry scan and a record read: no lock is taken
-/// and the store is not opened.
+/// registers the unknown linked worktrees the call works in, waits for the
+/// restore of the cwd's tree and of the tree the call works in, the
+/// background one a prompt started or its own if it gets there first, then
+/// counts the call as activity in both. A tree that is not stashed
+/// costs a registry scan and a record read: no lock is taken and the store
+/// is not opened.
 pub fn pre_tool(home: &BaleHome, lock_wait_ms: Option<u64>) -> ExitCode {
     crate::as_hook(Tool::Claude, || {
         let Some((cwd, payload)) = hook_input("pre-tool") else {
             return ExitCode::SUCCESS;
         };
-        learn_dd_roots(home, &payload, &cwd);
-        let (path, id) = match tree_containing(home, &cwd) {
-            Ok(Some(tree)) => tree,
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("bale: {e:#}");
-                return ExitCode::from(2);
-            }
-        };
-        if report_failure(home, &path, &id) {
-            return ExitCode::from(2);
-        }
-        match needs_restore(home, &id) {
-            Ok(false) => {}
-            Ok(true) => {
-                let opts = UnstashOpts {
-                    lock_wait: lock_wait_ms.map(Duration::from_millis),
-                    ..UnstashOpts::default()
-                };
-                if restore(home, &path, &id, &opts) != ExitCode::SUCCESS {
-                    return ExitCode::from(2);
-                }
-                // The background run that just finished may have failed.
-                if report_failure(home, &path, &id) {
-                    return ExitCode::from(2);
-                }
-            }
-            Err(e) => {
-                eprintln!("bale: {e:#}");
-                return ExitCode::from(2);
-            }
-        }
-        share_packages(home, &payload, &cwd, &id);
-        if let Err(e) = touch_restoring(home, &path) {
-            eprintln!("bale: not recorded as activity: {e:#}");
-        }
-        ExitCode::SUCCESS
+        pre_tool_with(home, &cwd, &payload, lock_wait_ms)
     })
 }
 
-/// Keeps the tree's shared Swift packages link current before a tool runs:
-/// relinks when a `Package.resolved` changed, and links the folder a Bash
-/// command's `-derivedDataPath` names. Best-effort and silent; the unchanged
-/// case is one record read and one stat per linked project. A tree with
-/// several projects uses the first project's key for `-derivedDataPath`.
+/// [`pre_tool`] for a payload already read.
+fn pre_tool_with(
+    home: &BaleHome,
+    cwd: &Path,
+    payload: &Value,
+    lock_wait_ms: Option<u64>,
+) -> ExitCode {
+    learn_dd_roots(home, payload, cwd);
+    let cwd_tree = match tree_containing(home, cwd) {
+        Ok(tree) => tree,
+        Err(e) => {
+            eprintln!("bale: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let target = command_tree(home, payload, cwd, cwd_tree.as_ref())
+        .filter(|t| cwd_tree.as_ref().is_none_or(|c| c.1 != t.1));
+    // The tree the command works in gets what the cwd's tree gets: an agent
+    // working in B from A must not have B's build output removed as idle.
+    if let Some((path, id)) = &cwd_tree {
+        if let Err(code) = ready(home, path, id, lock_wait_ms) {
+            return code;
+        }
+    }
+    if let Some((_, id)) = &target {
+        ready_quietly(home, id, lock_wait_ms);
+    }
+    let cwd_id = cwd_tree.as_ref().map(|(_, id)| id.as_str());
+    if let Some(dd_id) = target.as_ref().map(|(_, id)| id.as_str()).or(cwd_id) {
+        share_packages(home, payload, cwd, cwd_id, dd_id);
+    }
+    for (path, _) in cwd_tree.iter().chain(target.iter()) {
+        if let Err(e) = touch_restoring(home, path) {
+            eprintln!("bale: not recorded as activity: {e:#}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// [`ready`] for a tree the call names rather than the cwd's: a guess from
+/// parsing, so a failed restore goes to the trace, not to stderr or the exit
+/// code. It only costs a rebuild, since a stash holds build output only. A
+/// background restore's failure marker is left for the hook in that tree.
+fn ready_quietly(home: &BaleHome, id: &str, lock_wait_ms: Option<u64>) {
+    let result = needs_restore(home, id).and_then(|pending| {
+        if !pending {
+            return Ok(());
+        }
+        let opts = UnstashOpts {
+            lock_wait: lock_wait_ms.map(Duration::from_millis),
+            ..UnstashOpts::default()
+        };
+        unstash_with(home, id, &opts).map(|_| ())
+    });
+    if let Err(e) = result {
+        bale_core::trace::failed(home, "unstash", id, &e);
+    }
+}
+
+/// Waits for the tree's restore, the background one a prompt started or its
+/// own; `Err` with the hook's exit code when it failed.
+fn ready(
+    home: &BaleHome,
+    path: &Path,
+    id: &str,
+    lock_wait_ms: Option<u64>,
+) -> Result<(), ExitCode> {
+    if report_failure(home, path, id) {
+        return Err(ExitCode::from(2));
+    }
+    match needs_restore(home, id) {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            let opts = UnstashOpts {
+                lock_wait: lock_wait_ms.map(Duration::from_millis),
+                ..UnstashOpts::default()
+            };
+            if restore(home, path, id, &opts) != ExitCode::SUCCESS {
+                return Err(ExitCode::from(2));
+            }
+            // The background run that just finished may have failed.
+            if report_failure(home, path, id) {
+                return Err(ExitCode::from(2));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("bale: {e:#}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// What a path a tool call names is: an Xcode project or workspace, a
+/// directory the command works in (`cd`, `git -C`), or a file a Read, Edit
+/// or Write tool names; or the `-derivedDataPath` a build writes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathKind {
+    Project,
+    Dir,
+    File,
+    /// A `-derivedDataPath` folder: a build output, not a tree to register.
+    DerivedData,
+}
+
+/// The registered tree a tool call builds in, registering each unknown
+/// linked worktree among the paths it names on the way: the tree of its
+/// first `-project`/`-workspace` path, else of its first `cd`/`git -C`
+/// path, else of its first file path. `None` for a call that names none, or
+/// none in a registered tree; the caller then uses the cwd's tree. A call
+/// without such paths costs a few substring searches: no stat, no git.
+fn command_tree(
+    home: &BaleHome,
+    payload: &Value,
+    cwd: &Path,
+    cwd_tree: Option<&(PathBuf, String)>,
+) -> Option<(PathBuf, String)> {
+    let user_home = bale_core::paths::home_dir();
+    let paths = tool_paths(payload, cwd, user_home.as_deref());
+    if paths.is_empty() {
+        return None;
+    }
+    let session = payload["session_id"].as_str().unwrap_or_default();
+    let cwd_tree = cwd_tree.map(|(p, id)| (p.as_path(), id.as_str()));
+    let mut best: Option<(PathKind, (PathBuf, String))> = None;
+    for (kind, path) in paths {
+        if kind == PathKind::DerivedData {
+            continue;
+        }
+        let Some(tree) = tree_for(home, &path, cwd_tree, session) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(k, _)| rank(kind) < rank(*k)) {
+            best = Some((kind, tree));
+        }
+    }
+    best.map(|(_, tree)| tree)
+}
+
+fn rank(kind: PathKind) -> u8 {
+    match kind {
+        PathKind::Project => 0,
+        PathKind::Dir => 1,
+        PathKind::File => 2,
+        PathKind::DerivedData => 3,
+    }
+}
+
+/// [`command_paths`] of a Bash call's `command`, plus the `file_path` of a
+/// Read, Edit or Write call.
+fn tool_paths(payload: &Value, cwd: &Path, user_home: Option<&Path>) -> Vec<(PathKind, PathBuf)> {
+    let input = &payload["tool_input"];
+    let mut out = input["command"]
+        .as_str()
+        .map(|c| command_paths(c, cwd, user_home))
+        .unwrap_or_default();
+    if let Some(file) = input["file_path"].as_str().filter(|f| !f.is_empty()) {
+        out.push((PathKind::File, lexical(&cwd.join(file))));
+    }
+    out
+}
+
+/// The paths a shell command works in, in order: the argument after each
+/// `cd` that starts a command, `git -C`, `-project` and `-workspace`. Quotes
+/// are removed, `~` is expanded to `user_home`, and a relative path is
+/// joined to the directory of the last `cd` (the hook's `cwd` before any).
+/// An argument that needs the shell to resolve (`$VAR`, `$(..)`, backticks),
+/// is missing, or looks like a flag is left out; after such a `cd`, so are
+/// relative paths.
+fn command_paths(command: &str, cwd: &Path, user_home: Option<&Path>) -> Vec<(PathKind, PathBuf)> {
+    const WORDS: [(&str, PathKind); 5] = [
+        ("cd", PathKind::Dir),
+        ("-C", PathKind::Dir),
+        ("-project", PathKind::Project),
+        ("-workspace", PathKind::Project),
+        (DD_FLAG, PathKind::DerivedData),
+    ];
+    let mut out: Vec<(PathKind, PathBuf)> = Vec::new();
+    // Cheap rejection for the common command that names none of them.
+    if !WORDS.iter().any(|(w, _)| command.contains(w)) {
+        return out;
+    }
+    let mut base = Some(cwd.to_path_buf());
+    for (at, c) in command.char_indices() {
+        let before = &command[..at];
+        let starts_word = before
+            .chars()
+            .next_back()
+            .is_none_or(|p| p.is_whitespace() || matches!(p, '\'' | '"' | ';' | '&' | '|' | '('));
+        if !starts_word || !matches!(c, 'c' | '-') {
+            continue;
+        }
+        let rest = &command[at..];
+        let Some((word, kind)) = WORDS
+            .iter()
+            .find(|(w, _)| rest.starts_with(w) && rest[w.len()..].starts_with(char::is_whitespace))
+        else {
+            continue;
+        };
+        let accepted = match *word {
+            // Only `cd` that starts a command, not `echo cd x`.
+            "cd" => before
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_none_or(|p| matches!(p, ';' | '&' | '|' | '(' | '\n')),
+            "-C" => before
+                .trim_end()
+                .rsplit(|p: char| p.is_whitespace() || matches!(p, ';' | '&' | '|' | '('))
+                .next()
+                .is_some_and(|w| w == "git"),
+            _ => true,
+        };
+        if !accepted {
+            continue;
+        }
+        let is_cd = *word == "cd";
+        let arg = shell_word(rest[word.len()..].trim_start());
+        let path = arg
+            .filter(|a| !a.is_empty() && !a.starts_with('-') && !a.contains(['$', '`']))
+            .and_then(|a| {
+                if a == "~" || a.starts_with("~/") {
+                    user_home.map(|h| h.join(a[1..].trim_start_matches('/')))
+                } else if Path::new(&a).is_absolute() {
+                    Some(PathBuf::from(a))
+                } else {
+                    base.as_ref().map(|b| b.join(a))
+                }
+            })
+            .map(|p| lexical(&p));
+        if is_cd {
+            base.clone_from(&path);
+        }
+        if let Some(path) = path {
+            if !out.iter().any(|(k, p)| k == kind && *p == path) {
+                out.push((*kind, path));
+            }
+        }
+    }
+    out
+}
+
+/// The id of the registered tree holding `path`: the nearest ancestor with a
+/// `.git` entry. A linked worktree bale doesn't know is registered first,
+/// with this Claude Code `session` as its origin. `None` for a path in no
+/// checkout, in a main checkout or a submodule (a `.git` dir, or a gitfile
+/// that doesn't point into `<common>/worktrees/`), or one `register`
+/// refuses. A path in `cwd_tree` costs only stats; another one a canonical
+/// path and a record read. Silent: errors only mean `None`.
+fn tree_for(
+    home: &BaleHome,
+    path: &Path,
+    cwd_tree: Option<(&Path, &str)>,
+    session: &str,
+) -> Option<(PathBuf, String)> {
+    let (root, meta) = path
+        .ancestors()
+        .find_map(|a| fs::symlink_metadata(a.join(".git")).ok().map(|m| (a, m)))?;
+    if !meta.is_file() {
+        return None;
+    }
+    let root = bale_core::paths::canonicalize(root).ok()?;
+    if let Some((cwd_root, cwd_id)) = cwd_tree {
+        if root == cwd_root {
+            return Some((root, cwd_id.to_string()));
+        }
+    }
+    let id = bale_core::registry::workspace_id(&root);
+    match bale_core::registry::Registry::open(home.clone()).get(&id) {
+        Ok(Some(_)) => return Some((root, id)),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    if !is_linked_gitfile(&root.join(".git")) {
+        return None;
+    }
+    let record = register(home, &root).ok()?;
+    let origin = Origin {
+        tool: Tool::Claude.name().to_string(),
+        session: session.to_string(),
+        title: None,
+    };
+    let _ = set_origin(home, &record.id, origin);
+    Some((record.path, record.id))
+}
+
+/// True when the gitfile at `path` points into a `worktrees/` dir, as a
+/// linked worktree's does (a submodule's points into `modules/`), and that
+/// admin dir exists: a pruned worktree's is gone, and `register` would run
+/// git only to refuse it, on every call that names it.
+fn is_linked_gitfile(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(admin) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(|d| Path::new(d.trim()))
+    else {
+        return false;
+    };
+    let in_worktrees = admin
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == "worktrees");
+    let admin = match path.parent() {
+        Some(checkout) => checkout.join(admin),
+        None => admin.to_path_buf(),
+    };
+    in_worktrees && admin.is_dir()
+}
+
+/// Keeps shared Swift packages links current before a tool runs: relinks
+/// the cwd tree `cwd_id` when a `Package.resolved` changed, and links the
+/// folder a Bash command's `-derivedDataPath` names to the packages of tree
+/// `target` (the tree the command builds in; see [`command_tree`]).
+/// Best-effort and silent; the unchanged case is one record read and one
+/// stat per linked project. A tree with several projects uses the first
+/// project's key for `-derivedDataPath`.
 #[cfg(target_os = "macos")]
-fn share_packages(home: &BaleHome, payload: &Value, cwd: &Path, id: &str) {
-    bale_core::spm_link::relink_tree(home, id);
+fn share_packages(
+    home: &BaleHome,
+    payload: &Value,
+    cwd: &Path,
+    cwd_id: Option<&str>,
+    target: &str,
+) {
+    if let Some(id) = cwd_id {
+        bale_core::spm_link::relink_tree(home, id);
+    }
+    if cwd_id != Some(target) {
+        bale_core::spm_link::relink_tree(home, target);
+    }
     let Some(command) = payload["tool_input"]["command"].as_str() else {
         return;
     };
@@ -454,12 +745,19 @@ fn share_packages(home: &BaleHome, payload: &Value, cwd: &Path, id: &str) {
     }
     let user_home = bale_core::paths::home_dir();
     for root in derived_data_paths(command, cwd, user_home.as_deref()) {
-        bale_core::spm_link::link_derived_data_path(home, id, &root);
+        bale_core::spm_link::link_derived_data_path(home, target, &root);
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn share_packages(_home: &BaleHome, _payload: &Value, _cwd: &Path, _id: &str) {}
+fn share_packages(
+    _home: &BaleHome,
+    _payload: &Value,
+    _cwd: &Path,
+    _cwd_id: Option<&str>,
+    _target: &str,
+) {
+}
 
 /// Records the `-derivedDataPath` of a Bash command as a DerivedData root
 /// for sweep to reap once its project is gone. Best-effort: the hook's exit
@@ -478,44 +776,61 @@ fn learn_dd_roots(home: &BaleHome, payload: &Value, cwd: &Path) {
     }
 }
 
+/// Names the folder that holds Claude Code's per-user temp folders, in place
+/// of `/tmp`. Tests point it away from the real one.
+const TMP_ENV: &str = "BALE_CLAUDE_TMP";
+
+/// Claude Code's session scratchpads, where agents put the build folders
+/// they name with `-derivedDataPath`:
+/// `/tmp/claude-<uid>/<project>/<session>/scratchpad`, with `/tmp` resolved
+/// (`/private/tmp` on macOS) or replaced by `$BALE_CLAUDE_TMP`, listed
+/// until `deadline`. Empty off macOS, where bale reaps no Xcode builds.
+pub fn scratchpads(deadline: std::time::Instant) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = match std::env::var_os(TMP_ENV) {
+            Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
+            _ => bale_core::paths::canonicalize("/tmp").ok(),
+        };
+        tmp.map(|t| scratchpads_in(&t, deadline))
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (TMP_ENV, deadline);
+        Vec::new()
+    }
+}
+
+/// The scratchpads under `tmp/claude-<uid>`, reached through no symlink and
+/// listed until `deadline`.
+#[cfg(target_os = "macos")]
+fn scratchpads_in(tmp: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
+    let base = tmp.join(format!("claude-{}", bale_core::paths::uid()));
+    let mut pads = Vec::new();
+    for project in bale_core::paths::plain_subdirs(&base, deadline) {
+        for session in bale_core::paths::plain_subdirs(&project, deadline) {
+            let pad = session.join("scratchpad");
+            if fs::symlink_metadata(&pad).is_ok_and(|m| m.is_dir()) {
+                pads.push(pad);
+            }
+        }
+    }
+    pads
+}
+
 const DD_FLAG: &str = "-derivedDataPath";
 
 /// The argument after each `-derivedDataPath` in `command`, as an absolute
-/// path: quotes removed, a leading `~` expanded to `user_home`, a relative
-/// path joined to `cwd`. An argument that needs the shell to resolve
-/// (`$VAR`, `$(..)`, backticks), is missing, or looks like another flag is
-/// left out.
+/// path, resolved as [`command_paths`] resolves paths: a relative one is
+/// joined to the directory of the last `cd`, and left out after a `cd` bale
+/// can't follow.
 fn derived_data_paths(command: &str, cwd: &Path, user_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for (at, _) in command.match_indices(DD_FLAG) {
-        let starts_word = command[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| c.is_whitespace() || matches!(c, '\'' | '"' | ';' | '&' | '|' | '('));
-        let rest = &command[at + DD_FLAG.len()..];
-        if !starts_word || !rest.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let Some(arg) = shell_word(rest.trim_start()) else {
-            continue;
-        };
-        if arg.is_empty() || arg.starts_with('-') || arg.contains(['$', '`']) {
-            continue;
-        }
-        let path = if arg == "~" || arg.starts_with("~/") {
-            match user_home {
-                Some(h) => h.join(arg[1..].trim_start_matches('/')),
-                None => continue,
-            }
-        } else {
-            cwd.join(&arg)
-        };
-        let path = lexical(&path);
-        if !out.contains(&path) {
-            out.push(path);
-        }
-    }
-    out
+    command_paths(command, cwd, user_home)
+        .into_iter()
+        .filter(|(k, _)| *k == PathKind::DerivedData)
+        .map(|(_, p)| p)
+        .collect()
 }
 
 /// The first shell word of `s` with quotes and backslash escapes resolved;
@@ -1051,6 +1366,29 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn scratchpads_lists_this_users_session_scratchpads() {
+        let t = tempfile::tempdir().unwrap();
+        let mine = t.path().join(format!("claude-{}", bale_core::paths::uid()));
+        let pad = mine.join("-Users-me-proj/session-1/scratchpad");
+        fs::create_dir_all(&pad).unwrap();
+        // A session without a scratchpad, another user's, and a linked session.
+        fs::create_dir_all(mine.join("-Users-me-proj/session-2")).unwrap();
+        fs::create_dir_all(t.path().join("claude-0/p/s/scratchpad")).unwrap();
+        std::os::unix::fs::symlink(
+            mine.join("-Users-me-proj/session-1"),
+            mine.join("-Users-me-proj/session-3"),
+        )
+        .unwrap();
+        let later = std::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(scratchpads_in(t.path(), later), vec![pad]);
+        assert!(scratchpads_in(&t.path().join("missing"), later).is_empty());
+        // Listing stops at the deadline.
+        let past = std::time::Instant::now() - Duration::from_millis(1);
+        assert!(scratchpads_in(t.path(), past).is_empty());
+    }
+
+    #[test]
     fn sh_quote_escapes_a_single_quote() {
         assert_eq!(sh_quote("/opt/it's/bale"), r"'/opt/it'\''s/bale'");
     }
@@ -1384,15 +1722,328 @@ mod tests {
 
         let payload =
             json!({"tool_input": {"command": "xcodebuild -derivedDataPath build/dd build"}});
-        share_packages(&home, &payload, &tree, &id);
+        share_packages(&home, &payload, &tree, Some(&id), &id);
         let link = tree.join("build/dd/SourcePackages");
         assert_eq!(fs::read_link(&link).unwrap(), shared);
 
         // A command without the flag, or with an existing folder, changes nothing.
         let other = json!({"tool_input": {"command": "ls"}});
-        share_packages(&home, &other, &tree, &id);
-        share_packages(&home, &payload, &tree, &id);
+        share_packages(&home, &other, &tree, Some(&id), &id);
+        share_packages(&home, &payload, &tree, Some(&id), &id);
         assert_eq!(fs::read_link(&link).unwrap(), shared);
         assert!(!tree.join("SourcePackages").exists());
+    }
+
+    #[cfg(unix)]
+    fn cmd_paths(command: &str) -> Vec<(PathKind, PathBuf)> {
+        command_paths(
+            command,
+            Path::new("/work/tree"),
+            Some(Path::new("/home/me")),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_paths_reads_cd_git_c_project_and_workspace() {
+        use PathKind::{Dir, Project};
+        assert_eq!(
+            cmd_paths("cd /abs/tree-b; grep -rn foo ."),
+            vec![(Dir, PathBuf::from("/abs/tree-b"))]
+        );
+        assert_eq!(
+            cmd_paths("git -C '/abs/b c' status && cd ~/wt"),
+            vec![
+                (Dir, PathBuf::from("/abs/b c")),
+                (Dir, PathBuf::from("/home/me/wt"))
+            ]
+        );
+        assert_eq!(
+            cmd_paths("xcodebuild -project /p/App.xcodeproj -workspace \"/p/W.xcworkspace\""),
+            vec![
+                (Project, PathBuf::from("/p/App.xcodeproj")),
+                (Project, PathBuf::from("/p/W.xcworkspace"))
+            ]
+        );
+        assert_eq!(
+            cmd_paths("(cd sub && make)"),
+            vec![(Dir, PathBuf::from("/work/tree/sub"))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_paths_resolves_relative_paths_after_a_cd() {
+        use PathKind::{Dir, Project};
+        assert_eq!(
+            cmd_paths("cd /b; xcodebuild -project App.xcodeproj"),
+            vec![
+                (Dir, PathBuf::from("/b")),
+                (Project, PathBuf::from("/b/App.xcodeproj"))
+            ]
+        );
+        assert_eq!(
+            cmd_paths("cd /b && cd ios/../app"),
+            vec![(Dir, PathBuf::from("/b")), (Dir, PathBuf::from("/b/app"))]
+        );
+        // After a cd bale can't follow, a relative path is unknown.
+        assert_eq!(
+            cmd_paths("cd $R; xcodebuild -project App.xcodeproj -workspace /w/W.xcworkspace"),
+            vec![(Project, PathBuf::from("/w/W.xcworkspace"))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_paths_skips_what_it_cannot_resolve() {
+        for cmd in [
+            "ls -la",
+            "cd $R && ls",
+            "cd \"$(git rev-parse --show-toplevel)\"",
+            "cd `pwd`",
+            "cd",
+            "cd -",
+            "echo cd /abs/x",
+            "tar -C /abs/x -xf a.tar",
+            "grep -C 3 foo",
+            "git -C",
+            "cd '/unterminated",
+            "abcd /abs/x",
+        ] {
+            assert!(cmd_paths(cmd).is_empty(), "{cmd}: {:?}", cmd_paths(cmd));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_paths_adds_the_file_path_of_read_edit_and_write() {
+        let payload = json!({"tool_name": "Edit", "tool_input": {"file_path": "/abs/b/f.swift"}});
+        assert_eq!(
+            tool_paths(&payload, Path::new("/work/tree"), None),
+            vec![(PathKind::File, PathBuf::from("/abs/b/f.swift"))]
+        );
+        let payload = json!({"tool_name": "Bash", "tool_input": {"command": "cd /abs/b"}});
+        assert_eq!(
+            tool_paths(&payload, Path::new("/work/tree"), None),
+            vec![(PathKind::Dir, PathBuf::from("/abs/b"))]
+        );
+    }
+
+    /// A registered record for `tree`, with a gitfile like a linked
+    /// worktree's and, when `key` is set, a shared packages link of that key.
+    #[cfg(unix)]
+    fn fake_tree(home: &BaleHome, tree: &Path, key: Option<&str>) -> String {
+        use bale_core::registry::{workspace_id, Level, Record, Registry, SpmLink};
+        use std::time::SystemTime;
+
+        fs::create_dir_all(tree).unwrap();
+        fs::write(tree.join(".git"), "gitdir: /r/.git/worktrees/t\n").unwrap();
+        let id = workspace_id(tree);
+        let spm = key
+            .map(|k| {
+                fs::create_dir_all(home.spm_dir().join(k)).unwrap();
+                vec![SpmLink {
+                    project: tree.join("A.xcodeproj"),
+                    resolved: tree.join("Package.resolved"),
+                    mtime: SystemTime::now(),
+                    size: 0,
+                    key: k.into(),
+                    folder: tree.join("dd0"),
+                }]
+            })
+            .unwrap_or_default();
+        Registry::open(home.clone())
+            .put(&Record {
+                id: id.clone(),
+                repo_common_dir: PathBuf::from("/r/.git"),
+                path: tree.to_path_buf(),
+                admin_dir: PathBuf::from("/r/.git/worktrees/t"),
+                branch: None,
+                head: "0".repeat(40),
+                level: Level::Hot,
+                last_activity: SystemTime::now(),
+                note: None,
+                trash: Vec::new(),
+                origin: None,
+                pinned: false,
+                scope: None,
+                stash: None,
+                restore_hook: false,
+                spm,
+            })
+            .unwrap();
+        id
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn derived_data_path_links_to_the_tree_the_command_cds_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let root = bale_core::paths::canonicalize(tmp.path()).unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        fake_tree(&home, &a, Some("ka"));
+        fake_tree(&home, &b, Some("kb"));
+        let x = root.join("x");
+
+        let command = format!(
+            "cd {}; xcodebuild -derivedDataPath {} build",
+            b.display(),
+            x.display()
+        );
+        let payload =
+            json!({"session_id": "s", "tool_name": "Bash", "tool_input": {"command": command}});
+        assert_eq!(pre_tool_with(&home, &a, &payload, None), ExitCode::SUCCESS);
+        assert_eq!(
+            fs::read_link(x.join("SourcePackages")).unwrap(),
+            home.spm_dir().join("kb")
+        );
+
+        // A -project path wins over the cd, and its tree is picked even from
+        // a cwd in no tree.
+        let y = root.join("y");
+        let command = format!(
+            "cd {}; xcodebuild -project {}/A.xcodeproj -derivedDataPath {}",
+            b.display(),
+            a.display(),
+            y.display()
+        );
+        let payload = json!({"tool_input": {"command": command}});
+        assert_eq!(
+            pre_tool_with(&home, &root, &payload, None),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            fs::read_link(y.join("SourcePackages")).unwrap(),
+            home.spm_dir().join("ka")
+        );
+
+        // A plain command in A still links to A.
+        let z = root.join("z");
+        let payload = json!({"tool_input": {"command": format!("xcodebuild -derivedDataPath {}", z.display())}});
+        assert_eq!(pre_tool_with(&home, &a, &payload, None), ExitCode::SUCCESS);
+        assert_eq!(
+            fs::read_link(z.join("SourcePackages")).unwrap(),
+            home.spm_dir().join("ka")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_for_walks_up_to_the_checkout_and_skips_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let root = bale_core::paths::canonicalize(tmp.path()).unwrap();
+        let a = root.join("a");
+        let id = fake_tree(&home, &a, None);
+        // A file that does not exist yet, deep in the tree.
+        assert_eq!(
+            tree_for(&home, &a.join("new/dir/f.swift"), None, ""),
+            Some((a.clone(), id.clone()))
+        );
+        // A main checkout (a .git dir) and a path in no checkout.
+        let main = root.join("main");
+        fs::create_dir_all(main.join(".git")).unwrap();
+        assert_eq!(tree_for(&home, &main.join("src"), None, ""), None);
+        assert_eq!(tree_for(&home, &root.join("nowhere"), None, ""), None);
+        // A submodule's gitfile is not a linked worktree's: no register.
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        assert_eq!(tree_for(&home, &sub, None, ""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_data_path_is_relative_to_the_last_cd() {
+        assert_eq!(
+            dd_args("cd /b && xcodebuild -derivedDataPath build/dd"),
+            vec![PathBuf::from("/b/build/dd")]
+        );
+        assert!(dd_args("cd $R; xcodebuild -derivedDataPath build/dd").is_empty());
+        assert_eq!(
+            dd_args("cd $R; xcodebuild -derivedDataPath /abs/dd"),
+            vec![PathBuf::from("/abs/dd")]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relative_derived_data_path_after_cd_lands_in_that_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let root = bale_core::paths::canonicalize(tmp.path()).unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        fake_tree(&home, &a, Some("ka"));
+        fake_tree(&home, &b, Some("kb"));
+
+        let command = format!("cd {}; xcodebuild -derivedDataPath build/dd", b.display());
+        let payload = json!({"tool_input": {"command": command}});
+        assert_eq!(pre_tool_with(&home, &a, &payload, None), ExitCode::SUCCESS);
+        assert_eq!(
+            fs::read_link(b.join("build/dd/SourcePackages")).unwrap(),
+            home.spm_dir().join("kb")
+        );
+        assert!(!a.join("build").exists());
+
+        let payload =
+            json!({"tool_input": {"command": "cd $R; xcodebuild -derivedDataPath build/dd"}});
+        assert_eq!(pre_tool_with(&home, &a, &payload, None), ExitCode::SUCCESS);
+        assert!(!a.join("build").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_the_command_works_in_counts_as_active() {
+        use bale_core::registry::Registry;
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = BaleHome(tmp.path().join("bale"));
+        let root = bale_core::paths::canonicalize(tmp.path()).unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        fake_tree(&home, &a, None);
+        let id_b = fake_tree(&home, &b, None);
+        let registry = Registry::open(home.clone());
+        let old = SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        let mut rec = registry.get(&id_b).unwrap().unwrap();
+        rec.last_activity = old;
+        registry.put(&rec).unwrap();
+
+        let payload =
+            json!({"tool_input": {"command": format!("cd {}; grep -rn foo .", b.display())}});
+        assert_eq!(pre_tool_with(&home, &a, &payload, None), ExitCode::SUCCESS);
+        let after = registry.get(&id_b).unwrap().unwrap().last_activity;
+        assert!(after > old + Duration::from_secs(3600), "{after:?}");
+
+        // Also from a cwd in no tree.
+        let mut rec = registry.get(&id_b).unwrap().unwrap();
+        rec.last_activity = old;
+        registry.put(&rec).unwrap();
+        assert_eq!(
+            pre_tool_with(&home, &root, &payload, None),
+            ExitCode::SUCCESS
+        );
+        let after = registry.get(&id_b).unwrap().unwrap().last_activity;
+        assert!(after > old + Duration::from_secs(3600), "{after:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gitfile_whose_admin_dir_is_gone_is_not_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = bale_core::paths::canonicalize(tmp.path()).unwrap();
+        let admin = root.join("repo/.git/worktrees/b");
+        let gitfile = root.join("b/.git");
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(&gitfile, format!("gitdir: {}\n", admin.display())).unwrap();
+        assert!(!is_linked_gitfile(&gitfile));
+        fs::create_dir_all(&admin).unwrap();
+        assert!(is_linked_gitfile(&gitfile));
+        // A relative gitdir is relative to the checkout.
+        fs::write(&gitfile, "gitdir: ../repo/.git/worktrees/b\n").unwrap();
+        assert!(is_linked_gitfile(&gitfile));
+        fs::write(&gitfile, "gitdir: ../repo/.git/worktrees/gone\n").unwrap();
+        assert!(!is_linked_gitfile(&gitfile));
     }
 }
