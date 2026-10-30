@@ -361,3 +361,93 @@ fn share_skips_locked_tree() {
     assert_eq!(r.files, 0);
     assert_eq!(std::fs::read(wt.join("big.bin")).unwrap(), big(2 << 20, 11));
 }
+
+fn age_file(path: &Path, by: std::time::Duration) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - by).unwrap();
+}
+
+/// Writes `bytes` straight into the store under `key`, aged by `by`.
+fn put_store_file(
+    store: &bale_core::clones::store::CloneStore,
+    key: &Key,
+    bytes: &[u8],
+    by: std::time::Duration,
+) -> std::path::PathBuf {
+    let p = store.path(key);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
+    age_file(&p, by);
+    p
+}
+
+const HOUR2: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+#[test]
+fn gc_keeps_listed_and_young_files() {
+    use bale_core::clones::{gc::collect, store::CloneStore};
+    use bale_core::store::gc::GC_GRACE;
+    let fx = Fixture::new();
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let listed = Key::Git("aa".repeat(20));
+    let young = Key::Git("bb".repeat(20));
+    let a = put_store_file(&store, &listed, b"listed", HOUR2);
+    let b = put_store_file(&store, &young, b"young", std::time::Duration::ZERO);
+    let live = std::collections::HashSet::from([listed]);
+    assert_eq!(collect(&store, &live, GC_GRACE, false).unwrap(), 0);
+    assert!(a.exists() && b.exists());
+}
+
+#[test]
+fn gc_removes_unlisted_old_files() {
+    use bale_core::clones::{gc::collect, store::CloneStore};
+    use bale_core::store::gc::GC_GRACE;
+    let fx = Fixture::new();
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let key = Key::Lfs("cd".repeat(32));
+    let p = put_store_file(&store, &key, b"twelve bytes", HOUR2);
+    let tmp = p.with_file_name(format!("{}.tmp-1-0", "cd".repeat(32)));
+    std::fs::write(&tmp, b"abc").unwrap();
+    age_file(&tmp, HOUR2);
+    let odd = p.with_file_name("not-a-key");
+    std::fs::write(&odd, b"zz").unwrap();
+    age_file(&odd, HOUR2);
+    let live = std::collections::HashSet::new();
+    assert_eq!(collect(&store, &live, GC_GRACE, true).unwrap(), 15);
+    assert!(p.exists() && tmp.exists());
+    assert_eq!(collect(&store, &live, GC_GRACE, false).unwrap(), 15);
+    assert!(!p.exists() && !tmp.exists());
+    assert!(odd.exists());
+}
+
+#[test]
+fn gc_removes_nothing_when_a_listing_fails() {
+    use bale_core::clones::store::CloneStore;
+    use bale_core::registry::Registry;
+    let fx = Fixture::new();
+    let home = fx.home();
+    let wt = fx.add_worktree("w1", "w1");
+    let id = bale_core::ops::up::register(&home, &wt).unwrap().id;
+    let store = CloneStore::open(&home).unwrap();
+    let p = put_store_file(&store, &Key::Git("ee".repeat(20)), b"data", HOUR2);
+    // The path still exists but is no longer a git tree.
+    let rec = Registry::open(home.clone()).get(&id).unwrap().unwrap();
+    std::fs::remove_dir_all(&rec.path).unwrap();
+    std::fs::create_dir_all(&rec.path).unwrap();
+    let report = bale_core::ops::gc::gc(&home, false).unwrap();
+    assert_eq!(report.clones_bytes_freed, 0, "{report:?}");
+    assert!(
+        report.errors.iter().any(|(k, _)| k == "clones"),
+        "{report:?}"
+    );
+    assert!(p.exists());
+}
+
+#[test]
+fn gc_does_not_create_a_missing_store() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let report = bale_core::ops::gc::gc(&home, false).unwrap();
+    assert_eq!(report.clones_bytes_freed, 0);
+    assert!(!home.clones_dir().exists());
+}

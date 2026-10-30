@@ -1,12 +1,15 @@
 //! `bale gc`: forget workspaces whose worktree is gone, and clear what an
 //! interrupted `bale open` left on a hot one.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
+use crate::clones::{gc as clones_gc, store::CloneStore, tracked as clones_tracked};
+use crate::config::load_config;
 use crate::git::{self, Git, WorktreeInfo, LOCK_REASON};
 use crate::lock::WorkspaceLock;
 use crate::ops::disk;
@@ -30,6 +33,9 @@ pub struct GcReport {
     /// Bytes of store blobs, manifests and stat indexes removed (or that a
     /// dry run would remove).
     pub store_bytes_freed: u64,
+    /// Bytes of unreferenced clone-store files removed (or that a dry run
+    /// would remove).
+    pub clones_bytes_freed: u64,
 }
 
 /// Removes a `Hot` or `Baled` record when its dir is gone and git no longer
@@ -61,6 +67,7 @@ fn gc_untraced(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
         }
     }
     collect_store(home, &registry, dry_run, &mut report);
+    collect_clones(home, &registry, dry_run, &mut report);
     Ok(report)
 }
 
@@ -87,6 +94,34 @@ fn collect_store(home: &BaleHome, registry: &Registry, dry_run: bool, report: &m
     match result {
         Ok(n) => report.store_bytes_freed = n.unwrap_or(0),
         Err(e) => report.errors.push(("store".to_string(), format!("{e:#}"))),
+    }
+}
+
+/// Frees clone-store files no existing tree lists as a candidate. A record
+/// gc cannot read, or a tree whose candidates cannot be listed, might still
+/// use a file, so then it removes nothing (tmp files included).
+fn collect_clones(home: &BaleHome, registry: &Registry, dry_run: bool, report: &mut GcReport) {
+    let result = (|| -> Result<u64> {
+        if !home.clones_dir().exists() {
+            return Ok(0);
+        }
+        let mut live = HashSet::new();
+        for (stem, read) in registry.all_lenient()? {
+            let record = read.with_context(|| format!("record {stem} is unreadable"))?;
+            if fs::symlink_metadata(&record.path).is_err() {
+                continue;
+            }
+            let cfg = load_config(home, Some(&record.path))?;
+            let found = clones_tracked::candidates(&record.path, cfg.clone_min_bytes)
+                .with_context(|| format!("listing {}", record.path.display()))?;
+            live.extend(found.into_iter().map(|c| c.key));
+        }
+        let store = CloneStore::open(home)?;
+        clones_gc::collect(&store, &live, store_gc::GC_GRACE, dry_run)
+    })();
+    match result {
+        Ok(n) => report.clones_bytes_freed = n,
+        Err(e) => report.errors.push(("clones".to_string(), format!("{e:#}"))),
     }
 }
 

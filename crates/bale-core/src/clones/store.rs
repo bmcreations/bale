@@ -54,6 +54,11 @@ impl CloneStore {
         Ok(CloneStore { root })
     }
 
+    /// The `clones/` directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// `clones/git/<oid[..2]>/<oid>` or `clones/lfs/<sha256[..2]>/<sha256>`.
     pub fn path(&self, key: &Key) -> PathBuf {
         let (kind, id) = match key {
