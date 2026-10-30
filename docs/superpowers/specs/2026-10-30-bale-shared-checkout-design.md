@@ -22,14 +22,33 @@ no extra blocks.
 
 ### The clone store
 
-`BALE_HOME/clones/<repo-key>/<oid>` holds one file per git blob, written once and never changed. Only blobs
-of `clone_min_bytes` or more go in (default 1 MiB, the same cut as stash).
+`BALE_HOME/clones/<repo-key>/` holds one file per distinct content, written once and never changed:
+`git/<oid>` for an ordinary blob, `lfs/<sha256>` for a Git LFS object. Only files of `clone_min_bytes` or
+more go in (default 1 MiB, the same cut as stash).
 
 The store must sit on the same volume as the checkout, because a clone can't cross volumes. bale compares
 `st_dev` and does nothing for a checkout on another volume.
 
-Files with a `filter` attribute (Git LFS, smudge filters) are skipped, since their working copy is not the
-blob's bytes.
+### Git LFS
+
+Repos that track large binaries often keep them in LFS, so leaving LFS out would miss the files this is
+for. An LFS file's blob is a pointer of about 130 bytes, and the working copy is the object it names. The
+pointer carries that object's SHA-256 and size, so bale keys the file on them instead of the blob id:
+
+- A path counts as LFS when `git check-attr filter` reports `lfs` and its blob parses as a pointer
+  (`version https://git-lfs.github.com/spec/v1`, `oid sha256:<hex>`, `size <n>`). The pointer's `size`
+  decides whether it clears `clone_min_bytes`.
+- Before a working file is stored or replaced, bale checks that its SHA-256 matches the pointer.
+- The store is seeded by cloning from LFS's own object store (`<git-common-dir>/lfs/objects/<aa>/<bb>/<sha256>`)
+  when the object is there, so the first checkout costs no extra copy. LFS objects are never rewritten, and
+  a clone keeps its blocks if `git lfs prune` later deletes the original.
+- An object in neither store is left to `git checkout-index`, which runs LFS's smudge filter and downloads
+  it as it does today.
+
+LFS's object store already shares one copy between worktrees of a repo, but every checkout still writes its
+own working copy. This removes that copy.
+
+Files with any other `filter` are skipped, since bale can't tell what bytes their working copy should hold.
 
 ### New checkouts
 
@@ -49,13 +68,14 @@ Claude Code hooks. The sweep shares their files too, under these rules:
   for build output; whether it reacts the same way to source files is untested, and this rule makes that
   question moot for v1.
 - Take the tree's lock without waiting and skip busy trees, as `up` does.
-- Replace a file only when its bytes hash to the index's blob. Modified files are left alone.
+- Replace a file only when its bytes hash to the index's blob, or for LFS to the pointer's SHA-256.
+  Modified files are left alone.
 - Clone to a temp name next to the file, keep mode and nanosecond mtime, then rename over it.
 - Run `git update-index --refresh` afterwards, since the index caches inode numbers.
 
 ### Reclaiming the store
 
-`bale gc` deletes a stored blob that no live record's index references, once it is over an hour old, like
+`bale gc` deletes a stored file that no live record's index references, directly or through an LFS pointer, once it is over an hour old, like
 the stash store.
 
 ### Platforms
@@ -74,6 +94,9 @@ One measurement, on clones of two Android checkouts in a temp `BALE_HOME`:
 3. A Gradle build in the shared tree after a full build beforehand: nothing in `vendor/opencv` is rebuilt.
 4. Across every registered tree, the bytes of tracked blobs of 1 MiB or more held by two or more trees, to
    see whether any repo besides Android gains.
+5. No repo on this Mac uses LFS, so a temp repo with a 50 MiB LFS file and two worktrees: after sharing,
+   `df` shows one copy, `git status` and `git lfs status` are clean in both, and the file's SHA-256 matches
+   its pointer.
 
 If step 1 frees well under 0.9 GiB, some checkouts already share blocks and the saving above is overstated;
 stop and report.
