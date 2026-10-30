@@ -4189,3 +4189,49 @@ fn pre_tool_does_not_register_a_main_checkout_or_a_shell_variable() {
         assert_eq!(env.registered(), vec![canon(&a)], "{command}");
     }
 }
+
+/// A tree the command names (not the cwd's) whose restore fails doesn't
+/// block the call: exit 0, nothing on stderr, an `op` line in the trace.
+#[cfg(unix)]
+#[test]
+fn pre_tool_failed_restore_of_a_named_tree_is_best_effort() {
+    let env = Env::new();
+    let a = env.add_worktree("tree-a");
+    let b = env.add_worktree("tree-b");
+    for t in [&a, &b] {
+        let out = env.bale(&env.repo, &["adopt", t.to_str().unwrap()], None);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    // B is stashed under a manifest the store doesn't have.
+    let home = bale_core::BaleHome(env.bale_home());
+    let id_b = tree_id(&b);
+    let record = home.records_dir().join(format!("{id_b}.json"));
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    v["stash"] =
+        serde_json::json!({"commitment": "ab".repeat(32), "at_unix": 0, "restored": false});
+    fs::write(&record, v.to_string()).unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": a,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": format!("cd {}; ls", b.display())},
+    })
+    .to_string();
+    let out = env.bale(&a, &["hook", "claude", "pre-tool"], Some(&payload));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+
+    let mut traced = false;
+    for e in fs::read_dir(home.trace_dir()).unwrap().flatten() {
+        for line in fs::read_to_string(e.path()).unwrap_or_default().lines() {
+            let l: Value = serde_json::from_str(line).unwrap();
+            traced |= l["kind"] == "op"
+                && l["op"] == "unstash"
+                && l["id"] == id_b.as_str()
+                && l["outcome"] == "error";
+        }
+    }
+    assert!(traced, "no unstash error line in the trace");
+}

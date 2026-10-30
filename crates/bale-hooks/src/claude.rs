@@ -423,10 +423,13 @@ fn pre_tool_with(
         .filter(|t| cwd_tree.as_ref().is_none_or(|c| c.1 != t.1));
     // The tree the command works in gets what the cwd's tree gets: an agent
     // working in B from A must not have B's build output removed as idle.
-    for (path, id) in cwd_tree.iter().chain(target.iter()) {
+    if let Some((path, id)) = &cwd_tree {
         if let Err(code) = ready(home, path, id, lock_wait_ms) {
             return code;
         }
+    }
+    if let Some((_, id)) = &target {
+        ready_quietly(home, id, lock_wait_ms);
     }
     let cwd_id = cwd_tree.as_ref().map(|(_, id)| id.as_str());
     if let Some(dd_id) = target.as_ref().map(|(_, id)| id.as_str()).or(cwd_id) {
@@ -438,6 +441,26 @@ fn pre_tool_with(
         }
     }
     ExitCode::SUCCESS
+}
+
+/// [`ready`] for a tree the call names rather than the cwd's: a guess from
+/// parsing, so a failed restore goes to the trace, not to stderr or the exit
+/// code. It only costs a rebuild, since a stash holds build output only. A
+/// background restore's failure marker is left for the hook in that tree.
+fn ready_quietly(home: &BaleHome, id: &str, lock_wait_ms: Option<u64>) {
+    let result = needs_restore(home, id).and_then(|pending| {
+        if !pending {
+            return Ok(());
+        }
+        let opts = UnstashOpts {
+            lock_wait: lock_wait_ms.map(Duration::from_millis),
+            ..UnstashOpts::default()
+        };
+        unstash_with(home, id, &opts).map(|_| ())
+    });
+    if let Err(e) = result {
+        bale_core::trace::failed(home, "unstash", id, &e);
+    }
 }
 
 /// Waits for the tree's restore, the background one a prompt started or its
