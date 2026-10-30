@@ -265,6 +265,33 @@ fn adopt_gives_the_store_file_a_fresh_mtime() {
     assert!(age < std::time::Duration::from_secs(600), "{age:?}");
 }
 
+/// `share_checkouts` and `clone_min_bytes` come from the tree's `.bale.toml`.
+#[test]
+fn bale_toml_sets_share_checkouts_and_clone_min_bytes() {
+    let fx = Fixture::new();
+    std::fs::write(fx.repo.join("mid.bin"), big(4096, 17)).unwrap();
+    git(&fx.repo, &["add", "mid.bin"]);
+    git(&fx.repo, &["commit", "-m", "mid"]);
+    let home = fx.home();
+    let cfg = bale_core::config::load_config(&home, Some(&fx.repo)).unwrap();
+    assert!(cfg.share_checkouts);
+    assert!(candidates(&fx.repo, cfg.clone_min_bytes)
+        .unwrap()
+        .is_empty());
+
+    std::fs::write(
+        fx.repo.join(".bale.toml"),
+        "share_checkouts = false\nclone_min_bytes = 1024\n",
+    )
+    .unwrap();
+    let cfg = bale_core::config::load_config(&home, Some(&fx.repo)).unwrap();
+    assert!(!cfg.share_checkouts);
+    assert_eq!(cfg.clone_min_bytes, 1024);
+    let c = candidates(&fx.repo, cfg.clone_min_bytes).unwrap();
+    let paths: Vec<_> = c.iter().map(|c| c.path.clone()).collect();
+    assert_eq!(paths, vec![Path::new("mid.bin")]);
+}
+
 /// Commits a 2 MiB `big.bin` (mode `0o755` when `exec`), sets
 /// `clone_min_bytes = 1024` (the fixture's 4-byte `f` stays out), and returns the registered worktree's path and id.
 fn shared_fixture(fx: &Fixture, names: &[&str], exec: bool) -> Vec<(std::path::PathBuf, String)> {
@@ -422,6 +449,30 @@ fn share_skips_locked_tree() {
     assert_eq!(r.reason.as_deref(), Some("locked"));
     assert_eq!(r.files, 0);
     assert_eq!(std::fs::read(wt.join("big.bin")).unwrap(), big(2 << 20, 11));
+}
+
+#[test]
+fn share_skips_a_tree_with_sharing_disabled() {
+    use bale_core::clones::share::share;
+    let fx = Fixture::new();
+    let trees = shared_fixture(&fx, &["w1"], false);
+    let (wt, id) = &trees[0];
+    std::fs::write(wt.join(".bale.toml"), "share_checkouts = false\n").unwrap();
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(wt.join("big.bin")).unwrap());
+    let r = share(&fx.home(), id).unwrap();
+    assert_eq!(r.reason.as_deref(), Some("disabled"), "{r:?}");
+    assert_eq!(r.files, 0);
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(wt.join("big.bin")).unwrap()),
+        ino
+    );
+    let rec = bale_core::registry::Registry::open(fx.home())
+        .get(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.shared_head, None);
 }
 
 fn age_file(path: &Path, by: std::time::Duration) {
