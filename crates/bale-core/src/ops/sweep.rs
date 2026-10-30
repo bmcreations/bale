@@ -754,8 +754,9 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
 /// removes those folders; elsewhere a `true` would re-run `up` on every sweep.
 #[cfg(target_os = "macos")]
 fn has_shared_derived_data(home: &BaleHome, root: &Path) -> bool {
-    !crate::derived_data::global_for(root).is_empty()
-        || !crate::derived_data::learned_for(home, root).is_empty()
+    let trees = crate::derived_data::registered_trees(home);
+    !crate::derived_data::global_owned(root, &trees).is_empty()
+        || !crate::derived_data::learned_for(home, root, &trees).is_empty()
 }
 
 #[cfg(not(target_os = "macos"))]

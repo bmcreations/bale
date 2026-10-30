@@ -9,10 +9,17 @@ use crate::BaleHome;
 /// folder with a missing or unparseable plist, or no `WorkspacePath`, is
 /// never matched.
 pub fn derived_data_for(workspace: &Path, dd_root: &Path) -> Vec<PathBuf> {
+    owned_under(workspace, dd_root, &[])
+}
+
+/// [`derived_data_for`], leaving out folders built from one of `trees` (as
+/// [`workspace_key`]) that lies inside `workspace`: such a folder belongs to
+/// the deeper tree.
+pub(crate) fn owned_under(workspace: &Path, dd_root: &Path, trees: &[PathBuf]) -> Vec<PathBuf> {
     let ws = workspace_key(workspace);
     index(dd_root)
         .into_iter()
-        .filter(|d| d.built_from(&ws))
+        .filter(|d| d.owned_by(&ws, trees))
         .map(|d| d.dir)
         .collect()
 }
@@ -46,6 +53,16 @@ impl DdDir {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn workspace(&self) -> Option<&Path> {
         self.workspace.as_deref()
+    }
+
+    /// True when this folder was built from the tree whose [`workspace_key`]
+    /// is `ws` and from none of `trees` nested inside it: a folder belongs to
+    /// the deepest registered tree holding its project.
+    pub(crate) fn owned_by(&self, ws: &Path, trees: &[PathBuf]) -> bool {
+        self.built_from(ws)
+            && !trees
+                .iter()
+                .any(|t| t != ws && t.starts_with(ws) && self.built_from(t))
     }
 
     /// True when the project this folder was built from lies inside the
@@ -170,12 +187,13 @@ pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> 
 }
 
 /// The learned roots (see [`learn_root`]) that are DerivedData built from the
-/// tree at `root`: each passes [`is_derived_data_root`] and
-/// [`belongs_to_tree`], and neither lies inside the other, so a root inside
-/// the tree is left to `up`'s in-tree pass and no root holding the tree is
-/// ever named.
+/// tree at `root`: each is a real directory passing [`is_derived_data_root`]
+/// and [`DdDir::owned_by`] against the registered `trees` (as
+/// [`workspace_key`]). A root inside the tree is left to `up`'s in-tree
+/// pass, one inside another of `trees` is that tree's, and no root holding
+/// the tree is ever named.
 #[cfg(target_os = "macos")]
-pub(crate) fn learned_for(home: &BaleHome, root: &Path) -> Vec<PathBuf> {
+pub(crate) fn learned_for(home: &BaleHome, root: &Path, trees: &[PathBuf]) -> Vec<PathBuf> {
     let tree = workspace_key(root);
     learned_roots(home)
         .into_iter()
@@ -183,9 +201,24 @@ pub(crate) fn learned_for(home: &BaleHome, root: &Path) -> Vec<PathBuf> {
             let key = workspace_key(dir);
             !key.starts_with(&tree)
                 && !tree.starts_with(&key)
+                && !trees.iter().any(|t| key.starts_with(t))
+                && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
                 && is_derived_data_root(dir)
-                && belongs_to_tree(dir, root)
+                && DdDir::read(dir.clone()).owned_by(&tree, trees)
         })
+        .collect()
+}
+
+/// Every registered tree's path as [`workspace_key`], for
+/// [`DdDir::owned_by`]. A record that can't be read is left out.
+#[cfg(target_os = "macos")]
+pub(crate) fn registered_trees(home: &BaleHome) -> Vec<PathBuf> {
+    crate::registry::Registry::open(home.clone())
+        .all_lenient()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, r)| r.ok())
+        .map(|r| workspace_key(&r.path))
         .collect()
 }
 
@@ -196,20 +229,27 @@ pub(crate) fn global_root() -> Option<PathBuf> {
 
 /// The folders in Xcode's shared DerivedData built from the tree at `root`.
 pub(crate) fn global_for(root: &Path) -> Vec<PathBuf> {
+    global_owned(root, &[])
+}
+
+/// [`global_for`], leaving out folders that belong to one of the registered
+/// `trees` nested inside `root` (see [`DdDir::owned_by`]).
+pub(crate) fn global_owned(root: &Path, trees: &[PathBuf]) -> Vec<PathBuf> {
     global_root()
-        .map(|g| derived_data_for(root, &g))
+        .map(|g| owned_under(root, &g, trees))
         .unwrap_or_default()
 }
 
 /// Every Xcode DerivedData root that belongs to the tree at `root`: the
-/// in-tree ones among its regenerable `regen` dirs, then the shared ones.
-pub(crate) fn all_for(root: &Path, regen: &[PathBuf]) -> Vec<PathBuf> {
+/// in-tree ones among its regenerable `regen` dirs, then the shared ones
+/// not owned by one of the registered `trees` nested inside it.
+pub(crate) fn all_for(root: &Path, regen: &[PathBuf], trees: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = regen
         .iter()
         .filter(|d| is_derived_data_root(d))
         .cloned()
         .collect();
-    roots.extend(global_for(root));
+    roots.extend(global_owned(root, trees));
     roots
 }
 

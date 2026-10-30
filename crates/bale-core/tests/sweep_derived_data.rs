@@ -479,3 +479,45 @@ fn baled_tree_with_an_unignored_in_tree_root_is_baled_again() {
     );
     assert!(!dot_dd.exists());
 }
+
+#[test]
+fn up_leaves_derived_data_of_a_registered_tree_nested_inside() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    let id_b = register(&fx.home(), &b).unwrap().id;
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+
+    let out = up(&fx.home(), &id_a).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(learned_b.join("Build/Products/out").exists());
+    assert!(global_b.join("Build/Products/out").exists());
+
+    let out = up(&fx.home(), &id_b).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(!learned_b.exists() && !global_b.exists());
+}
+
+#[test]
+fn up_leaves_a_learned_root_inside_another_registered_tree() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let c = xcode_tree(&fx, "c");
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    register(&fx.home(), &c).unwrap();
+    // Built from A's project, but it lives in C.
+    let in_c = dd(&c, ".dd-a", Some(&a.join("App.xcodeproj")));
+    bale_core::derived_data::learn_root(&fx.home(), &in_c).unwrap();
+
+    up(&fx.home(), &id_a).unwrap();
+    assert!(in_c.join("Build/Products/out").exists());
+}

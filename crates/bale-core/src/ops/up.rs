@@ -321,6 +321,12 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
         ))))
     };
     let mut kept = Vec::new();
+    // A DerivedData folder belongs to the deepest registered tree holding
+    // its project, so `up` leaves those of a tree nested in this one.
+    #[cfg(target_os = "macos")]
+    let trees = crate::derived_data::registered_trees(home);
+    #[cfg(not(target_os = "macos"))]
+    let trees: Vec<PathBuf> = Vec::new();
     match record.level {
         Level::Cooling | Level::Cold => return skip(SkipCode::Cold, "cold"),
         Level::Opening => return skip(SkipCode::Opening, OPENING),
@@ -345,9 +351,9 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
             kept = real;
             // Xcode's build logs go with its DerivedData; record them first.
             #[allow(unused_mut)]
-            let mut built = crate::derived_data::all_for(&root, &dirs);
+            let mut built = crate::derived_data::all_for(&root, &dirs, &trees);
             #[cfg(target_os = "macos")]
-            built.extend(crate::derived_data::learned_for(home, &root));
+            built.extend(crate::derived_data::learned_for(home, &root, &trees));
             crate::trace::harvest(home, id, &built);
             let moves = trash_names(&dirs);
             record.trash = moves.iter().map(|(_, to)| to.clone()).collect();
@@ -370,9 +376,9 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
         let dd_root = crate::derived_data::global_root();
         let mut failures = dd_root
             .as_deref()
-            .map(|dd| remove_derived_data(&root, dd, ignore))
+            .map(|dd| remove_derived_data(&root, dd, &trees, ignore))
             .unwrap_or_default();
-        let (removed, learned_failures) = remove_learned(home, &root, ignore);
+        let (removed, learned_failures) = remove_learned(home, &root, &trees, ignore);
         failures.extend(learned_failures);
         // The tree's next build starts from a fresh folder, so link it now.
         if let Some(dd) = &dd_root {
@@ -689,10 +695,15 @@ fn idle(dir: &Path, ignore: &[u32]) -> Result<(), String> {
 /// and a message per root that a process holds or that could not be probed
 /// or removed. Their `dd-roots` lines stay; reap drops dead ones.
 #[cfg(target_os = "macos")]
-fn remove_learned(home: &BaleHome, root: &Path, ignore: &[u32]) -> (Vec<PathBuf>, Vec<String>) {
+fn remove_learned(
+    home: &BaleHome,
+    root: &Path,
+    trees: &[PathBuf],
+    ignore: &[u32],
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut removed = Vec::new();
     let mut failures = Vec::new();
-    for dir in crate::derived_data::learned_for(home, root) {
+    for dir in crate::derived_data::learned_for(home, root, trees) {
         if let Err(why) = idle(&dir, ignore) {
             failures.push(why);
             continue;
@@ -710,12 +721,17 @@ fn remove_learned(home: &BaleHome, root: &Path, ignore: &[u32]) -> (Vec<PathBuf>
 /// a process holds (such a folder is left alone). Missing `dd_root` is not a
 /// failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn remove_derived_data(root: &Path, dd_root: &Path, ignore: &[u32]) -> Vec<String> {
+fn remove_derived_data(
+    root: &Path,
+    dd_root: &Path,
+    trees: &[PathBuf],
+    ignore: &[u32],
+) -> Vec<String> {
     let mut failures = Vec::new();
     if !dd_root.is_dir() {
         return failures;
     }
-    for dir in crate::derived_data::derived_data_for(root, dd_root) {
+    for dir in crate::derived_data::owned_under(root, dd_root, trees) {
         if let Err(why) = idle(&dir, ignore) {
             failures.push(why);
             continue;
@@ -843,7 +859,7 @@ mod tests {
     #[test]
     fn missing_derived_data_root_is_not_a_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope"), &[]).is_empty());
+        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope"), &[], &[]).is_empty());
     }
 
     #[cfg(unix)]
@@ -867,7 +883,7 @@ mod tests {
         let locked = folder.join("Build/locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &[]);
+        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &[], &[]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("App-abc"), "{failures:?}");
