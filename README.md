@@ -102,8 +102,7 @@ in worktrees that already exist, run `bale migrate <repo>` to see the plan and `
 bale runs day to day on macOS. CI runs the tests on macOS, Linux and Windows; nothing has been run on
 Windows outside CI yet.
 
-Design: `docs/superpowers/specs/2026-10-27-bale-design.md`. Tool hooks:
-`docs/superpowers/specs/2026-10-28-bale-multi-tool-hooks-design.md`.
+How it works: `docs/architecture.md`. Working on bale: `AGENTS.md`.
 
 ## Install and uninstall
 

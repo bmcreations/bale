@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, existing `bale-core` / `bale-hooks` / `bale-cli` crates, `zstd-safe` (new), `sha2`, `walkdir`, `serde_json`.
 
-**Spec:** `docs/code-vm-design.md` (PR #5, branch `docs/code-vm-design`). Read its "Tiers", "Per-turn delta" and "Decisions" sections first.
+**Spec:** `docs/code-vm-design.md` (PR #5, branch `docs/code-vm-design`; since rewritten as `docs/architecture.md`, so read it at that PR). Read its "Tiers", "Per-turn delta" and "Decisions" sections first.
 
 ## Global Constraints
 
