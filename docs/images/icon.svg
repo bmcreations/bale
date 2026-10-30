@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="bale icon: a hay bale tied with two bands of twine">
+  <!-- Shadow -->
+  <ellipse cx="66" cy="112" rx="50" ry="6" fill="#000" opacity=".12"/>
+  <!-- Top face -->
+  <path d="M16,46 L42,26 L114,26 L88,46 Z" fill="#F6D77E" stroke="#F6D77E" stroke-width="6" stroke-linejoin="round"/>
+  <!-- Side face -->
+  <path d="M88,46 L114,26 L114,84 L88,104 Z" fill="#C9902B" stroke="#C9902B" stroke-width="6" stroke-linejoin="round"/>
+  <!-- Front face -->
+  <path d="M16,46 L88,46 L88,104 L16,104 Z" fill="#E8B13F" stroke="#E8B13F" stroke-width="6" stroke-linejoin="round"/>
+  <!-- Straw on the front -->
+  <g stroke="#B67D1F" stroke-width="2" stroke-linecap="round" opacity=".75">
+    <path d="M22,56 h10 M50,54 h8 M70,58 h12 M24,70 h8 M56,68 h10 M76,72 h6 M20,84 h12 M48,82 h8 M68,86 h12 M26,96 h8 M54,94 h10 M76,98 h6"/>
+  </g>
+  <!-- Straw on the top -->
+  <g stroke="#D9A94A" stroke-width="2" stroke-linecap="round" opacity=".8">
+    <path d="M34,40 h10 M62,34 h12 M90,32 h8 M50,42 h6 M78,40 h8"/>
+  </g>
+  <!-- Straw on the side -->
+  <g stroke="#9E6A17" stroke-width="2" stroke-linecap="round" opacity=".7">
+    <path d="M94,52 l8,-6 M100,64 l8,-6 M94,78 l8,-6 M102,86 l6,-5"/>
+  </g>
+  <!-- Twine bands -->
+  <g fill="none" stroke="#7A3E1D" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M38,104 L38,46 L64,26"/>
+    <path d="M66,104 L66,46 L92,26"/>
+  </g>
+</svg>

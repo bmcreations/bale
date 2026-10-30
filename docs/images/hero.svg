@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 260" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="bale: keep agent worktrees from filling your disk">
+  <style>
+    .bg { fill: #fff8e7; stroke: #f0dcae; }
+    .title { fill: #1f2328; }
+    .tag { fill: #4b5563; }
+    .chip { fill: #ffffff; stroke: #e8cf94; }
+    .chipt { fill: #6b4e16; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1c1708; stroke: #3d3214; }
+      .title { fill: #f0f3f6; }
+      .tag { fill: #b4bcc6; }
+      .chip { fill: #0d1117; stroke: #5a4716; }
+      .chipt { fill: #e3b341; }
+    }
+  </style>
+  <rect class="bg" x="1" y="1" width="898" height="258" rx="18"/>
+
+  <!-- Icon, as in docs/images/icon.svg, scaled -->
+  <g transform="translate(56,46) scale(1.35)">
+    <ellipse cx="66" cy="112" rx="50" ry="6" fill="#000" opacity=".12"/>
+    <path d="M16,46 L42,26 L114,26 L88,46 Z" fill="#F6D77E" stroke="#F6D77E" stroke-width="6" stroke-linejoin="round"/>
+    <path d="M88,46 L114,26 L114,84 L88,104 Z" fill="#C9902B" stroke="#C9902B" stroke-width="6" stroke-linejoin="round"/>
+    <path d="M16,46 L88,46 L88,104 L16,104 Z" fill="#E8B13F" stroke="#E8B13F" stroke-width="6" stroke-linejoin="round"/>
+    <g stroke="#B67D1F" stroke-width="2" stroke-linecap="round" opacity=".75">
+      <path d="M22,56 h10 M50,54 h8 M70,58 h12 M24,70 h8 M56,68 h10 M76,72 h6 M20,84 h12 M48,82 h8 M68,86 h12 M26,96 h8 M54,94 h10 M76,98 h6"/>
+    </g>
+    <g stroke="#D9A94A" stroke-width="2" stroke-linecap="round" opacity=".8">
+      <path d="M34,40 h10 M62,34 h12 M90,32 h8 M50,42 h6 M78,40 h8"/>
+    </g>
+    <g stroke="#9E6A17" stroke-width="2" stroke-linecap="round" opacity=".7">
+      <path d="M94,52 l8,-6 M100,64 l8,-6 M94,78 l8,-6 M102,86 l6,-5"/>
+    </g>
+    <g fill="none" stroke="#7A3E1D" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M38,104 L38,46 L64,26"/>
+      <path d="M66,104 L66,46 L92,26"/>
+    </g>
+  </g>
+
+  <text class="title" x="270" y="118" font-size="64" font-weight="800" letter-spacing="-1">bale</text>
+  <text class="tag" x="272" y="156" font-size="21">Keep agent worktrees from filling your disk.</text>
+
+  <rect class="chip" x="272" y="180" width="176" height="34" rx="17"/>
+  <text class="chipt" x="360" y="202" font-size="13.5" font-weight="600" text-anchor="middle">stash between prompts</text>
+  <rect class="chip" x="458" y="180" width="144" height="34" rx="17"/>
+  <text class="chipt" x="530" y="202" font-size="13.5" font-weight="600" text-anchor="middle">bale idle builds</text>
+  <rect class="chip" x="612" y="180" width="160" height="34" rx="17"/>
+  <text class="chipt" x="692" y="202" font-size="13.5" font-weight="600" text-anchor="middle">park old worktrees</text>
+</svg>
