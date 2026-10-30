@@ -138,7 +138,7 @@ fn clones_work(fx: &Fixture) -> bool {
 #[cfg(unix)]
 #[test]
 fn adopt_then_place_round_trips() {
-    use bale_core::clones::store::CloneStore;
+    use bale_core::clones::store::{Adopted, CloneStore};
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, UNIX_EPOCH};
     let fx = Fixture::new();
@@ -151,9 +151,15 @@ fn adopt_then_place_round_trips() {
     let store = CloneStore::open(&fx.home()).unwrap();
     let key = Key::Git("ab".to_string() + &"c".repeat(38));
     assert!(!store.has(&key));
-    assert!(store.adopt(&key, &src).unwrap());
+    assert_eq!(
+        store.adopt(&key, &src, || Ok(true)).unwrap(),
+        Adopted::Stored
+    );
     assert!(store.has(&key));
-    assert!(!store.adopt(&key, &src).unwrap());
+    assert_eq!(
+        store.adopt(&key, &src, || Ok(true)).unwrap(),
+        Adopted::Present
+    );
     assert!(store
         .path(&key)
         .ends_with(format!("git/ab/ab{}", "c".repeat(38))));
@@ -186,7 +192,7 @@ fn place_over_existing_file_leaves_no_temp() {
     std::fs::write(&src, &data).unwrap();
     let store = CloneStore::open(&fx.home()).unwrap();
     let key = Key::Lfs("de".to_string() + &"f".repeat(62));
-    store.adopt(&key, &src).unwrap();
+    store.adopt(&key, &src, || Ok(true)).unwrap();
     assert!(store
         .path(&key)
         .ends_with(format!("lfs/de/{}", "de".to_string() + &"f".repeat(62))));
@@ -201,6 +207,56 @@ fn place_over_existing_file_leaves_no_temp() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".bale-share"))
         .collect();
     assert!(leftovers.is_empty());
+}
+
+/// A source that changes during the clone is never published, and its temp
+/// copy is removed.
+#[cfg(unix)]
+#[test]
+fn adopt_drops_a_copy_whose_source_changed() {
+    use bale_core::clones::store::{Adopted, CloneStore};
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let src = fx.repo.join("src.bin");
+    std::fs::write(&src, big(1 << 20, 14)).unwrap();
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let key = Key::Git("12".repeat(20));
+    let r = store
+        .adopt(&key, &src, || {
+            std::fs::write(&src, big(1 << 20, 15))?;
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(r, Adopted::Changed);
+    assert!(!store.has(&key));
+    assert_eq!(store_files(&fx.home()), 0);
+}
+
+/// The temp copy gets the time of the clone, not the source's mtime, so gc's
+/// grace covers a fresh store file.
+#[cfg(unix)]
+#[test]
+fn adopt_gives_the_store_file_a_fresh_mtime() {
+    use bale_core::clones::store::CloneStore;
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let src = fx.repo.join("src.bin");
+    std::fs::write(&src, big(1 << 20, 16)).unwrap();
+    age_file(&src, HOUR2);
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let key = Key::Git("34".repeat(20));
+    store.adopt(&key, &src, || Ok(true)).unwrap();
+    let age = std::fs::metadata(store.path(&key))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .elapsed()
+        .unwrap_or_default();
+    assert!(age < std::time::Duration::from_secs(600), "{age:?}");
 }
 
 /// Commits a 2 MiB `big.bin` (mode `0o755` when `exec`), sets

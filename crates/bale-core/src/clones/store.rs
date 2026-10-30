@@ -11,6 +11,17 @@ use std::time::SystemTime;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// What [`CloneStore::adopt`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adopted {
+    /// This call added the file to the store.
+    Stored,
+    /// The key was already stored.
+    Present,
+    /// The source changed during the clone; nothing was stored.
+    Changed,
+}
+
 pub struct CloneStore {
     root: PathBuf,
 }
@@ -73,12 +84,19 @@ impl CloneStore {
         self.path(key).is_file()
     }
 
-    /// Clones `from`, which the caller has verified matches `key`, into the store.
-    /// `Ok(false)` when the key is already stored.
-    pub fn adopt(&self, key: &Key, from: &Path) -> io::Result<bool> {
+    /// Clones `from`, which the caller has verified matches `key`, into the
+    /// store. `unchanged` runs after the clone and before the copy is
+    /// published; it returns whether `from` is still the file that was
+    /// verified, and when it isn't the copy is dropped unseen.
+    pub fn adopt(
+        &self,
+        key: &Key,
+        from: &Path,
+        unchanged: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Adopted> {
         let dest = self.path(key);
         if dest.is_file() {
-            return Ok(false);
+            return Ok(Adopted::Present);
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -86,11 +104,16 @@ impl CloneStore {
         let tmp = temp_name(&dest);
         clone_file(from, &tmp)?;
         let _guard = TempGuard(&tmp, true);
+        // A clone keeps the source's mtime; gc's grace counts from now.
+        std::fs::File::open(&tmp)?.set_modified(SystemTime::now())?;
+        if !unchanged()? {
+            return Ok(Adopted::Changed);
+        }
         set_mode(&tmp, 0o444)?;
         // A hard link never replaces an existing name, unlike rename.
         match std::fs::hard_link(&tmp, &dest) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Ok(()) => Ok(Adopted::Stored),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Adopted::Present),
             Err(e) => Err(e),
         }
     }

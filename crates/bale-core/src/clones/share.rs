@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use anyhow::{bail, Context, Result};
 
 use super::reflink::same_volume;
-use super::store::CloneStore;
+use super::store::{Adopted, CloneStore};
 use super::tracked::candidates;
 use super::{Candidate, Key};
 use crate::busy::busy_holders;
@@ -269,42 +269,24 @@ fn place_one(store: &CloneStore, c: &Candidate, dst: &Path, verified: &Seen) -> 
         _ => {}
     }
     let stored = if store.has(&c.key) {
-        if seen(dst)?.as_ref() != Some(verified) {
-            return Ok(Placed::Changed);
-        }
         false
     } else {
-        match adopt_one(store, c, dst, verified)? {
-            Some(stored) => stored,
-            None => return Ok(Placed::Changed),
+        match store.adopt(&c.key, dst, || unchanged(dst, verified))? {
+            Adopted::Stored => true,
+            Adopted::Present => false,
+            Adopted::Changed => return Ok(Placed::Changed),
         }
     };
+    if !unchanged(dst, verified)? {
+        return Ok(Placed::Changed);
+    }
     store.place(&c.key, dst, verified.mode, Some(verified.mtime))?;
     Ok(Placed::Done { stored })
 }
 
-/// Adds the verified file `dst` to the store under `c.key`. Returns whether
-/// this call stored it, or `None` when the file changed after it was
-/// verified (a copy stored with the wrong bytes is dropped).
-fn adopt_one(
-    store: &CloneStore,
-    c: &Candidate,
-    dst: &Path,
-    verified: &Seen,
-) -> io::Result<Option<bool>> {
-    if seen(dst)?.as_ref() != Some(verified) {
-        return Ok(None);
-    }
-    let stored = store.adopt(&c.key, dst)?;
-    if seen(dst)?.as_ref() != Some(verified) {
-        // Written while being adopted: the stored copy may hold the new
-        // bytes under the old key. Drop it unless it still matches.
-        if stored && !matches_key(dst.parent().unwrap_or(dst), &store.path(&c.key), &c.key)? {
-            std::fs::remove_file(store.path(&c.key))?;
-        }
-        return Ok(None);
-    }
-    Ok(Some(stored))
+/// Whether `path` is still the file that was verified.
+fn unchanged(path: &Path, verified: &Seen) -> io::Result<bool> {
+    Ok(seen(path)?.as_ref() == Some(verified))
 }
 
 /// Fills the index and files of `tree`, a worktree just added with
@@ -383,7 +365,8 @@ pub(crate) fn materialize(home: &BaleHome, tree: &Path, cfg: &Config) -> Result<
             // Adopting is for later trees; this one is complete without it.
             if let Ok(matched) = verify(tree, fresh, &mut report) {
                 for (c, s) in matched {
-                    match adopt_one(&store, &c, &tree.join(&c.path), &s) {
+                    let path = tree.join(&c.path);
+                    match store.adopt(&c.key, &path, || unchanged(&path, &s)) {
                         Err(e) if e.kind() == io::ErrorKind::Unsupported => break,
                         _ => {}
                     }
@@ -401,23 +384,4 @@ fn sharing_store(home: &BaleHome, tree: &Path) -> Option<CloneStore> {
         .ok()
         .filter(|&same| same)
         .map(|_| store)
-}
-
-/// Whether the file at `path` holds the bytes `key` names. `dir` is any
-/// directory of the repo, for git to run in.
-fn matches_key(dir: &Path, path: &Path, key: &Key) -> io::Result<bool> {
-    let actual = match key {
-        Key::Git(_) => {
-            let p = path
-                .to_str()
-                .ok_or_else(|| io::Error::other("non-UTF-8 path"))?;
-            Git::at(dir)
-                .run(&["hash-object", "--no-filters", "--", p])
-                .map_err(io::Error::other)?
-        }
-        Key::Lfs(_) => sha256_file(path).map_err(io::Error::other)?,
-    };
-    Ok(match key {
-        Key::Git(k) | Key::Lfs(k) => actual.trim() == k,
-    })
 }
