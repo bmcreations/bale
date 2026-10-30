@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::clones::share::materialize;
-use crate::config::load_config;
+use crate::config::{load_config, Config};
 use crate::git::{self, Git};
 use crate::ops::up::register_untraced;
 use crate::registry::{workspace_id, Record, Registry};
@@ -35,7 +35,7 @@ fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) 
     if branch.starts_with('-') {
         bail!("branch {branch:?} must not start with '-'");
     }
-    let (main, root) = workspace_root(home, repo)?;
+    let (main, root, cfg) = workspace_root(home, repo)?;
     let path = root.join(name);
 
     if fs::symlink_metadata(&path).is_ok() {
@@ -54,19 +54,38 @@ fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) 
 
     let g = Git::at(&main);
     let p = path.to_string_lossy();
-    let added = branch_exists(&g, branch).and_then(|exists| {
-        if exists {
-            g.run(&["worktree", "add", "--no-checkout", "--", &p, branch])
-        } else {
-            g.run(&["worktree", "add", "--no-checkout", "-b", branch, "--", &p])
+    // A sparse checkout is left to git: `read-tree HEAD` would write every
+    // path. Without sharing there is nothing to gain from filling it here.
+    let fill = cfg.share_checkouts && !sparse_checkout(&g)?;
+    let filled = branch_exists(&g, branch).and_then(|exists| {
+        let mut args = vec!["worktree", "add"];
+        if fill {
+            args.push("--no-checkout");
         }
-    });
-    let filled = added.and_then(|_| {
-        let cfg = load_config(home, Some(&main))?;
+        if !exists {
+            args.extend(["-b", branch]);
+        }
+        args.extend(["--", &p]);
+        if exists {
+            args.push(branch);
+        }
+        g.run(&args)?;
+        if !fill {
+            return Ok(());
+        }
         materialize(home, &path, &cfg).inspect_err(|_| {
-            // The tree is new and holds no user changes yet.
+            // The tree and, when made here, its branch are new and hold no
+            // user changes yet.
             let _ = g.run(&["worktree", "remove", "--force", "--", &p]);
-        })
+            if !exists {
+                let _ = g.run(&["branch", "-D", "--", branch]);
+            }
+        })?;
+        // `--no-checkout` skips the hook git runs after a checkout.
+        if let Err(e) = post_checkout(&path) {
+            eprintln!("bale: post-checkout hook in {}: {e:#}", path.display());
+        }
+        Ok(())
     });
     if let Err(e) = filled {
         // Undo only the dirs made above; remove_dir leaves any non-empty one.
@@ -86,15 +105,15 @@ pub fn workspace_path(home: &BaleHome, repo: &Path, name: &str) -> Result<PathBu
     Ok(workspace_root(home, repo)?.1.join(name))
 }
 
-/// The main checkout and the dir new worktrees of it go in.
-fn workspace_root(home: &BaleHome, repo: &Path) -> Result<(PathBuf, PathBuf)> {
+/// The main checkout, the dir new worktrees of it go in, and its config.
+fn workspace_root(home: &BaleHome, repo: &Path) -> Result<(PathBuf, PathBuf, Config)> {
     let main = main_checkout(repo)?;
     let repo_name = main
         .file_name()
         .with_context(|| format!("{} has no directory name", main.display()))?
         .to_os_string();
     let cfg = load_config(home, Some(&main))?;
-    let root = match cfg.worktree_root {
+    let root = match &cfg.worktree_root {
         // A relative root is relative to the main checkout, never the cwd.
         Some(r) => main.join(r).join(&repo_name),
         None => {
@@ -105,7 +124,41 @@ fn workspace_root(home: &BaleHome, repo: &Path) -> Result<(PathBuf, PathBuf)> {
                 .join(dir)
         }
     };
-    Ok((main, root))
+    Ok((main, root, cfg))
+}
+
+/// Whether `core.sparseCheckout` is on, in any of git's bool spellings.
+fn sparse_checkout(g: &Git) -> Result<bool> {
+    let v = g.run(&[
+        "config",
+        "--bool",
+        "--default",
+        "false",
+        "--get",
+        "core.sparseCheckout",
+    ])?;
+    Ok(v.trim() == "true")
+}
+
+/// Runs the repo's post-checkout hook in `tree` as git would after checking
+/// out a new worktree: null old head, the new head, branch checkout.
+fn post_checkout(tree: &Path) -> Result<()> {
+    let g = Git::at(tree);
+    let head = g.run(&["rev-parse", "HEAD"])?;
+    let head = head.trim();
+    // As long as the oid: SHA-1 and SHA-256 repos differ.
+    let null = "0".repeat(head.len());
+    g.run(&[
+        "hook",
+        "run",
+        "--ignore-missing",
+        "post-checkout",
+        "--",
+        &null,
+        head,
+        "1",
+    ])?;
+    Ok(())
 }
 
 /// Accepts only a single plain path component (no `.`, `..`, separator or

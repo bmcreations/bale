@@ -693,7 +693,48 @@ fn new_without_clones_checks_out_normally() {
         let rec = new_workspace(&fx.home(), &fx.repo, name, None).unwrap();
         assert_checked_out(&rec.path, &data);
     }
-    assert!(store_files(&fx).is_empty());
+    // The old path: plain `worktree add`, the store never opened.
+    assert!(!fx.home().clones_dir().exists());
+}
+
+#[test]
+fn new_keeps_a_sparse_checkout_sparse() {
+    let fx = Fixture::new();
+    for d in ["a", "b"] {
+        fs::create_dir_all(fx.repo.join(d)).unwrap();
+        fs::write(fx.repo.join(d).join("x"), d).unwrap();
+    }
+    git(&fx.repo, &["add", "."]);
+    git(&fx.repo, &["commit", "-m", "dirs"]);
+    git(&fx.repo, &["sparse-checkout", "set", "a"]);
+
+    let rec = new_workspace(&fx.home(), &fx.repo, "w", None).unwrap();
+    assert_eq!(fs::read(rec.path.join("a/x")).unwrap(), b"a");
+    assert!(!rec.path.join("b").exists());
+    assert_eq!(git(&rec.path, &["status", "--porcelain"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn new_runs_the_post_checkout_hook_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let hook = fx.repo.join(".git/hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho \"$1 $3\" >> \"$(git rev-parse --show-toplevel)/../hook-ran\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rec = new_workspace(&fx.home(), &fx.repo, "w", None).unwrap();
+    let ran = fs::read_to_string(rec.path.parent().unwrap().join("hook-ran")).unwrap();
+    assert_eq!(ran.lines().count(), 1, "{ran:?}");
+    assert!(
+        ran.ends_with(" 1\n") && ran.starts_with("0000000"),
+        "{ran:?}"
+    );
 }
 
 #[test]
@@ -711,6 +752,7 @@ fn new_removes_worktree_when_checkout_fails() {
     assert!(new_workspace(&fx.home(), &fx.repo, "w", None).is_err());
     assert!(!default_root(&fx).exists());
     assert_eq!(worktrees(&fx.repo).unwrap().len(), 1);
+    assert_eq!(git(&fx.repo, &["branch", "--list", "w"]), "");
 }
 
 #[test]
