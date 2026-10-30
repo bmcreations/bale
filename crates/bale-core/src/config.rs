@@ -10,6 +10,7 @@ const DEFAULT_IDLE_STASH_MINUTES: u64 = 10;
 const DEFAULT_REAP_GRACE_MINUTES: u64 = 60;
 const DEFAULT_STASH_MIN_BYTES: u64 = 1 << 20;
 const DEFAULT_PATCH_MAX_DEPTH: u32 = 4;
+const DEFAULT_CLONE_MIN_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -23,6 +24,10 @@ pub struct Config {
     pub share_swift_packages: bool,
     pub stash_min_bytes: u64,
     pub patch_max_depth: u32,
+    /// Share large tracked files between worktrees through file clones.
+    pub share_checkouts: bool,
+    /// Tracked files this size or larger are shared.
+    pub clone_min_bytes: u64,
     pub regenerable_extra: Vec<String>,
     pub ignored_denylist_extra: Vec<String>,
     pub worktree_root: Option<PathBuf>,
@@ -38,6 +43,8 @@ struct RawConfig {
     share_swift_packages: Option<bool>,
     stash_min_bytes: Option<u64>,
     patch_max_depth: Option<u32>,
+    share_checkouts: Option<bool>,
+    clone_min_bytes: Option<u64>,
     regenerable: Option<Vec<String>>,
     ignored_denylist: Option<Vec<String>>,
     worktree_root: Option<PathBuf>,
@@ -90,6 +97,14 @@ pub fn load_config(home: &BaleHome, repo_root: Option<&Path>) -> Result<Config> 
             .patch_max_depth
             .or(machine.patch_max_depth)
             .unwrap_or(DEFAULT_PATCH_MAX_DEPTH),
+        share_checkouts: repo
+            .share_checkouts
+            .or(machine.share_checkouts)
+            .unwrap_or(true),
+        clone_min_bytes: repo
+            .clone_min_bytes
+            .or(machine.clone_min_bytes)
+            .unwrap_or(DEFAULT_CLONE_MIN_BYTES),
         regenerable_extra: repo.regenerable.or(machine.regenerable).unwrap_or_default(),
         ignored_denylist_extra: repo
             .ignored_denylist

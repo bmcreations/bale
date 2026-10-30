@@ -166,6 +166,7 @@ fn sweep_traced(
     rows.reserve(records.len());
     let mut builds = Vec::new();
     let mut paths = Vec::new();
+    let mut ids = Vec::new();
     for ((stem, record), m) in records.into_iter().zip(measured) {
         match record {
             Ok(record) => {
@@ -173,6 +174,7 @@ fn sweep_traced(
                 trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
+                ids.push(record.id.clone());
                 rows.push((record.id, action, result));
             }
             Err(e) => {
@@ -182,6 +184,21 @@ fn sweep_traced(
             }
         }
     }
+    let mut current: Vec<Record> = Vec::new();
+    {
+        let reg = Registry::open(home.clone());
+        for id in &ids {
+            match reg.get(id) {
+                Ok(Some(r)) => current.push(r),
+                Ok(None) => {}
+                Err(e) => {
+                    let text = format!("error: {e:#}");
+                    rows.push((id.clone(), Action::Report("share".into()), text));
+                }
+            }
+        }
+    }
+    rows.extend(share_rows(home, &current, dry_run));
     #[cfg(target_os = "macos")]
     {
         learn_build_dirs(home, build_dirs);
@@ -210,6 +227,53 @@ fn sweep_traced(
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
     Ok(rows)
+}
+
+/// Shares the large tracked files of each idle (`Baled`, unpinned) tree whose
+/// live `HEAD` is not the one it was last shared at. One `share` row each; on
+/// `dry_run` nothing is shared. An error becomes the row's text. A tree that
+/// had nothing to share, or that was skipped as "disabled", "other volume" or
+/// "clones unsupported", gets no row.
+fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String, Action, String)> {
+    let mut rows = Vec::new();
+    for r in records {
+        // A missing tree is already reported by its own sweep row.
+        if r.level != Level::Baled || r.pinned || !r.path.exists() {
+            continue;
+        }
+        // The record's `head` is refreshed only by register, so ask git. A
+        // tree git can't read falls through to `share`, which reports why.
+        let head = crate::git::Git::at(&r.path).run(&["rev-parse", "HEAD"]);
+        if matches!((&head, &r.shared_head), (Ok(h), Some(s)) if h.trim() == s) {
+            continue;
+        }
+        let text = if dry_run {
+            "dry run, not applied".to_string()
+        } else {
+            match crate::clones::share::share(home, &r.id) {
+                Ok(report)
+                    if matches!(
+                        report.reason.as_deref(),
+                        Some("disabled" | "other volume" | "clones unsupported")
+                    ) =>
+                {
+                    continue
+                }
+                // A pass that found nothing to share is not worth a row.
+                Ok(report)
+                    if report.files == 0
+                        && report.reason.is_none()
+                        && report.skipped.is_empty() =>
+                {
+                    continue
+                }
+                Ok(report) => report.summary(),
+                Err(e) => format!("error: {e:#}"),
+            }
+        };
+        rows.push((r.id.clone(), Action::Report("share".into()), text));
+    }
+    rows
 }
 
 /// Listing one repository's worktrees longer than this is given up on, and
@@ -832,6 +896,8 @@ mod tests {
             share_swift_packages: true,
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
+            share_checkouts: true,
+            clone_min_bytes: 1 << 20,
             regenerable_extra: Vec::new(),
             ignored_denylist_extra: Vec::new(),
             worktree_root: None,

@@ -52,6 +52,14 @@ enum Command {
         #[arg(long = "ignore-pid", value_name = "PID")]
         ignore_pid: Vec<u32>,
     },
+    /// Replace a worktree's large tracked files with clones of one shared copy.
+    Share {
+        /// Worktree path or workspace id.
+        target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
+    },
     /// Refill a worktree's stashed files from the store.
     Unstash {
         /// Worktree path or workspace id.
@@ -315,6 +323,12 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
             .and_then(|id| stash(&home, &id, &ignore_pid))
             .map(|outcome| {
                 println!("{}", stash_line(&outcome));
+                ExitCode::SUCCESS
+            }),
+        Command::Share { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| bale_core::clones::share::share_ignoring(&home, &id, &ignore_pid))
+            .map(|r| {
+                println!("{}", r.summary());
                 ExitCode::SUCCESS
             }),
         Command::Unstash {
@@ -628,6 +642,12 @@ fn gc_lines(report: &GcReport, dry_run: bool) -> Vec<(bool, String)> {
         lines.push((
             false,
             format!("store: {} bytes {would}freed", report.store_bytes_freed),
+        ));
+    }
+    if report.clones_bytes_freed > 0 {
+        lines.push((
+            false,
+            format!("clones: {} bytes {would}freed", report.clones_bytes_freed),
         ));
     }
     lines
@@ -1139,6 +1159,7 @@ mod tests {
             stash: None,
             restore_hook: false,
             spm: Vec::new(),
+            shared_head: None,
         };
         assert!(show_text(&r, None).contains("origin:   cursor\n"));
         r.origin = Some(origin("s1"));
@@ -1313,6 +1334,7 @@ mod tests {
             checks: vec![("d".into(), PathBuf::from("/w/.bale-check-d-a1B2c3"))],
             errors: vec![("c".into(), "boom\nmore".into())],
             store_bytes_freed: 2048,
+            clones_bytes_freed: 4096,
         };
         assert_eq!(
             gc_lines(&report, false),
@@ -1326,6 +1348,7 @@ mod tests {
                 ),
                 (true, "bale: c: boom more".to_string()),
                 (false, "store: 2048 bytes freed".to_string()),
+                (false, "clones: 4096 bytes freed".to_string()),
             ]
         );
         assert_eq!(gc_lines(&report, true)[0].1, "a: would be removed");

@@ -599,3 +599,195 @@ fn gc_keeps_saved_state_when_the_path_is_not_the_checkout() {
     assert_eq!(lock_reason(&fx, &wt), Some(LOCK_REASON.to_string()));
     assert!(registry(&fx).get(&id).unwrap().is_some());
 }
+
+fn clones_work(fx: &Fixture) -> bool {
+    let a = fx.repo.join("probe-src");
+    fs::write(&a, "x").unwrap();
+    let r = bale_core::clones::reflink::clone_file(&a, &fx.repo.join("probe-dst"));
+    let _ = fs::remove_file(&a);
+    let _ = fs::remove_file(fx.repo.join("probe-dst"));
+    !matches!(r, Err(e) if e.kind() == std::io::ErrorKind::Unsupported)
+}
+
+fn big(n: usize, seed: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn store_files(fx: &Fixture) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(fx.home().clones_dir())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect()
+}
+
+/// Commits a 2 MiB `big.bin` with mode 0o755 and writes `config` as the
+/// machine config. Returns the committed bytes.
+fn commit_big(fx: &Fixture, config: &str) -> Vec<u8> {
+    let data = big(2 << 20, 5);
+    let p = fx.repo.join("big.bin");
+    fs::write(&p, &data).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&fx.repo, &["add", "big.bin"]);
+    git(&fx.repo, &["commit", "-m", "big"]);
+    fs::create_dir_all(fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), config).unwrap();
+    data
+}
+
+fn assert_checked_out(tree: &Path, data: &[u8]) {
+    assert_eq!(fs::read(tree.join("big.bin")).unwrap(), data);
+    assert_eq!(fs::read(tree.join("f")).unwrap(), b"one\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(tree.join("big.bin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+    assert_eq!(git(tree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn new_places_stored_files() {
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let data = commit_big(&fx, "clone_min_bytes = 1024\n");
+    let a = new_workspace(&fx.home(), &fx.repo, "a", None).unwrap();
+    assert_checked_out(&a.path, &data);
+    // `a` checked big.bin out and adopted it.
+    let stored = store_files(&fx);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+
+    let b = new_workspace(&fx.home(), &fx.repo, "b", None).unwrap();
+    assert_checked_out(&b.path, &data);
+    assert_eq!(store_files(&fx), stored);
+    // Placed from the store: its own inode, the stored copy's mtime.
+    let in_b = fs::metadata(b.path.join("big.bin")).unwrap();
+    let in_store = fs::metadata(&stored[0]).unwrap();
+    assert_eq!(in_b.modified().unwrap(), in_store.modified().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(in_b.ino(), in_store.ino());
+    }
+    assert!(!b.path.join("big.bin.bale-share").exists());
+}
+
+#[test]
+fn new_without_clones_checks_out_normally() {
+    let fx = Fixture::new();
+    let data = commit_big(&fx, "share_checkouts = false\nclone_min_bytes = 1024\n");
+    for name in ["a", "b"] {
+        let rec = new_workspace(&fx.home(), &fx.repo, name, None).unwrap();
+        assert_checked_out(&rec.path, &data);
+    }
+    // The old path: plain `worktree add`, the store never opened.
+    assert!(!fx.home().clones_dir().exists());
+}
+
+#[test]
+fn new_keeps_a_sparse_checkout_sparse() {
+    let fx = Fixture::new();
+    for d in ["a", "b"] {
+        fs::create_dir_all(fx.repo.join(d)).unwrap();
+        fs::write(fx.repo.join(d).join("x"), d).unwrap();
+    }
+    git(&fx.repo, &["add", "."]);
+    git(&fx.repo, &["commit", "-m", "dirs"]);
+    git(&fx.repo, &["sparse-checkout", "set", "a"]);
+
+    let rec = new_workspace(&fx.home(), &fx.repo, "w", None).unwrap();
+    assert_eq!(fs::read(rec.path.join("a/x")).unwrap(), b"a");
+    assert!(!rec.path.join("b").exists());
+    assert_eq!(git(&rec.path, &["status", "--porcelain"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn new_runs_the_post_checkout_hook_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let hook = fx.repo.join(".git/hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho \"$1 $3\" >> \"$(git rev-parse --show-toplevel)/../hook-ran\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rec = new_workspace(&fx.home(), &fx.repo, "w", None).unwrap();
+    let ran = fs::read_to_string(rec.path.parent().unwrap().join("hook-ran")).unwrap();
+    assert_eq!(ran.lines().count(), 1, "{ran:?}");
+    assert!(
+        ran.ends_with(" 1\n") && ran.starts_with("0000000"),
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn new_removes_worktree_when_checkout_fails() {
+    let fx = Fixture::new();
+    // A required filter whose smudge always fails makes checkout-index fail.
+    git(&fx.repo, &["config", "filter.boom.clean", "cat"]);
+    git(&fx.repo, &["config", "filter.boom.smudge", "false"]);
+    git(&fx.repo, &["config", "filter.boom.required", "true"]);
+    fs::write(fx.repo.join(".gitattributes"), "*.dat filter=boom\n").unwrap();
+    fs::write(fx.repo.join("x.dat"), "x\n").unwrap();
+    git(&fx.repo, &["add", "."]);
+    git(&fx.repo, &["commit", "-m", "boom"]);
+
+    assert!(new_workspace(&fx.home(), &fx.repo, "w", None).is_err());
+    assert!(!default_root(&fx).exists());
+    assert_eq!(worktrees(&fx.repo).unwrap().len(), 1);
+    assert_eq!(git(&fx.repo, &["branch", "--list", "w"]), "");
+}
+
+#[test]
+fn new_places_stored_lfs_files() {
+    if std::process::Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    git(&fx.repo, &["lfs", "install", "--local"]);
+    git(&fx.repo, &["lfs", "track", "*.bin"]);
+    let data = big(2 << 20, 9);
+    fs::write(fx.repo.join("big.bin"), &data).unwrap();
+    git(&fx.repo, &["add", "."]);
+    git(&fx.repo, &["commit", "-m", "lfs"]);
+    fs::create_dir_all(fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "clone_min_bytes = 1024\n").unwrap();
+
+    let a = new_workspace(&fx.home(), &fx.repo, "a", None).unwrap();
+    assert_eq!(fs::read(a.path.join("big.bin")).unwrap(), data);
+    let stored = store_files(&fx);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!(stored[0].to_string_lossy().contains("lfs"));
+
+    let b = new_workspace(&fx.home(), &fx.repo, "b", None).unwrap();
+    assert_eq!(fs::read(b.path.join("big.bin")).unwrap(), data);
+    assert_eq!(git(&b.path, &["status", "--porcelain"]), "");
+    let in_b = fs::metadata(b.path.join("big.bin")).unwrap();
+    let in_store = fs::metadata(&stored[0]).unwrap();
+    assert_eq!(in_b.modified().unwrap(), in_store.modified().unwrap());
+}

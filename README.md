@@ -164,9 +164,10 @@ uses to ignore Conductor itself are a guess until then.
 | `bale up TARGET` | Removes a tree's regenerable build output in place. |
 | `bale cold TARGET` | Saves uncommitted work and ignored files, then deletes the checkout. |
 | `bale open TARGET` | Restores a cold tree at its path and removes the saved state. |
+| `bale share TARGET` | Replaces the tree's tracked files of 1 MiB or more with clones of one stored copy (APFS, and Linux filesystems with reflinks). |
 | `bale migrate REPO... [--apply]` | Shows the plan for adopting a repo's existing worktrees; `--apply` registers and bales them. |
 | `bale new NAME`, `bale adopt [PATH]` | Create and register a worktree, or register one that exists. |
-| `bale gc [--dry-run]` | Forgets trees that are gone and clears stale leftovers. |
+| `bale gc [--dry-run]` | Forgets trees that are gone, clears stale leftovers, and removes stored clone copies no tree uses. |
 
 `TARGET` is a worktree path or an id from `bale ls`. `bale show` and `bale pin` default to the current
 directory.
@@ -178,6 +179,8 @@ Codex and T3 Code trees record the tool as their origin with no session or title
 
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
+The sweep and `bale new` also share large tracked files between trees; set `share_checkouts = false` to turn
+that off, or `clone_min_bytes` to change the 1 MiB cut.
 The sweep's stash step only stashes trees where Claude Code's restore hook (`prompt` or `pre-tool`) has run, because no other tool restores stashed files; `bale stash` by hand works on any tree.
 On macOS the sweep also checks Claude Code's session scratchpads (`/tmp/claude-<uid>/<project>/<session>/scratchpad`) for Xcode DerivedData folders at most two levels deep, and deletes one once its project has been gone for an hour and no process holds it. Set `BALE_CLAUDE_TMP` to look under another folder instead of `/tmp`.
 `bale up` on macOS also removes the tree's `-derivedDataPath` folders that bale has learned (from a hook or a scratchpad) and that no process holds, then links each one back to the tree's shared Swift packages.

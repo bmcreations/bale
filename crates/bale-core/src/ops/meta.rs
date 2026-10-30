@@ -128,6 +128,7 @@ mod tests {
             stash: None,
             restore_hook: false,
             spm: Vec::new(),
+            shared_head: None,
         }
     }
 

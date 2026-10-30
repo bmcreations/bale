@@ -1,8 +1,9 @@
 //! Thin wrapper over the `git` binary: worktree listing, locking, status.
 
 use anyhow::{bail, Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::registry::Scope;
@@ -49,9 +50,9 @@ impl Git {
         self
     }
 
-    fn output(&self, args: &[&str]) -> Result<std::process::Output> {
-        Command::new("git")
-            .args(OVERRIDES.iter().flat_map(|o| ["-c", o]))
+    fn output(&self, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output> {
+        let mut cmd = Command::new("git");
+        cmd.args(OVERRIDES.iter().flat_map(|o| ["-c", o]))
             .args(args)
             .current_dir(&self.dir)
             .env("LC_ALL", "C")
@@ -61,20 +62,52 @@ impl Git {
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_COMMON_DIR")
-            .envs(self.envs.iter().map(|(k, v)| (k, v)))
-            .output()
-            .with_context(|| format!("failed to run git {}", args.join(" ")))
+            .envs(self.envs.iter().map(|(k, v)| (k, v)));
+        let ctx = || format!("failed to run git {}", args.join(" "));
+        let Some(input) = input else {
+            return cmd.output().with_context(ctx);
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().with_context(ctx)?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        // Feed stdin from a thread so a large input cannot deadlock against
+        // git filling its stdout pipe.
+        let out = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // A git that exits early closes the pipe; its status tells why.
+                let _ = stdin.write_all(input);
+            });
+            child.wait_with_output()
+        });
+        out.with_context(ctx)
     }
 
     /// Runs `git <args>` in the directory and returns stdout. Retries up to five
     /// times (100, 200, 400, 800, 1600 ms) when stderr reports a held
     /// `index.lock` or ref lock; any other failure returns immediately.
     pub fn run(&self, args: &[&str]) -> Result<String> {
+        self.run_with(args, None).map(lossy)
+    }
+
+    /// Like [`Git::run`], feeding `input` to git's stdin.
+    pub fn run_stdin(&self, args: &[&str], input: &[u8]) -> Result<String> {
+        self.run_with(args, Some(input)).map(lossy)
+    }
+
+    /// Like [`Git::run_stdin`], returning stdout unconverted (for
+    /// `cat-file --batch`, whose framing counts bytes).
+    pub fn run_stdin_bytes(&self, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+        self.run_with(args, Some(input))
+    }
+
+    fn run_with(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
         let mut attempt = 0;
         loop {
-            let out = self.output(args)?;
+            let out = self.output(args, input)?;
             if out.status.success() {
-                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+                return Ok(out.stdout);
             }
             let stderr = String::from_utf8_lossy(&out.stderr);
             let locked = stderr.contains("index.lock") || stderr.contains("cannot lock ref");
@@ -86,6 +119,10 @@ impl Git {
             return Err(GitError::new(args, &self.dir, &stderr).into());
         }
     }
+}
+
+fn lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// A git command that exited with failure.
@@ -193,7 +230,7 @@ pub fn admin_dir(dir: &Path) -> Result<PathBuf> {
 /// HEAD is detached.
 pub fn current_branch(dir: &Path) -> Result<Option<String>> {
     let args = ["symbolic-ref", "-q", "HEAD"];
-    let out = Git::at(dir).output(&args)?;
+    let out = Git::at(dir).output(&args, None)?;
     if out.status.code() == Some(1) && out.stderr.is_empty() {
         return Ok(None);
     }

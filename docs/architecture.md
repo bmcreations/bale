@@ -23,6 +23,8 @@ The main modules in `bale-core/src`:
 - `detect`: build-system markers, and which directories count as build output.
 - `derived_data`, `spm`, `spm_link`, `spm_lock`: Xcode DerivedData ownership and the shared Swift package folder.
 - `store`: the content-addressed store (`blob`, `codec`, `manifest`, `index`, `gc`).
+- `clones`: shared checkouts: file clones (`reflink`), the clone store (`store`), which tracked files can be
+  shared (`tracked`), `share` and `materialize` (`share`), and the store's `gc`.
 - `trace`, `history`: the usage trace and the `bale history` summary built from it.
 - `ops/*`: one module per operation: `up`, `stash`, `unstash`, `cold`, `open`, `sweep`, `gc`, `new`, `migrate`, `reap` and `spm_gc` (macOS), with helpers in `meta` and `disk`.
 
@@ -32,9 +34,10 @@ Everything lives under `BALE_HOME`, which defaults to `~/.bale`:
 
 | Path | Holds |
 |---|---|
-| `registry/<id>.json` | One record per worktree: path, repo, level, pin, origin, last activity, stash state. `<id>` is 12 hex characters. |
+| `registry/<id>.json` | One record per worktree: path, repo, level, pin, origin, last activity, stash state, the head it was last shared at. `<id>` is 12 hex characters. |
 | `locks/<id>.lock` | The tree's lock. |
 | `store/objects/`, `store/manifests/`, `store/index/` | Stashed file contents, one manifest per stash, and a stat index per tree. |
+| `clones/git/<hh>/<oid>`, `clones/lfs/<hh>/<sha256>` | One read-only copy of each large tracked file, shared by every repo. See "Shared checkouts". |
 | `<id>/` | A cold tree's saved uncommitted work and ignored files. |
 | `dd-roots` | DerivedData roots learned from `-derivedDataPath` and Claude scratchpads. |
 | `spm/<key>` | Shared Swift package checkouts. |
@@ -70,7 +73,7 @@ bump. `sweep::decide` (`crates/bale-core/src/ops/sweep.rs`) checks, in order:
 
 Pinned trees are never upped or colded. Defaults live at the top of `crates/bale-core/src/config.rs`:
 `idle_stash` 10 min, `idle_baled` 4 h, `idle_cold` 7 days, `reap_grace` 60 min, `stash_min_bytes` 1 MiB,
-`patch_max_depth` 4.
+`patch_max_depth` 4, `share_checkouts` on, `clone_min_bytes` 1 MiB.
 
 ## What counts as build output
 
@@ -134,6 +137,74 @@ duplicate under `Build/Products/` is cloned from its restored twin instead of de
 `bale gc`, not the sweep, forgets records whose path is gone. It also deletes blobs, manifests and indexes
 no record reaches, once they are over an hour old.
 
+## Shared checkouts
+
+Tracked files of `clone_min_bytes` or more are kept once in `BALE_HOME/clones/`, and each tree's copy is a
+clone of the stored file: `clonefile` on macOS, the `FICLONE` ioctl on Linux. A clone shares the stored
+file's blocks until one of them is written, so editing a tree's copy changes only that tree. The code is in
+`crates/bale-core/src/clones/`.
+
+A store file is named by its git blob oid (`git/<hh>/<oid>`), or for a Git LFS file by the SHA-256 in its
+pointer (`lfs/<hh>/<sha256>`). An oid names the same bytes in any repo, so one store serves them all. Adding
+a file clones it to a temp name in the store and sets the copy's mtime to now. It then checks that the
+source file's size, mtime, mode, inode and ctime still match what was hashed; if they don't, it removes the
+copy and neither stores nor replaces the file. Otherwise it sets mode `0o444` and hard-links the copy to its
+final name, so a store file is written once and never replaced; `AlreadyExists` means another tree stored it
+first.
+
+`tracked::candidates` reads the index. A candidate is a stage-0 entry with mode `100644` or `100755` and a
+blob of at least `clone_min_bytes`. A path whose `filter` attribute is `lfs` and whose blob parses as an LFS
+pointer is keyed by the pointer's SHA-256, and the pointer's size is what counts against the cut. Git could
+convert the bytes of anything else on checkout, so these are skipped: a path with any other `filter`, a path
+with a `text`, `eol`, `ident` or `working-tree-encoding` attribute set, and the whole tree when
+`core.autocrlf` is `true` or `input`.
+
+A working file is replaced only when its bytes match its key: `git hash-object --no-filters` gives the
+index oid, or for LFS the file's SHA-256 is the pointer's. A modified file is left alone. Replacing clones the
+store file to `<file>.bale-share`, sets the original mode and nanosecond mtime, and renames it over the
+file; a `<file>.bale-share` left by a crashed run is removed first. `git update-index --refresh` then
+updates the index's stat data, so `git status` doesn't hash the new inodes again.
+
+The store and the tree must be on the same volume (`st_dev`), because a clone can't cross volumes. Before
+hashing anything, sharing clones a tiny probe file inside `clones/` and removes it. On another volume, on a
+filesystem without clones and on Windows, sharing does nothing and says why rather than failing.
+
+Files get shared in three places:
+
+- `bale share TARGET [--ignore-pid PID]` takes the tree's lock without waiting, skips a busy tree, and
+  prints `shared N files (X MiB), stored M` or `skipped: <reason>` (`locked`, `busy`, `disabled`,
+  `other volume`, `clones unsupported`), followed by `, N errors` when files were left alone for an io
+  error. When every file was shared or left alone as modified or missing, it sets the record's
+  `shared_head` to the `HEAD` it read under the lock.
+- `bale new`, and so the `WorktreeCreate` hook, runs `git worktree add --no-checkout` on macOS and Linux
+  and then fills the tree itself: `read-tree HEAD`, a clone for each candidate already in the store, `git checkout-index` for
+  every other index path, `update-index --refresh`, and last it verifies the large files git wrote and adds
+  them to the store for the next tree. `--no-checkout` skips git's `post-checkout` hook, so bale runs it
+  with `git hook run`; a failing hook is reported and the tree is kept. If filling the tree fails, bale
+  removes the new tree, and removes the branch only if `bale new` created it. With `share_checkouts` off,
+  with `core.sparseCheckout` on in the repo, or on another OS, `bale new` runs a plain `git worktree add`
+  instead.
+- The sweep shares trees that are baled, unpinned and whose `HEAD`, read with `git rev-parse HEAD`, is not
+  their `shared_head`. A hot tree is left alone: a baled tree rebuilds from scratch anyway, and whether a
+  build tool rebuilds when a source file gets a new inode is untested. It emits a `share` row only when it
+  shared or skipped something. A tree with nothing to share, or skipped as `disabled`, `other volume` or
+  `clones unsupported`, gets no row.
+
+`bale gc` builds the live set from the candidates of every record whose path exists; a cold tree adds
+nothing. It removes a store file outside that set, or a temp file from an interrupted add, only once its
+mtime is over an hour old; adding a file sets that mtime, so a file added in the last hour is kept. If a
+record can't be read or a tree's candidates can't be listed, it removes nothing. The
+`clones: N bytes freed` it prints is the files' logical size. A store file can still share blocks with a
+tree's copy, so the space actually freed can be lower.
+
+`share_checkouts` and `clone_min_bytes` are read from `config.toml` and a repo's `.bale.toml`. `bale new`
+reads the main checkout's `.bale.toml`, since the new tree has no files yet; `bale share`, the sweep and
+`bale gc` read the tree's own.
+
+On the Android repo, where 117 files of 1 MiB or more hold 943 MiB, `bale share` freed about 940 MiB per
+tree once the store held them, and a `bale new` tree took 62 MiB where `git worktree add` took 1,002 MiB
+([bench](bench/2026-10-shared-checkout.md#after-implementation)).
+
 ## The sweep
 
 `bale sweep` runs from the schedule: every 5 min on macOS, every 30 min on Linux and Windows. In order:
@@ -143,9 +214,10 @@ no record reaches, once they are over an hour old.
 3. macOS: seed the shared Swift package folder and drop stubs whose trees are gone.
 4. Index shared DerivedData and measure each tree, in parallel (8 threads, 120 s limit).
 5. For each record: decide, then `up`, `cold` or `stash`. Each writes a trace line.
-6. macOS: learn DerivedData roots from Claude scratchpads, reap DerivedData whose project is gone, and
+6. Share the large tracked files of baled, unpinned trees whose `HEAD` moved since their last share.
+7. macOS: learn DerivedData roots from Claude scratchpads, reap DerivedData whose project is gone, and
    delete unused shared Swift packages.
-7. Write the sweep's trace line and prune old trace files.
+8. Write the sweep's trace line and prune old trace files.
 
 There is no global sweep lock. Each operation takes the tree's lock without waiting and skips a locked tree,
 so a hook always wins over the sweep, and two sweeps never work on the same tree at once.
@@ -159,7 +231,7 @@ nothing in it changed within `reap_grace`.
 ## Not built
 
 This file replaces the "Code VM" design (`git log -- docs/code-vm-design.md`), which planned more than
-shipped. Not built: a shared per-repo base that new trees clone from, reflinked or mounted trees,
-`bale wait`/`bale resume`, and a policy for which of a turn's changes to keep. Cold deletes the checkout
-rather than mounting it from the store, and the prompt hook restores in the background rather than
+shipped. Not built: a shared per-repo base that new trees clone from (only large tracked files are
+cloned), mounted trees, `bale wait`/`bale resume`, and a policy for which of a turn's changes to keep.
+Cold deletes the checkout rather than mounting it from the store, and the prompt hook restores in the background rather than
 blocking.

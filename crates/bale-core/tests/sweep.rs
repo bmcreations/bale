@@ -509,6 +509,8 @@ mod warm {
             share_swift_packages: true,
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
+            share_checkouts: true,
+            clone_min_bytes: 1 << 20,
             regenerable_extra: Vec::new(),
             ignored_denylist_extra: Vec::new(),
             worktree_root: None,
@@ -821,4 +823,136 @@ mod warm {
         assert!(trees[0]["reason"].is_string(), "{trees:?}");
         assert!(trace_lines(&fx.home(), "stash").is_empty());
     }
+}
+
+/// Commits a 2 MiB `big.bin`, lowers `clone_min_bytes`, and returns a baled worktree's id.
+fn baled_big(fx: &Fixture, name: &str) -> (PathBuf, String) {
+    fs::write(
+        fx.repo.join("big.bin"),
+        (0..2usize << 20).map(|i| i as u8).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    git(&fx.repo, &["add", "big.bin"]);
+    git(&fx.repo, &["commit", "-m", "big"]);
+    global_config(&fx.home(), "clone_min_bytes = 1024\n");
+    let wt = fx.add_worktree(name, name);
+    let id = register(&fx.home(), &wt).unwrap().id;
+    set_level(fx, &id, Level::Baled);
+    (wt, id)
+}
+
+fn share_row<'a>(
+    rows: &'a [(String, Action, String)],
+    id: &str,
+) -> Option<&'a (String, Action, String)> {
+    rows.iter()
+        .find(|r| r.0 == id && r.1 == Action::Report("share".into()))
+}
+
+fn clones_work(fx: &Fixture) -> bool {
+    let a = fx.repo.join("probe-src");
+    fs::write(&a, b"x").unwrap();
+    let r = bale_core::clones::reflink::clone_file(&a, &fx.repo.join("probe-dst"));
+    let _ = fs::remove_file(&a);
+    let _ = fs::remove_file(fx.repo.join("probe-dst"));
+    !matches!(r, Err(e) if e.kind() == std::io::ErrorKind::Unsupported)
+}
+
+#[test]
+fn sweep_shares_baled_tree_once() {
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let (_wt, id) = baled_big(&fx, "w1");
+    let rows = sweep(&fx.home(), false).unwrap();
+    let r = share_row(&rows, &id).unwrap_or_else(|| panic!("no share row: {rows:?}"));
+    assert!(r.2.starts_with("shared 1 files"), "{r:?}");
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.shared_head.as_deref(), Some(rec.head.as_str()));
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_none(), "{rows:?}");
+}
+
+/// A commit moves `HEAD` without touching the record's `head`; the next
+/// sweep shares the tree again.
+#[test]
+fn sweep_shares_again_after_head_moves() {
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let (wt, id) = baled_big(&fx, "w1");
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_some(), "{rows:?}");
+
+    fs::write(
+        wt.join("more.bin"),
+        (0..2usize << 20)
+            .map(|i| (i as u8) ^ 0x5a)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    git(&wt, &["add", "more.bin"]);
+    git(&wt, &["commit", "-m", "more"]);
+    let head = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let r = share_row(&rows, &id).unwrap_or_else(|| panic!("no share row: {rows:?}"));
+    assert!(r.2.starts_with("shared "), "{r:?}");
+    assert!(r.2.ends_with("stored 1"), "{r:?}");
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.shared_head.as_deref(), Some(head.as_str()));
+    assert_ne!(rec.head, head);
+}
+
+#[test]
+fn sweep_does_not_share_hot_tree() {
+    let fx = Fixture::new();
+    let (wt, id) = baled_big(&fx, "w1");
+    set_level(&fx, &id, Level::Hot);
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(wt.join("big.bin")).unwrap());
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_none(), "{rows:?}");
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(wt.join("big.bin")).unwrap()),
+        ino
+    );
+    #[cfg(not(unix))]
+    let _ = wt;
+}
+
+#[test]
+fn sweep_share_dry_run_does_nothing() {
+    let fx = Fixture::new();
+    let (_wt, id) = baled_big(&fx, "w1");
+    let rows = sweep(&fx.home(), true).unwrap();
+    assert_eq!(share_row(&rows, &id).unwrap().2, "dry run, not applied");
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.shared_head, None);
+}
+
+#[test]
+fn sweep_share_skips_locked_tree() {
+    let fx = Fixture::new();
+    let (_wt, id) = baled_big(&fx, "w1");
+    let _lock = bale_core::lock::WorkspaceLock::try_acquire(&fx.home(), &id)
+        .unwrap()
+        .unwrap();
+    let rows = sweep(&fx.home(), false).unwrap();
+    let r = share_row(&rows, &id).expect("locked row");
+    assert!(r.2.contains("locked"), "{r:?}");
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.shared_head, None);
+}
+
+#[test]
+fn sweep_does_not_share_missing_tree() {
+    let fx = Fixture::new();
+    let (wt, id) = baled_big(&fx, "w1");
+    fs::remove_dir_all(&wt).unwrap();
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_none(), "{rows:?}");
 }

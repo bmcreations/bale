@@ -1,4 +1,5 @@
 pub mod busy;
+pub mod clones;
 pub mod config;
 pub mod derived_data;
 pub mod detect;
@@ -72,6 +73,11 @@ impl BaleHome {
     /// Shared Swift packages folders, one `<key>` directory each.
     pub fn spm_dir(&self) -> PathBuf {
         self.0.join("spm")
+    }
+
+    /// Read-only copies of large tracked files, shared between worktrees.
+    pub fn clones_dir(&self) -> PathBuf {
+        self.0.join("clones")
     }
 
     /// Where the local usage trace is kept (see [`trace`]).
