@@ -537,7 +537,7 @@ impl Job<'_> {
         };
         let tmp = parent.join(format!(".bale-clone-{}-{}", std::process::id(), e.ino));
         let _ = fs::remove_file(&tmp);
-        let placed = clonefile(&twin, &tmp)
+        let placed = crate::clones::reflink::clone_file(&twin, &tmp)
             .and_then(|()| set_mtime(&tmp, e.mtime_ns).map_err(io::Error::other))
             .and_then(|()| set_mode(&tmp, e.mode, false))
             .and_then(|()| fs::rename(&tmp, path));
@@ -712,29 +712,6 @@ fn is_product(rel: &Path) -> bool {
     parts
         .windows(3)
         .any(|w| w[0].as_os_str() == "Build" && w[1].as_os_str() == "Products")
-}
-
-/// Clones `src` to the new path `dst` (APFS copy-on-write; fails elsewhere).
-#[cfg(target_os = "macos")]
-fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    /// `CLONE_NOFOLLOW` from <sys/clonefile.h>; the libc crate omits it.
-    const CLONE_NOFOLLOW: u32 = 0x0001;
-    let c = |p: &Path| CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
-    let (src, dst) = (c(src)?, c(dst)?);
-    // SAFETY: both are valid NUL-terminated paths for the call's duration.
-    let rc = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn clonefile(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Passes writes through, noting whether the destination failed. With
