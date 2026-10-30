@@ -45,14 +45,12 @@ impl ShareReport {
     /// Some file was left alone for an io error rather than for being
     /// modified or missing.
     pub fn had_errors(&self) -> bool {
-        self.skipped
-            .iter()
-            .any(|(_, why)| !matches!(why.as_str(), MODIFIED | MISSING | ODD_PATH))
+        self.skipped.iter().any(|(_, why)| is_error(why))
     }
 
     /// The one line `bale share` prints and the sweep reports.
     pub fn summary(&self) -> String {
-        match &self.reason {
+        let mut line = match &self.reason {
             Some(reason) => format!("skipped: {reason}"),
             None => format!(
                 "shared {} files ({:.1} MiB), stored {}",
@@ -60,7 +58,12 @@ impl ShareReport {
                 self.bytes as f64 / (1u64 << 20) as f64,
                 self.stored
             ),
+        };
+        let errors = self.skipped.iter().filter(|(_, why)| is_error(why)).count();
+        if errors > 0 {
+            line.push_str(&format!(", {errors} errors"));
         }
+        line
     }
 
     fn skipped(reason: &str) -> ShareReport {
@@ -75,15 +78,28 @@ const MODIFIED: &str = "modified";
 const MISSING: &str = "missing";
 const ODD_PATH: &str = "unsupported path";
 
+/// A skip for an io error rather than for the file itself.
+fn is_error(why: &str) -> bool {
+    !matches!(why, MODIFIED | MISSING | ODD_PATH)
+}
+
 /// Shares the large tracked files of the registered tree `id` through the
 /// clone store. Takes the tree's lock without waiting and skips a busy tree.
 /// Sets the record's `shared_head` to the `HEAD` it read under the lock when
 /// every file was shared or left alone for being modified or missing.
 pub fn share(home: &BaleHome, id: &str) -> Result<ShareReport> {
-    crate::trace::op(home, "share", Some(id), || share_untraced(home, id))
+    share_ignoring(home, id, &[])
 }
 
-fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
+/// `share`, where processes in `ignore_pids` do not count as holding the
+/// tree.
+pub fn share_ignoring(home: &BaleHome, id: &str, ignore_pids: &[u32]) -> Result<ShareReport> {
+    crate::trace::op(home, "share", Some(id), || {
+        share_untraced(home, id, ignore_pids)
+    })
+}
+
+fn share_untraced(home: &BaleHome, id: &str, ignore_pids: &[u32]) -> Result<ShareReport> {
     let Some(_lock) = WorkspaceLock::try_acquire(home, id)? else {
         return Ok(ShareReport::skipped("locked"));
     };
@@ -97,7 +113,7 @@ fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
     if !cfg.share_checkouts {
         return Ok(ShareReport::skipped("disabled"));
     }
-    if !busy_holders(&root, &[])?.is_empty() {
+    if !busy_holders(&root, ignore_pids)?.is_empty() {
         return Ok(ShareReport::skipped("busy"));
     }
     let store = CloneStore::open(home)

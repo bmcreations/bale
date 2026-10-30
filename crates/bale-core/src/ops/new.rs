@@ -49,14 +49,17 @@ fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) 
             r.level.name()
         );
     }
+    let g = Git::at(&main);
+    // A sparse checkout is left to git: `read-tree HEAD` would write every
+    // path. Without sharing, or where bale can't clone, there is nothing to
+    // gain from filling it here.
+    let fill = cfg!(any(target_os = "macos", target_os = "linux"))
+        && cfg.share_checkouts
+        && !sparse_checkout(&g)?;
     let created = missing_ancestors(&root);
     fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
 
-    let g = Git::at(&main);
     let p = path.to_string_lossy();
-    // A sparse checkout is left to git: `read-tree HEAD` would write every
-    // path. Without sharing there is nothing to gain from filling it here.
-    let fill = cfg.share_checkouts && !sparse_checkout(&g)?;
     let filled = branch_exists(&g, branch).and_then(|exists| {
         let mut args = vec!["worktree", "add"];
         if fill {

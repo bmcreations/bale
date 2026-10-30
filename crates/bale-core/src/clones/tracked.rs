@@ -45,7 +45,7 @@ struct Entry {
 /// Regular files of the index (stage 0, modes 100644 and 100755) that are
 /// `min_bytes` or larger, keyed by blob oid or, for LFS pointers, by the
 /// object's SHA-256. Paths that git would convert on checkout (`filter` other
-/// than `lfs`, `text`, `eol`) are left out, and so is the whole tree when
+/// than `lfs`, `text`, `eol`, `ident`, `working-tree-encoding`) are left out, and so is the whole tree when
 /// `core.autocrlf` is `true` or `input`.
 pub fn candidates(tree: &Path, min_bytes: u64) -> Result<Vec<Candidate>> {
     let git = Git::at(tree);
@@ -119,30 +119,41 @@ pub fn candidates(tree: &Path, min_bytes: u64) -> Result<Vec<Candidate>> {
         .flat_map(|e| e.path.bytes().chain([0]))
         .collect();
     let attrs = git.run_stdin(
-        &["check-attr", "-z", "--stdin", "filter", "text", "eol"],
+        &[
+            "check-attr",
+            "-z",
+            "--stdin",
+            "filter",
+            "text",
+            "eol",
+            "ident",
+            "working-tree-encoding",
+        ],
         &input,
     )?;
-    let mut by_path: HashMap<&str, [&str; 3]> = HashMap::new();
+    let mut by_path: HashMap<&str, [&str; 5]> = HashMap::new();
     let parts: Vec<&str> = attrs.split('\0').collect();
     for t in parts.chunks_exact(3) {
         let slot = match t[1] {
             "filter" => 0,
             "text" => 1,
             "eol" => 2,
+            "ident" => 3,
+            "working-tree-encoding" => 4,
             _ => continue,
         };
-        by_path.entry(t[0]).or_insert(["unspecified"; 3])[slot] = t[2];
+        by_path.entry(t[0]).or_insert(["unspecified"; 5])[slot] = t[2];
     }
     let unset = |v: &str| v == "unspecified" || v == "unset";
 
     let mut out = Vec::new();
     let mut lfs: Vec<(&Entry, &str)> = Vec::new();
     for e in relevant {
-        let [filter, text, eol] = by_path
+        let [filter, text, eol, ident, encoding] = by_path
             .get(e.path.as_str())
             .copied()
-            .unwrap_or(["unspecified"; 3]);
-        if !unset(text) || !unset(eol) {
+            .unwrap_or(["unspecified"; 5]);
+        if !unset(text) || !unset(eol) || !unset(ident) || !unset(encoding) {
             continue;
         }
         let size = sizes[e.oid.as_str()];

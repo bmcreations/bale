@@ -51,7 +51,7 @@ fn candidates_skip_converted_paths() {
     let fx = Fixture::new();
     std::fs::write(
         fx.repo.join(".gitattributes"),
-        "crlf.bin eol=crlf\nf.bin filter=custom\nauto.bin text=auto\nbinary.bin -text\n",
+        "crlf.bin eol=crlf\nf.bin filter=custom\nauto.bin text=auto\nbinary.bin -text\nid.bin ident\n",
     )
     .unwrap();
     for (n, s) in [
@@ -59,11 +59,17 @@ fn candidates_skip_converted_paths() {
         ("f.bin", 4),
         ("auto.bin", 5),
         ("binary.bin", 6),
+        ("id.bin", 12),
+        ("enc.bin", 13),
     ] {
         std::fs::write(fx.repo.join(n), big(2 << 20, s)).unwrap();
     }
     git(&fx.repo, &["add", "."]);
     git(&fx.repo, &["commit", "-m", "files"]);
+    // Set after the commit: git can't add these bytes as UTF-16.
+    let mut attrs = std::fs::read_to_string(fx.repo.join(".gitattributes")).unwrap();
+    attrs.push_str("enc.bin working-tree-encoding=UTF-16\n");
+    std::fs::write(fx.repo.join(".gitattributes"), attrs).unwrap();
 
     let c = candidates(&fx.repo, 1 << 20).unwrap();
     let paths: Vec<_> = c.iter().map(|c| c.path.clone()).collect();
@@ -556,4 +562,20 @@ fn gc_removes_nothing_when_a_record_is_unreadable() {
         "{report:?}"
     );
     assert!(p.exists());
+}
+
+#[test]
+fn share_summary_counts_io_errors() {
+    use bale_core::clones::share::ShareReport;
+    let r = ShareReport {
+        files: 1,
+        bytes: 2 << 20,
+        skipped: vec![
+            ("a.bin".into(), "modified".into()),
+            ("b.bin".into(), "Permission denied (os error 13)".into()),
+        ],
+        ..ShareReport::default()
+    };
+    assert!(r.had_errors());
+    assert_eq!(r.summary(), "shared 1 files (2.0 MiB), stored 0, 1 errors");
 }

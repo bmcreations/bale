@@ -56,6 +56,9 @@ enum Command {
     Share {
         /// Worktree path or workspace id.
         target: String,
+        /// Do not treat this process as holding the tree (repeatable).
+        #[arg(long = "ignore-pid", value_name = "PID")]
+        ignore_pid: Vec<u32>,
     },
     /// Refill a worktree's stashed files from the store.
     Unstash {
@@ -322,8 +325,8 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
                 println!("{}", stash_line(&outcome));
                 ExitCode::SUCCESS
             }),
-        Command::Share { target } => resolve(&home, &target)
-            .and_then(|id| bale_core::clones::share::share(&home, &id))
+        Command::Share { target, ignore_pid } => resolve(&home, &target)
+            .and_then(|id| bale_core::clones::share::share_ignoring(&home, &id, &ignore_pid))
             .map(|r| {
                 println!("{}", r.summary());
                 ExitCode::SUCCESS
