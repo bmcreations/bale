@@ -231,8 +231,9 @@ fn sweep_traced(
 
 /// Shares the large tracked files of each idle (`Baled`, unpinned) tree whose
 /// `head` is not the one it was last shared at. One `share` row each; on
-/// `dry_run` nothing is shared. An error becomes the row's text, and a tree
-/// whose sharing is disabled, or that had nothing to share, gets no row.
+/// `dry_run` nothing is shared. An error becomes the row's text. A tree that
+/// had nothing to share, or that was skipped as "disabled", "other volume" or
+/// "clones unsupported", gets no row.
 fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String, Action, String)> {
     let mut rows = Vec::new();
     for r in records {
@@ -244,7 +245,14 @@ fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String
             "dry run, not applied".to_string()
         } else {
             match crate::clones::share::share(home, &r.id) {
-                Ok(report) if report.reason.as_deref() == Some("disabled") => continue,
+                Ok(report)
+                    if matches!(
+                        report.reason.as_deref(),
+                        Some("disabled" | "other volume" | "clones unsupported")
+                    ) =>
+                {
+                    continue
+                }
                 // A pass that found nothing to share is not worth a row.
                 Ok(report)
                     if report.files == 0

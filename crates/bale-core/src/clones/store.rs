@@ -84,6 +84,24 @@ impl CloneStore {
         self.path(key).is_file()
     }
 
+    /// Whether files in the store can be cloned: clones a tiny file inside
+    /// `clones/` and removes both. `Ok(false)` on a filesystem or platform
+    /// without clones.
+    pub fn supports_clones(&self) -> io::Result<bool> {
+        let src = temp_name(&self.root.join(".probe"));
+        let dst = temp_name(&self.root.join(".probe"));
+        std::fs::write(&src, b"bale")?;
+        let _src = TempGuard(&src, true);
+        match clone_file(&src, &dst) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&dst);
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Clones `from`, which the caller has verified matches `key`, into the
     /// store. `unchanged` runs after the clone and before the copy is
     /// published; it returns whether `from` is still the file that was

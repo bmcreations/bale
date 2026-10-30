@@ -105,6 +105,13 @@ fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
     if !same_volume(&home.clones_dir(), &root)? {
         return Ok(ShareReport::skipped("other volume"));
     }
+    // Before any file is hashed: without clones that work is for nothing.
+    if !store
+        .supports_clones()
+        .with_context(|| format!("probing clones in {}", store.root().display()))?
+    {
+        return Ok(ShareReport::skipped("clones unsupported"));
+    }
 
     let mut report = ShareReport::default();
     let matched = verify(&root, candidates(&root, cfg.clone_min_bytes)?, &mut report)?;
@@ -377,11 +384,10 @@ pub(crate) fn materialize(home: &BaleHome, tree: &Path, cfg: &Config) -> Result<
     Ok(())
 }
 
-/// The clone store, when it can share files with `tree`.
+/// The clone store, when it is on `tree`'s volume and clones work there.
 fn sharing_store(home: &BaleHome, tree: &Path) -> Option<CloneStore> {
     let store = CloneStore::open(home).ok()?;
-    same_volume(&home.clones_dir(), tree)
-        .ok()
-        .filter(|&same| same)
-        .map(|_| store)
+    let usable = same_volume(&home.clones_dir(), tree).unwrap_or(false)
+        && store.supports_clones().unwrap_or(false);
+    usable.then_some(store)
 }
