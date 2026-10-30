@@ -75,7 +75,9 @@ jobs:
             tar -C "$dir" -czf "dist/$name.tar.gz" bale
             archive="dist/$name.tar.gz"
           fi
-          (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          # Windows' Git Bash has sha256sum but no shasum; both print "<hash>  <file>".
+          if command -v shasum >/dev/null; then sum="shasum -a 256"; else sum=sha256sum; fi
+          (cd dist && $sum "$(basename "$archive")" > "$(basename "$archive").sha256")
       - name: The binary runs
         if: matrix.target != 'x86_64-apple-darwin'
         shell: bash
