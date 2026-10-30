@@ -73,6 +73,7 @@ installs and `bale install --hooks claude` instead. Plugin hooks also run alongs
 **Homebrew:**
 
 ```
+brew trust bmcreations/tap   # Homebrew asks before loading a third-party tap
 brew install bmcreations/tap/bale
 bale install                 # sweep every 5 minutes (launchd on macOS)
 bale install --hooks claude  # or codex, t3; git, conductor, cursor also take --repo <repo>
