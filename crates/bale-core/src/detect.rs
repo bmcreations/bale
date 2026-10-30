@@ -115,15 +115,12 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
 /// `regenerable_extra` dirs are left out: bale can't tell what they hold.
 /// Symlinked dirs are left out too. On macOS the `Build/` of each DerivedData
 /// folder in Xcode's shared DerivedData built from this tree comes last, as a
-/// canonical path outside `root`.
-pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
-    stash_dirs_owned(root, systems, cfg, &Trees::default())
-}
-
-/// [`stash_dirs`], taking from Xcode's shared DerivedData only the folders
-/// the tree owns given the registered `trees` (see
-/// [`crate::derived_data::DdDir::owned_by`]), as `up` does.
-pub(crate) fn stash_dirs_owned(
+/// canonical path outside `root`. Of Xcode's shared DerivedData it takes only
+/// the folders the tree owns given the registered `trees` (see
+/// [`crate::derived_data::DdDir::owned_by`]), as `up` does; there is no
+/// variant without `trees`, since prefix-only ownership would take a nested
+/// tree's folders.
+pub(crate) fn stash_dirs(
     root: &Path,
     systems: &[BuildSystem],
     cfg: &Config,
@@ -161,4 +158,105 @@ pub(crate) fn stash_dirs_owned(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::Duration;
+
+    fn cfg(extra: &[&str]) -> Config {
+        Config {
+            idle_baled: Duration::from_secs(4 * 3600),
+            idle_cold: Duration::from_secs(7 * 86400),
+            idle_stash: Duration::from_secs(600),
+            reap_grace: Duration::from_secs(3600),
+            share_swift_packages: true,
+            stash_min_bytes: 1 << 20,
+            patch_max_depth: 4,
+            regenerable_extra: extra.iter().map(|s| s.to_string()).collect(),
+            ignored_denylist_extra: vec![],
+            worktree_root: None,
+        }
+    }
+
+    fn touch(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, "x").unwrap();
+    }
+
+    fn set(v: Vec<PathBuf>) -> BTreeSet<PathBuf> {
+        v.into_iter().collect()
+    }
+
+    fn write_plist(dir: &Path, workspace: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "WorkspacePath".into(),
+            plist::Value::String(workspace.to_string_lossy().into_owned()),
+        );
+        plist::Value::Dictionary(dict)
+            .to_file_xml(dir.join("info.plist"))
+            .unwrap();
+    }
+
+    #[test]
+    fn stash_dirs_are_xcode_build_only() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        fs::create_dir_all(r.join("App.xcodeproj")).unwrap();
+        write_plist(&r.join(".dd"), &r.join("App.xcodeproj"));
+        for f in [
+            ".dd/Build/Products/x",
+            ".dd/SourcePackages/checkouts/y",
+            ".dd/SDKExplicitPrecompiledModules/z",
+            ".dd/ModuleCache.noindex/w",
+            ".build/v",
+            "out/u",
+        ] {
+            touch(r, f);
+        }
+        let sys = detect(r);
+        let got = set(stash_dirs(r, &sys, &cfg(&["out"]), &Trees::default()));
+        assert_eq!(got, set(vec![r.join(".dd/Build")]));
+    }
+
+    #[test]
+    fn stash_dirs_are_gradle_build_only() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        for f in [
+            "settings.gradle.kts",
+            "app/build/x",
+            "lib/feature/build/y",
+            ".gradle/z",
+            ".kotlin/k",
+            "lib/.cxx/c",
+            "src/build.rs",
+        ] {
+            touch(r, f);
+        }
+        let sys = detect(r);
+        let got = set(stash_dirs(r, &sys, &cfg(&[]), &Trees::default()));
+        assert_eq!(
+            got,
+            set(vec![r.join("app/build"), r.join("lib/feature/build")])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stash_dirs_skip_symlinked_build() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let o = tempfile::tempdir().unwrap();
+        touch(r, "settings.gradle.kts");
+        fs::create_dir_all(r.join("app")).unwrap();
+        std::os::unix::fs::symlink(o.path(), r.join("app/build")).unwrap();
+        assert!(stash_dirs(r, &detect(r), &cfg(&[]), &Trees::default()).is_empty());
+    }
 }

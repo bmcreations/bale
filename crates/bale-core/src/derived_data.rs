@@ -115,6 +115,8 @@ impl DdDir {
 
     /// Whether the project lies in a dir strictly below `ws` (the project
     /// itself included) that holds a `.git` file, as a linked worktree does.
+    /// A `.git` file also marks a submodule, so those match too; that errs
+    /// toward keeping the folder, the safe direction.
     fn in_nested_checkout(&self, ws: &Path) -> bool {
         [&self.workspace, &self.canonical]
             .into_iter()

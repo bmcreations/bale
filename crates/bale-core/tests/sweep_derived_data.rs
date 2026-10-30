@@ -552,3 +552,35 @@ fn up_with_an_unreadable_record_leaves_derived_data_of_a_nested_checkout() {
     // A's own folder still goes.
     assert!(!global_a.exists());
 }
+
+#[test]
+fn baled_tree_is_not_baled_again_for_derived_data_of_a_nested_tree() {
+    let fx = Fixture::new();
+    fs::create_dir_all(&fx.home().0).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "idle_baled_hours = 0\n").unwrap();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    register(&fx.home(), &b).unwrap();
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id_a).unwrap().unwrap();
+    rec.level = Level::Baled;
+    reg.put(&rec).unwrap();
+    // Both folders are B's: the default root and a learned root.
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+
+    let rows = sweep(&fx.home(), true).unwrap();
+    assert_eq!(
+        rows.iter().find(|r| r.0 == id_a).unwrap().1,
+        Action::Keep,
+        "{rows:?}"
+    );
+    assert!(learned_b.exists() && global_b.exists());
+}

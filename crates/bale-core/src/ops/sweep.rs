@@ -153,6 +153,8 @@ fn sweep_traced(
             }
         }
     }
+    // The registered set does not change during a sweep (`up` and `cold` only move levels).
+    let trees = crate::derived_data::Trees::registered(home);
     let mut rows = adopted;
     rows.reserve(records.len());
     let mut builds = Vec::new();
@@ -160,7 +162,7 @@ fn sweep_traced(
     for ((stem, record), m) in records.into_iter().zip(measured) {
         match record {
             Ok(record) => {
-                let (action, result, edited) = sweep_one(home, &record, dry_run);
+                let (action, result, edited) = sweep_one(home, &trees, &record, dry_run);
                 trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
@@ -642,6 +644,7 @@ fn millis(d: Duration) -> u64 {
 /// not probed or no file remains).
 fn sweep_one(
     home: &BaleHome,
+    trees: &crate::derived_data::Trees,
     record: &Record,
     dry_run: bool,
 ) -> (Action, String, Option<SystemTime>) {
@@ -663,7 +666,7 @@ fn sweep_one(
             return (Action::Report(text.clone()), text, None);
         }
     }
-    let (action, edited) = match plan(home, record) {
+    let (action, edited) = match plan(home, trees, record) {
         Ok(planned) => planned,
         Err(e) => {
             let text = format!("{e:#}");
@@ -707,7 +710,11 @@ fn level_action(level: Level) -> Option<Action> {
 /// become `Report` rows and can never lead to `Cold`. Level-only actions
 /// load no config, so a broken config cannot block a resume or the
 /// interrupted-open hint.
-fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)> {
+fn plan(
+    home: &BaleHome,
+    trees: &crate::derived_data::Trees,
+    record: &Record,
+) -> Result<(Action, Option<SystemTime>)> {
     // Cooling may legitimately have no checkout; cold's recovery handles it.
     if matches!(record.level, Level::Cold | Level::Opening | Level::Cooling) {
         return Ok((level_action(record.level).expect("level-only action"), None));
@@ -734,7 +741,8 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
     // roots, which `up` also removes on macOS.
     let has_regen = record.level == Level::Baled
         && idle_for >= cfg.idle_baled
-        && (has_shared_derived_data(home, &root) || !bale_able_from(&root, regen)?.0.is_empty());
+        && (has_shared_derived_data(home, trees, &root)
+            || !bale_able_from(&root, regen)?.0.is_empty());
     let edited = (changed > UNIX_EPOCH).then_some(changed);
     Ok((
         decide(
@@ -754,14 +762,21 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
 /// root, holds a folder built from `root`. Only macOS, the one place `up`
 /// removes those folders; elsewhere a `true` would re-run `up` on every sweep.
 #[cfg(target_os = "macos")]
-fn has_shared_derived_data(home: &BaleHome, root: &Path) -> bool {
-    let trees = crate::derived_data::Trees::registered(home);
-    !crate::derived_data::global_owned(root, &trees).is_empty()
-        || !crate::derived_data::learned_for(home, root, &trees).is_empty()
+fn has_shared_derived_data(
+    home: &BaleHome,
+    trees: &crate::derived_data::Trees,
+    root: &Path,
+) -> bool {
+    !crate::derived_data::global_owned(root, trees).is_empty()
+        || !crate::derived_data::learned_for(home, root, trees).is_empty()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn has_shared_derived_data(_home: &BaleHome, _root: &Path) -> bool {
+fn has_shared_derived_data(
+    _home: &BaleHome,
+    _trees: &crate::derived_data::Trees,
+    _root: &Path,
+) -> bool {
     false
 }
 
