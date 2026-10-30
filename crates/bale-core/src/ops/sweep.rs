@@ -166,7 +166,7 @@ fn sweep_traced(
     rows.reserve(records.len());
     let mut builds = Vec::new();
     let mut paths = Vec::new();
-    let mut paths_ids = Vec::new();
+    let mut ids = Vec::new();
     for ((stem, record), m) in records.into_iter().zip(measured) {
         match record {
             Ok(record) => {
@@ -174,7 +174,7 @@ fn sweep_traced(
                 trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
-                paths_ids.push(record.id.clone());
+                ids.push(record.id.clone());
                 rows.push((record.id, action, result));
             }
             Err(e) => {
@@ -184,13 +184,20 @@ fn sweep_traced(
             }
         }
     }
-    let current: Vec<Record> = {
+    let mut current: Vec<Record> = Vec::new();
+    {
         let reg = Registry::open(home.clone());
-        paths_ids
-            .iter()
-            .filter_map(|id| reg.get(id).ok().flatten())
-            .collect()
-    };
+        for id in &ids {
+            match reg.get(id) {
+                Ok(Some(r)) => current.push(r),
+                Ok(None) => {}
+                Err(e) => {
+                    let text = format!("error: {e:#}");
+                    rows.push((id.clone(), Action::Report("share".into()), text));
+                }
+            }
+        }
+    }
     rows.extend(share_rows(home, &current, dry_run));
     #[cfg(target_os = "macos")]
     {

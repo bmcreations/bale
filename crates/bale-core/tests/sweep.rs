@@ -877,10 +877,19 @@ fn sweep_shares_baled_tree_once() {
 #[test]
 fn sweep_does_not_share_hot_tree() {
     let fx = Fixture::new();
-    let (_wt, id) = baled_big(&fx, "w1");
+    let (wt, id) = baled_big(&fx, "w1");
     set_level(&fx, &id, Level::Hot);
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(wt.join("big.bin")).unwrap());
     let rows = sweep(&fx.home(), false).unwrap();
     assert!(share_row(&rows, &id).is_none(), "{rows:?}");
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(wt.join("big.bin")).unwrap()),
+        ino
+    );
+    #[cfg(not(unix))]
+    let _ = wt;
 }
 
 #[test]
@@ -901,9 +910,8 @@ fn sweep_share_skips_locked_tree() {
         .unwrap()
         .unwrap();
     let rows = sweep(&fx.home(), false).unwrap();
-    if let Some(r) = share_row(&rows, &id) {
-        assert!(r.2.contains("locked"), "{r:?}");
-    }
+    let r = share_row(&rows, &id).expect("locked row");
+    assert!(r.2.contains("locked"), "{r:?}");
     let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
     assert_eq!(rec.shared_head, None);
 }
