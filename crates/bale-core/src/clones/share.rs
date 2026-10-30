@@ -50,6 +50,19 @@ impl ShareReport {
             .any(|(_, why)| !matches!(why.as_str(), MODIFIED | MISSING | ODD_PATH))
     }
 
+    /// The one line `bale share` prints and the sweep reports.
+    pub fn summary(&self) -> String {
+        match &self.reason {
+            Some(reason) => format!("skipped: {reason}"),
+            None => format!(
+                "shared {} files ({:.1} MiB), stored {}",
+                self.files,
+                self.bytes as f64 / (1u64 << 20) as f64,
+                self.stored
+            ),
+        }
+    }
+
     fn skipped(reason: &str) -> ShareReport {
         ShareReport {
             reason: Some(reason.to_string()),

@@ -166,6 +166,7 @@ fn sweep_traced(
     rows.reserve(records.len());
     let mut builds = Vec::new();
     let mut paths = Vec::new();
+    let mut paths_ids = Vec::new();
     for ((stem, record), m) in records.into_iter().zip(measured) {
         match record {
             Ok(record) => {
@@ -173,6 +174,7 @@ fn sweep_traced(
                 trace_tree(home, &record, &action, &result, edited, &m);
                 builds.extend(m.builds.into_iter().map(|b| (record.id.clone(), b)));
                 paths.push(record.path.clone());
+                paths_ids.push(record.id.clone());
                 rows.push((record.id, action, result));
             }
             Err(e) => {
@@ -182,6 +184,14 @@ fn sweep_traced(
             }
         }
     }
+    let current: Vec<Record> = {
+        let reg = Registry::open(home.clone());
+        paths_ids
+            .iter()
+            .filter_map(|id| reg.get(id).ok().flatten())
+            .collect()
+    };
+    rows.extend(share_rows(home, &current, dry_run));
     #[cfg(target_os = "macos")]
     {
         learn_build_dirs(home, build_dirs);
@@ -210,6 +220,39 @@ fn sweep_traced(
     crate::trace::emit(home, "sweep", fields);
     crate::trace::prune(home, now);
     Ok(rows)
+}
+
+/// Shares the large tracked files of each idle (`Baled`, unpinned) tree whose
+/// `head` is not the one it was last shared at. One `share` row each; on
+/// `dry_run` nothing is shared. An error becomes the row's text, and a tree
+/// whose sharing is disabled, or that had nothing to share, gets no row.
+fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String, Action, String)> {
+    let mut rows = Vec::new();
+    for r in records {
+        if r.level != Level::Baled || r.pinned || r.shared_head.as_deref() == Some(r.head.as_str())
+        {
+            continue;
+        }
+        let text = if dry_run {
+            "dry run, not applied".to_string()
+        } else {
+            match crate::clones::share::share(home, &r.id) {
+                Ok(report) if report.reason.as_deref() == Some("disabled") => continue,
+                // A pass that found nothing to share is not worth a row.
+                Ok(report)
+                    if report.files == 0
+                        && report.reason.is_none()
+                        && report.skipped.is_empty() =>
+                {
+                    continue
+                }
+                Ok(report) => report.summary(),
+                Err(e) => format!("error: {e:#}"),
+            }
+        };
+        rows.push((r.id.clone(), Action::Report("share".into()), text));
+    }
+    rows
 }
 
 /// Listing one repository's worktrees longer than this is given up on, and

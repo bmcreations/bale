@@ -325,7 +325,7 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
         Command::Share { target } => resolve(&home, &target)
             .and_then(|id| bale_core::clones::share::share(&home, &id))
             .map(|r| {
-                println!("{}", share_line(&r));
+                println!("{}", r.summary());
                 ExitCode::SUCCESS
             }),
         Command::Unstash {
@@ -468,18 +468,6 @@ fn stash_line(outcome: &StashOutcome) -> String {
             line
         }
         StashOutcome::Skipped(reason) => format!("not stashed: {reason}"),
-    }
-}
-
-fn share_line(r: &bale_core::clones::share::ShareReport) -> String {
-    match &r.reason {
-        Some(reason) => format!("skipped: {reason}"),
-        None => format!(
-            "shared {} files ({:.1} MiB), stored {}",
-            r.files,
-            r.bytes as f64 / (1u64 << 20) as f64,
-            r.stored
-        ),
     }
 }
 
