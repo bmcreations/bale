@@ -135,6 +135,13 @@ fn sweep_traced(
         .map(|(_, r)| r.as_ref().ok().map(|r| workspace_key(&r.path)))
         .collect();
     let matches = match_trees(&global, &roots);
+    // Trees `bale gc` would forget hold no DerivedData: their project is gone.
+    let held: Vec<PathBuf> = records
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .filter(|r| !super::gc::is_gone(r))
+        .flat_map(|r| [workspace_key(&r.path), r.path.clone()])
+        .collect();
     let mut measured = par_map(&records, |(_, record)| match record {
         Ok(r) => measure(home, r),
         Err(_) => Measured::default(),
@@ -178,7 +185,7 @@ fn sweep_traced(
     #[cfg(target_os = "macos")]
     {
         learn_build_dirs(home, build_dirs);
-        rows.extend(reap_rows(home, &global, &roots, &paths, dry_run));
+        rows.extend(reap_rows(home, &global, &held, dry_run));
         rows.extend(spm_gc_rows(home, dry_run));
     }
     let now = SystemTime::now();
@@ -356,8 +363,7 @@ fn list_worktrees(repos: &[PathBuf], deadline: Instant) -> Vec<Option<Vec<git::W
 fn reap_rows(
     home: &BaleHome,
     global: &[DdDir],
-    roots: &[Option<PathBuf>],
-    paths: &[PathBuf],
+    trees: &[PathBuf],
     dry_run: bool,
 ) -> Vec<(String, Action, String)> {
     let cfg = match load_config(home, None) {
@@ -367,8 +373,7 @@ fn reap_rows(
             return Vec::new();
         }
     };
-    let trees: Vec<PathBuf> = roots.iter().flatten().chain(paths).cloned().collect();
-    super::reap::reap_orphans(home, global, &trees, cfg.reap_grace, dry_run)
+    super::reap::reap_orphans(home, global, trees, cfg.reap_grace, dry_run)
         .into_iter()
         .map(|(dir, result)| (dir, Action::Reap, result))
         .collect()

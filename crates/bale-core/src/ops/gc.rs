@@ -180,6 +180,15 @@ fn collect(
     Ok(())
 }
 
+/// Whether the record's worktree is gone without bale's doing: a hot or baled
+/// tree whose path is absent. Cold and mid-operation trees can be absent on
+/// purpose. `collect` forgets such a record (unless git still lists it).
+pub(crate) fn is_gone(record: &Record) -> bool {
+    matches!(record.level, Level::Hot | Level::Baled)
+        && matches!(fs::symlink_metadata(&record.path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
+
 /// A git runner for the record's repo. Errs unless git, run in the recorded
 /// common dir, resolves to that same common dir: a deleted repo, or a dir
 /// from which git would climb into an enclosing repo, fails the probe.

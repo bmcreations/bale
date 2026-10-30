@@ -584,3 +584,51 @@ fn baled_tree_is_not_baled_again_for_derived_data_of_a_nested_tree() {
     );
     assert!(learned_b.exists() && global_b.exists());
 }
+
+/// Registers a worktree, sets its level, then deletes it from disk.
+fn registered_then_deleted(fx: &Fixture, level: Level) -> PathBuf {
+    let wt = fx.add_worktree("wt-del", "wt-del");
+    let id = register(&fx.home(), &wt).unwrap().id;
+    let reg = Registry::open(fx.home());
+    let mut rec = reg.get(&id).unwrap().unwrap();
+    rec.level = level;
+    reg.put(&rec).unwrap();
+    fs::remove_dir_all(&wt).unwrap();
+    wt
+}
+
+#[test]
+fn derived_data_of_a_record_whose_worktree_was_deleted_is_reaped() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = registered_then_deleted(&fx, Level::Baled);
+    let orphan = dd(
+        &fx.repo.parent().unwrap().join("pad"),
+        "fc-1-dd",
+        Some(&wt.join("App.xcodeproj")),
+    );
+    age(&orphan, 48);
+    bale_core::derived_data::learn_root(&fx.home(), &orphan).unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(reap_rows(&rows).len(), 1, "{rows:?}");
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn derived_data_of_a_cold_record_with_a_missing_path_is_kept() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let wt = registered_then_deleted(&fx, Level::Cold);
+    let owned = dd(
+        &fx.repo.parent().unwrap().join("pad"),
+        "fc-1-dd",
+        Some(&wt.join("App.xcodeproj")),
+    );
+    age(&owned, 48);
+    bale_core::derived_data::learn_root(&fx.home(), &owned).unwrap();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(reap_rows(&rows).is_empty(), "{rows:?}");
+    assert!(owned.exists());
+}
