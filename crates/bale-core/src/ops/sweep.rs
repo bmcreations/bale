@@ -237,7 +237,8 @@ fn sweep_traced(
 fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String, Action, String)> {
     let mut rows = Vec::new();
     for r in records {
-        if r.level != Level::Baled || r.pinned {
+        // A missing tree is already reported by its own sweep row.
+        if r.level != Level::Baled || r.pinned || !r.path.exists() {
             continue;
         }
         // The record's `head` is refreshed only by register, so ask git. A

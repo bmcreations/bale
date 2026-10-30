@@ -947,3 +947,12 @@ fn sweep_share_skips_locked_tree() {
     let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
     assert_eq!(rec.shared_head, None);
 }
+
+#[test]
+fn sweep_does_not_share_missing_tree() {
+    let fx = Fixture::new();
+    let (wt, id) = baled_big(&fx, "w1");
+    fs::remove_dir_all(&wt).unwrap();
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_none(), "{rows:?}");
+}
