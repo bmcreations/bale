@@ -204,7 +204,7 @@ fn days(t: SystemTime) -> i64 {
 
 /// `(year, month, day)` for days since the Unix epoch (Howard Hinnant's
 /// `civil_from_days`).
-fn civil(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -218,7 +218,7 @@ fn civil(z: i64) -> (i64, u32, u32) {
 }
 
 /// Days since the Unix epoch for a civil date (Hinnant's `days_from_civil`).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
