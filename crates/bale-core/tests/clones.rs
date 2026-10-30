@@ -127,6 +127,7 @@ fn candidates_key_lfs_files_on_pointer() {
     assert_eq!(c[0].key, Key::Lfs(sha));
 }
 
+#[cfg(unix)]
 fn clones_work(fx: &Fixture) -> bool {
     let a = fx.repo.join("probe-src");
     std::fs::write(&a, b"x").unwrap();
@@ -200,4 +201,163 @@ fn place_over_existing_file_leaves_no_temp() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".bale-share"))
         .collect();
     assert!(leftovers.is_empty());
+}
+
+/// Commits a 2 MiB `big.bin` (mode `0o755` when `exec`), sets
+/// `clone_min_bytes = 1024` (the fixture's 4-byte `f` stays out), and returns the registered worktree's path and id.
+fn shared_fixture(fx: &Fixture, names: &[&str], exec: bool) -> Vec<(std::path::PathBuf, String)> {
+    let big_path = fx.repo.join("big.bin");
+    std::fs::write(&big_path, big(2 << 20, 11)).unwrap();
+    #[cfg(unix)]
+    if exec {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&big_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+    git(&fx.repo, &["add", "big.bin"]);
+    git(&fx.repo, &["commit", "-m", "big"]);
+    let home = fx.home();
+    std::fs::create_dir_all(&home.0).unwrap();
+    std::fs::write(home.0.join("config.toml"), "clone_min_bytes = 1024\n").unwrap();
+    names
+        .iter()
+        .map(|n| {
+            let wt = fx.add_worktree(n, n);
+            let id = bale_core::ops::up::register(&home, &wt).unwrap().id;
+            (wt, id)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn store_files(home: &bale_core::BaleHome) -> usize {
+    walkdir::WalkDir::new(home.clones_dir())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
+}
+
+#[cfg(unix)]
+#[test]
+fn share_two_worktrees_uses_one_store_file() {
+    use bale_core::clones::share::share;
+    use bale_core::registry::Registry;
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let trees = shared_fixture(&fx, &["w1", "w2"], false);
+    let home = fx.home();
+    let data = big(2 << 20, 11);
+
+    let r1 = share(&home, &trees[0].1).unwrap();
+    assert_eq!(r1.reason, None, "{r1:?}");
+    assert_eq!((r1.files, r1.stored, r1.bytes), (1, 1, 2 << 20), "{r1:?}");
+    let r2 = share(&home, &trees[1].1).unwrap();
+    assert_eq!(r2.reason, None, "{r2:?}");
+    assert_eq!((r2.files, r2.stored), (1, 0), "{r2:?}");
+    assert!(r2.skipped.is_empty(), "{r2:?}");
+    assert_eq!(store_files(&home), 1);
+
+    let registry = Registry::open(home.clone());
+    for (wt, id) in &trees {
+        assert_eq!(std::fs::read(wt.join("big.bin")).unwrap(), data);
+        assert_eq!(git(wt, &["status", "--porcelain"]), "");
+        let rec = registry.get(id).unwrap().unwrap();
+        assert_eq!(rec.shared_head.as_deref(), Some(rec.head.as_str()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn share_leaves_modified_file() {
+    use bale_core::clones::share::share;
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let trees = shared_fixture(&fx, &["w1"], false);
+    let (wt, id) = &trees[0];
+    let other = big(2 << 20, 99);
+    std::fs::write(wt.join("big.bin"), &other).unwrap();
+
+    let r = share(&fx.home(), id).unwrap();
+    assert_eq!(r.files, 0, "{r:?}");
+    assert_eq!(
+        r.skipped,
+        vec![(std::path::PathBuf::from("big.bin"), "modified".to_string())]
+    );
+    assert_eq!(std::fs::read(wt.join("big.bin")).unwrap(), other);
+    assert_eq!(store_files(&fx.home()), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn share_keeps_mode_and_mtime() {
+    use bale_core::clones::share::share;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let trees = shared_fixture(&fx, &["w1"], true);
+    let (wt, id) = &trees[0];
+    let file = wt.join("big.bin");
+    let t = UNIX_EPOCH + Duration::new(1_700_000_000, 987_654_321);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+
+    let r = share(&fx.home(), id).unwrap();
+    assert_eq!(r.files, 1, "{r:?}");
+    let md = std::fs::metadata(&file).unwrap();
+    assert_eq!(md.permissions().mode() & 0o777, 0o755);
+    assert_eq!(md.modified().unwrap(), t);
+}
+
+/// Where clones don't work (e.g. ext4 on Linux CI), share changes nothing and says why.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn share_reports_unsupported() {
+    use bale_core::clones::share::share;
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::new();
+    if clones_work(&fx) {
+        return;
+    }
+    let trees = shared_fixture(&fx, &["w1"], false);
+    let (wt, id) = &trees[0];
+    let file = wt.join("big.bin");
+    let ino = std::fs::metadata(&file).unwrap().ino();
+
+    let r = share(&fx.home(), id).unwrap();
+    assert_eq!(r.reason.as_deref(), Some("clones unsupported"), "{r:?}");
+    assert_eq!(r.files, 0);
+    assert_eq!(std::fs::read(&file).unwrap(), big(2 << 20, 11));
+    assert_eq!(std::fs::metadata(&file).unwrap().ino(), ino);
+    let rec = bale_core::registry::Registry::open(fx.home())
+        .get(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.shared_head, None);
+}
+
+#[test]
+fn share_skips_locked_tree() {
+    use bale_core::clones::share::share;
+    use bale_core::lock::WorkspaceLock;
+    let fx = Fixture::new();
+    let trees = shared_fixture(&fx, &["w1"], false);
+    let (wt, id) = &trees[0];
+    let _lock = WorkspaceLock::try_acquire(&fx.home(), id).unwrap().unwrap();
+    let r = share(&fx.home(), id).unwrap();
+    assert_eq!(r.reason.as_deref(), Some("locked"));
+    assert_eq!(r.files, 0);
+    assert_eq!(std::fs::read(wt.join("big.bin")).unwrap(), big(2 << 20, 11));
 }

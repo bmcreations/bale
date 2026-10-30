@@ -215,6 +215,7 @@ fn cold_refuses_main_checkout() {
         stash: None,
         restore_hook: false,
         spm: Vec::new(),
+        shared_head: None,
     };
     Registry::open(fx.home()).put(&rec).unwrap();
     let err = cold(&fx.home(), &id).unwrap_err();

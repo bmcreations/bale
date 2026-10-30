@@ -1717,6 +1717,7 @@ mod tests {
                     key: "k1".into(),
                     folder: tree.join("dd0"),
                 }],
+                shared_head: None,
             })
             .unwrap();
 
@@ -1870,6 +1871,7 @@ mod tests {
                 stash: None,
                 restore_hook: false,
                 spm,
+                shared_head: None,
             })
             .unwrap();
         id

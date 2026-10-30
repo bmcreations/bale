@@ -74,6 +74,9 @@ pub struct Record {
     /// field existed load with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spm: Vec<SpmLink>,
+    /// `head` at the last `share` that ran to the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_head: Option<String>,
 }
 
 /// One pre-made DerivedData folder: `folder` holds a `SourcePackages` link to

@@ -23,6 +23,7 @@ fn record(id: &str) -> Record {
         stash: None,
         restore_hook: false,
         spm: Vec::new(),
+        shared_head: None,
     }
 }
 

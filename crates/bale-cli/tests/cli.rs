@@ -4274,3 +4274,23 @@ fn pre_tool_failed_restore_of_a_named_tree_is_best_effort() {
     }
     assert!(traced, "no unstash error line in the trace");
 }
+
+#[test]
+fn share_command_shares_or_says_why_not() {
+    let env = Env::new();
+    fs::write(env.repo.join("big.bin"), noise(2 * MIB, 4)).unwrap();
+    env.git(&env.repo, &["add", "big.bin"]);
+    env.git(&env.repo, &["commit", "-m", "big"]);
+    let wt = env.add_worktree("shared");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = env.bale(&env.repo, &["share", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("shared ") || text.starts_with("skipped: "),
+        "{text:?}"
+    );
+    assert_eq!(fs::read(wt.join("big.bin")).unwrap(), noise(2 * MIB, 4));
+}

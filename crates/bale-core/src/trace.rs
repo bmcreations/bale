@@ -18,6 +18,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use walkdir::WalkDir;
 
+use crate::clones::share::ShareReport;
 use crate::ops::disk::{free_space, total_space};
 use crate::ops::gc::GcReport;
 use crate::ops::open::OpenReport;
@@ -363,6 +364,22 @@ impl Traced for Record {
     }
     fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
         ("ok", None)
+    }
+}
+
+impl Traced for ShareReport {
+    fn traced_outcome(&self) -> (&'static str, Option<&'static str>) {
+        let code = match self.reason.as_deref() {
+            None if self.had_errors() => return ("ok", Some("partial")),
+            None => return ("ok", None),
+            Some("locked") => "locked",
+            Some("busy") => "busy",
+            Some("other volume") => "other_volume",
+            Some("clones unsupported") => "unsupported",
+            Some("disabled") => "disabled",
+            Some(_) => "other",
+        };
+        ("skipped", Some(code))
     }
 }
 

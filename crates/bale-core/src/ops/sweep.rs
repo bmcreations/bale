@@ -832,6 +832,8 @@ mod tests {
             share_swift_packages: true,
             stash_min_bytes: 1 << 20,
             patch_max_depth: 4,
+            share_checkouts: true,
+            clone_min_bytes: 1 << 20,
             regenerable_extra: Vec::new(),
             ignored_denylist_extra: Vec::new(),
             worktree_root: None,

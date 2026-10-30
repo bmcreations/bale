@@ -52,6 +52,11 @@ enum Command {
         #[arg(long = "ignore-pid", value_name = "PID")]
         ignore_pid: Vec<u32>,
     },
+    /// Replace a worktree's large tracked files with clones of one shared copy.
+    Share {
+        /// Worktree path or workspace id.
+        target: String,
+    },
     /// Refill a worktree's stashed files from the store.
     Unstash {
         /// Worktree path or workspace id.
@@ -317,6 +322,12 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
                 println!("{}", stash_line(&outcome));
                 ExitCode::SUCCESS
             }),
+        Command::Share { target } => resolve(&home, &target)
+            .and_then(|id| bale_core::clones::share::share(&home, &id))
+            .map(|r| {
+                println!("{}", share_line(&r));
+                ExitCode::SUCCESS
+            }),
         Command::Unstash {
             target,
             background: true,
@@ -457,6 +468,18 @@ fn stash_line(outcome: &StashOutcome) -> String {
             line
         }
         StashOutcome::Skipped(reason) => format!("not stashed: {reason}"),
+    }
+}
+
+fn share_line(r: &bale_core::clones::share::ShareReport) -> String {
+    match &r.reason {
+        Some(reason) => format!("skipped: {reason}"),
+        None => format!(
+            "shared {} files ({:.1} MiB), stored {}",
+            r.files,
+            r.bytes as f64 / (1u64 << 20) as f64,
+            r.stored
+        ),
     }
 }
 
@@ -1139,6 +1162,7 @@ mod tests {
             stash: None,
             restore_hook: false,
             spm: Vec::new(),
+            shared_head: None,
         };
         assert!(show_text(&r, None).contains("origin:   cursor\n"));
         r.origin = Some(origin("s1"));

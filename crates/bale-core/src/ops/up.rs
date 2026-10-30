@@ -209,6 +209,7 @@ pub(crate) fn register_untraced(home: &BaleHome, path: &Path) -> Result<Record> 
                 stash: None,
                 restore_hook: false,
                 spm: Vec::new(),
+                shared_head: None,
             }
         }
     };
