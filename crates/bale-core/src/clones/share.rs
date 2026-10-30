@@ -5,6 +5,7 @@
 //! or an LFS object's SHA-256) and it has not changed since it was checked;
 //! anything else is left alone and listed in `skipped`.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -16,7 +17,7 @@ use super::store::CloneStore;
 use super::tracked::candidates;
 use super::{Candidate, Key};
 use crate::busy::busy_holders;
-use crate::config::load_config;
+use crate::config::{load_config, Config};
 use crate::git::Git;
 use crate::lock::WorkspaceLock;
 use crate::registry::Registry;
@@ -255,23 +256,138 @@ fn place_one(store: &CloneStore, c: &Candidate, dst: &Path, verified: &Seen) -> 
         _ => {}
     }
     let stored = if store.has(&c.key) {
-        false
-    } else {
         if seen(dst)?.as_ref() != Some(verified) {
             return Ok(Placed::Changed);
         }
-        store.adopt(&c.key, dst)?
+        false
+    } else {
+        match adopt_one(store, c, dst, verified)? {
+            Some(stored) => stored,
+            None => return Ok(Placed::Changed),
+        }
     };
+    store.place(&c.key, dst, verified.mode, Some(verified.mtime))?;
+    Ok(Placed::Done { stored })
+}
+
+/// Adds the verified file `dst` to the store under `c.key`. Returns whether
+/// this call stored it, or `None` when the file changed after it was
+/// verified (a copy stored with the wrong bytes is dropped).
+fn adopt_one(
+    store: &CloneStore,
+    c: &Candidate,
+    dst: &Path,
+    verified: &Seen,
+) -> io::Result<Option<bool>> {
+    if seen(dst)?.as_ref() != Some(verified) {
+        return Ok(None);
+    }
+    let stored = store.adopt(&c.key, dst)?;
     if seen(dst)?.as_ref() != Some(verified) {
         // Written while being adopted: the stored copy may hold the new
         // bytes under the old key. Drop it unless it still matches.
         if stored && !matches_key(dst.parent().unwrap_or(dst), &store.path(&c.key), &c.key)? {
             std::fs::remove_file(store.path(&c.key))?;
         }
-        return Ok(Placed::Changed);
+        return Ok(None);
     }
-    store.place(&c.key, dst, verified.mode, Some(verified.mtime))?;
-    Ok(Placed::Done { stored })
+    Ok(Some(stored))
+}
+
+/// Fills the index and files of `tree`, a worktree just added with
+/// `--no-checkout`. When sharing is on and the store is on the tree's
+/// volume, large tracked files already in the store are placed as clones of
+/// it and git checks out only the rest; then the large files git wrote are
+/// verified and added to the store for the next tree. Fails only when git
+/// can't fill the index or check files out; sharing problems leave git to
+/// write the file.
+pub(crate) fn materialize(home: &BaleHome, tree: &Path, cfg: &Config) -> Result<()> {
+    let git = Git::at(tree);
+    git.run(&["read-tree", "HEAD"])?;
+
+    let shared = if cfg.share_checkouts {
+        sharing_store(home, tree).map(|store| {
+            // A failure listing candidates only means nothing is shared.
+            (
+                store,
+                candidates(tree, cfg.clone_min_bytes).unwrap_or_default(),
+            )
+        })
+    } else {
+        None
+    };
+
+    // Index paths as git prints them, NUL-separated and unconverted.
+    let listing = git.run_stdin_bytes(&["ls-files", "-z"], b"")?;
+    let paths: Vec<&[u8]> = listing
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let mut placed: HashSet<&[u8]> = HashSet::new();
+    if let Some((store, cands)) = &shared {
+        // Candidate paths were read lossily; place only those that name an
+        // index path exactly.
+        let exact: HashSet<&[u8]> = paths.iter().copied().collect();
+        for c in cands {
+            let Some(p) = c.path.to_str() else { continue };
+            if !exact.contains(p.as_bytes()) || !store.has(&c.key) {
+                continue;
+            }
+            let dst = tree.join(&c.path);
+            let res = match dst.parent() {
+                Some(dir) => std::fs::create_dir_all(dir),
+                None => Ok(()),
+            }
+            .and_then(|()| store.place(&c.key, &dst, c.mode, None));
+            match res {
+                Ok(()) => {
+                    placed.insert(p.as_bytes());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => break,
+                // Git writes this file instead.
+                Err(_) => {}
+            }
+        }
+    }
+
+    let mut input = Vec::new();
+    for p in paths.iter().filter(|p| !placed.contains(*p)) {
+        input.extend_from_slice(p);
+        input.push(0);
+    }
+    if !input.is_empty() {
+        git.run_stdin_bytes(&["checkout-index", "-u", "-q", "-z", "--stdin"], &input)?;
+    }
+    // Placed files have no stat data in the index yet; their bytes are right
+    // either way, so a failure here changes nothing.
+    let _ = git.run(&["update-index", "-q", "--refresh"]);
+
+    if let Some((store, cands)) = shared {
+        let fresh: Vec<Candidate> = cands.into_iter().filter(|c| !store.has(&c.key)).collect();
+        if !fresh.is_empty() {
+            let mut report = ShareReport::default();
+            // Adopting is for later trees; this one is complete without it.
+            if let Ok(matched) = verify(tree, fresh, &mut report) {
+                for (c, s) in matched {
+                    match adopt_one(&store, &c, &tree.join(&c.path), &s) {
+                        Err(e) if e.kind() == io::ErrorKind::Unsupported => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The clone store, when it can share files with `tree`.
+fn sharing_store(home: &BaleHome, tree: &Path) -> Option<CloneStore> {
+    let store = CloneStore::open(home).ok()?;
+    same_volume(&home.clones_dir(), tree)
+        .ok()
+        .filter(|&same| same)
+        .map(|_| store)
 }
 
 /// Whether the file at `path` holds the bytes `key` names. `dir` is any

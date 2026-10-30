@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::clones::share::materialize;
 use crate::config::load_config;
 use crate::git::{self, Git};
 use crate::ops::up::register_untraced;
@@ -55,12 +56,19 @@ fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) 
     let p = path.to_string_lossy();
     let added = branch_exists(&g, branch).and_then(|exists| {
         if exists {
-            g.run(&["worktree", "add", "--", &p, branch])
+            g.run(&["worktree", "add", "--no-checkout", "--", &p, branch])
         } else {
-            g.run(&["worktree", "add", "-b", branch, "--", &p])
+            g.run(&["worktree", "add", "--no-checkout", "-b", branch, "--", &p])
         }
     });
-    if let Err(e) = added {
+    let filled = added.and_then(|_| {
+        let cfg = load_config(home, Some(&main))?;
+        materialize(home, &path, &cfg).inspect_err(|_| {
+            // The tree is new and holds no user changes yet.
+            let _ = g.run(&["worktree", "remove", "--force", "--", &p]);
+        })
+    });
+    if let Err(e) = filled {
         // Undo only the dirs made above; remove_dir leaves any non-empty one.
         for dir in &created {
             let _ = fs::remove_dir(dir);
