@@ -1,0 +1,16 @@
+{
+  "name": "bale",
+  "owner": {
+    "name": "Brandon McAnsh"
+  },
+  "metadata": {
+    "description": "bale: keeps agent worktrees from filling your disk."
+  },
+  "plugins": [
+    {
+      "name": "bale",
+      "source": "./plugins/bale",
+      "description": "Keeps agent worktrees from filling your disk."
+    }
+  ]
+}

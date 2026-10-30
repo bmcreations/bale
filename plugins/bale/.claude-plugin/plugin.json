@@ -1,0 +1,9 @@
+{
+  "name": "bale",
+  "version": "0.1.0",
+  "description": "Keeps agent worktrees from filling your disk: idle worktrees drop build output, and it comes back before an agent needs it.",
+  "author": { "name": "Brandon McAnsh" },
+  "homepage": "https://github.com/bmcreations/bale",
+  "repository": "https://github.com/bmcreations/bale",
+  "license": "MIT OR Apache-2.0"
+}

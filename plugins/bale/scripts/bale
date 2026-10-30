@@ -1,0 +1,69 @@
+#!/bin/sh
+# Launcher for the bale Claude Code plugin.
+#
+# `bale ensure` (the SessionStart hook) downloads the release named below into
+# the plugin's data directory, which plugin updates keep, and installs the
+# sweep schedule pointing at it. Any other arguments run that binary. Hooks
+# never download: before the first download finishes they do nothing, except
+# WorktreeCreate, which fails so Claude Code reports it.
+set -eu
+
+BALE_VERSION="0.1.0"
+repo="bmcreations/bale"
+data="${CLAUDE_PLUGIN_DATA:?bale: CLAUDE_PLUGIN_DATA is not set}"
+bin="$data/bin/bale"
+stamp="$data/bin/version"
+
+ensure() {
+  if [ -x "$bin" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$BALE_VERSION" ]; then
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) os=apple-darwin ;;
+    Linux) os=unknown-linux-musl ;;
+    *) echo "bale: the plugin has no binary for $(uname -s); see https://github.com/$repo#install" >&2; return 0 ;;
+  esac
+  case "$(uname -m)" in
+    arm64 | aarch64) arch=aarch64 ;;
+    x86_64 | amd64) arch=x86_64 ;;
+    *) echo "bale: the plugin has no binary for $(uname -m)" >&2; return 0 ;;
+  esac
+  mkdir -p "$data/bin"
+  # Sessions starting together download once; the rest skip this round.
+  lock="$data/bin/.lock"
+  mkdir "$lock" 2>/dev/null || return 0
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"; rmdir "$lock" 2>/dev/null || true' EXIT
+  archive="bale-v$BALE_VERSION-$arch-$os.tar.gz"
+  url="https://github.com/$repo/releases/download/v$BALE_VERSION/$archive"
+  curl -fsSL "$url" -o "$tmp/$archive"
+  curl -fsSL "$url.sha256" -o "$tmp/$archive.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    (cd "$tmp" && shasum -a 256 -c "$archive.sha256" >/dev/null)
+  else
+    (cd "$tmp" && sha256sum -c "$archive.sha256" >/dev/null)
+  fi
+  tar -xzf "$tmp/$archive" -C "$tmp"
+  cp "$tmp/bale" "$bin.new"
+  chmod +x "$bin.new"
+  mv -f "$bin.new" "$bin"
+  "$bin" install >&2
+  echo "$BALE_VERSION" > "$stamp"
+  echo "bale: installed $BALE_VERSION" >&2
+}
+
+if [ "${1:-}" = "ensure" ]; then
+  # SessionStart stdout goes into the model's context; keep it quiet.
+  # A subshell so set -e stops ensure at the first failed step (it is
+  # ignored in a function called from an || list).
+  set +e
+  (set -e; ensure) >&2
+  [ $? -eq 0 ] || echo "bale: download failed; the next session retries" >&2
+  exit 0
+fi
+
+if [ ! -x "$bin" ]; then
+  [ "${3:-}" = "create" ] && { echo "bale: not downloaded yet; start a new session" >&2; exit 1; }
+  exit 0
+fi
+exec "$bin" "$@"
