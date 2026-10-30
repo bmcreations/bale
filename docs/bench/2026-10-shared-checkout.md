@@ -70,3 +70,36 @@ Tracked blobs of 1 MiB or more at `HEAD`, across trees on disk, counting every c
 13 of the 14 Android trees are baled, so the sweep could share them right away; the hot one waits until
 `up` bales it. This assumes no copies share blocks today. The `w3`/`w4` run supports that for checkouts written by
 `git worktree add`.
+
+## After implementation
+
+Run on 2026-10-30 with bale's own `bale share` and `bale new` (release build of `feat/shared-checkout` at
+`939ff9e`), same Mac. The Android repo was at `c934c9138`, where 117 tracked files of 1 MiB or more hold
+943 MiB. `BALE_HOME` and every tree sat on a 20 GiB sparse APFS disk image made for the run. A first
+attempt on the Data volume itself was unreadable: `df` free moved by up to 2 GiB between 10 s samples while
+nothing of this run was writing, most likely from other processes on the Mac. On the image `df` held
+within 480 KiB over 30 s after each step. One run per case.
+
+Trees `w1`..`w3` were `git worktree add --detach` checkouts of the repo, registered with `bale adopt`.
+
+| Step | `df` free change | Time |
+|---|---|---|
+| `git worktree add` (each of `w1`..`w3`) | -1,002 MiB | 3.9 to 4.9 s |
+| `bale share w1`, empty store | +6 MiB; 117 files shared, 115 stored | 7.3 s |
+| `bale share w2`, store filled | +940 MiB | 7.4 s |
+| `bale share w3`, store filled | +939 MiB | 6.6 s |
+
+`w2` and `w3` together freed 1,879 MiB. The first share frees almost nothing: it clones each file into the
+store and back, so the tree and the store share the same blocks. The store held 115 files, 933 MiB by `du`;
+two of the 117 paths are duplicates of other blobs. `git status --porcelain` was empty in all three trees.
+
+`bale new` creates a branch, and the repo's only branch at `HEAD` is checked out in its main checkout, so it
+ran against a `git clone --shared --no-checkout` of the repo on the image instead, with the store above:
+
+| Command | `df` free change | Time | First `git status` |
+|---|---|---|---|
+| `git worktree add --detach` | -1,002 MiB | 3.75 s | 0.20 s |
+| `bale new` | -62 MiB | 4.42 s | 0.08 s |
+
+`bale new` took 0.67 s longer here; where that time goes wasn't profiled. On the Data volume, in the
+unreadable first attempt, the same pair took 5.35 s and 5.25 s.

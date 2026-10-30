@@ -13,7 +13,7 @@ replay it later. It records:
   checkout and its build output take on disk, the space of Xcode's shared
   DerivedData built from it (`global_dd_bytes`, which `bale up` also
   removes on macOS), and what sweep decided;
-- each operation (`new`, `adopt`, `up`, `cold`, `open`, `gc`, `touch`): its outcome,
+- each operation (`new`, `adopt`, `up`, `cold`, `open`, `share`, `gc`, `touch`): its outcome,
   a fixed reason code when it did not succeed, how long it took, what
   started it (`cli`, `sweep` or a tool's hook), and for `up` and `cold` the
   free space gained. A `cold` run by a tool's remove or archive hook also

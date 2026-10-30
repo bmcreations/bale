@@ -22,8 +22,9 @@ no extra blocks.
 
 ### The clone store
 
-`BALE_HOME/clones/<repo-key>/` holds one file per distinct content, written once and never changed:
-`git/<oid>` for an ordinary blob, `lfs/<sha256>` for a Git LFS object. Only files of `clone_min_bytes` or
+`BALE_HOME/clones/` holds one file per distinct content, written once and never changed:
+`git/<oid[..2]>/<oid>` for an ordinary blob, `lfs/<sha256[..2]>/<sha256>` for a Git LFS object. One store
+serves every repo, because an oid or SHA-256 names the same bytes in any repo. Only files of `clone_min_bytes` or
 more go in (default 1 MiB, the same cut as stash).
 
 The store must sit on the same volume as the checkout, because a clone can't cross volumes. bale compares
