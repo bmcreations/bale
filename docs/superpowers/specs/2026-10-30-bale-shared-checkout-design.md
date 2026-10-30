@@ -40,11 +40,10 @@ pointer carries that object's SHA-256 and size, so bale keys the file on them in
   (`version https://git-lfs.github.com/spec/v1`, `oid sha256:<hex>`, `size <n>`). The pointer's `size`
   decides whether it clears `clone_min_bytes`.
 - Before a working file is stored or replaced, bale checks that its SHA-256 matches the pointer.
-- The store is seeded by cloning from LFS's own object store (`<git-common-dir>/lfs/objects/<aa>/<bb>/<sha256>`)
-  when the object is there, so the first checkout costs no extra copy. LFS objects are never rewritten, and
-  a clone keeps its blocks if `git lfs prune` later deletes the original.
-- An object in neither store is left to `git checkout-index`, which runs LFS's smudge filter and downloads
-  it as it does today.
+- The store fills by adopting verified worktree files, the same as for other files. Seeding it from LFS's
+  own object store (`<git-common-dir>/lfs/objects/<aa>/<bb>/<sha256>`) was planned but is not built.
+- An object not in the clone store is left to `git checkout-index`, which runs LFS's smudge filter and
+  downloads it as it does today.
 
 LFS's object store already shares one copy between worktrees of a repo, but every checkout still writes its
 own working copy. This removes that copy.

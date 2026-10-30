@@ -77,7 +77,7 @@ Run on 2026-10-30 with bale's own `bale share` and `bale new` (release build of 
 `939ff9e`), same Mac. The Android repo was at `c934c9138`, where 117 tracked files of 1 MiB or more hold
 943 MiB. `BALE_HOME` and every tree sat on a 20 GiB sparse APFS disk image made for the run. A first
 attempt on the Data volume itself was unreadable: `df` free moved by up to 2 GiB between 10 s samples while
-nothing of this run was writing, most likely from other processes on the Mac. On the image `df` held
+nothing of this run was writing; the cause was not identified. On the image `df` held
 within 480 KiB over 30 s after each step. One run per case.
 
 Trees `w1`..`w3` were `git worktree add --detach` checkouts of the repo, registered with `bale adopt`.
@@ -90,8 +90,8 @@ Trees `w1`..`w3` were `git worktree add --detach` checkouts of the repo, registe
 | `bale share w3`, store filled | +939 MiB | 6.6 s |
 
 `w2` and `w3` together freed 1,879 MiB. The first share frees almost nothing: it clones each file into the
-store and back, so the tree and the store share the same blocks. The store held 115 files, 933 MiB by `du`;
-two of the 117 paths are duplicates of other blobs. `git status --porcelain` was empty in all three trees.
+store and back, so the tree and the store share the same blocks. The store held 115 files, 933 MiB by `du`:
+117 paths, 115 distinct blobs. `git status --porcelain` was empty in all three trees.
 
 `bale new` creates a branch, and the repo's only branch at `HEAD` is checked out in its main checkout, so it
 ran against a `git clone --shared --no-checkout` of the repo on the image instead, with the store above:
