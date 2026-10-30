@@ -1,0 +1,117 @@
+name: release
+
+# Pushing a vX.Y.Z tag builds bale for each target, publishes a GitHub
+# release with the archives and their sha256 files, and writes bale.rb into
+# bmcreations/homebrew-tap. The tag, the workspace version and the plugin's
+# pinned version must agree, so the plugin downloads the release it ships with.
+
+on:
+  push:
+    tags: ["v*"]
+  # A PR touching the release files builds and packages every target without
+  # publishing anything.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/check-release-version.sh
+      - scripts/homebrew-formula.sh
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace and plugin versions
+        if: github.event_name == 'push'
+        run: scripts/check-release-version.sh "${GITHUB_REF_NAME#v}"
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        shell: bash
+        run: |
+          # zstd-sys compiles C; point cc at musl-gcc for the musl targets.
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            t="${{ matrix.target }}"
+            export "CC_${t//-/_}=musl-gcc"
+          fi
+          cargo build --release --locked -p bale-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          name="bale-${tag}-${{ matrix.target }}"
+          dir="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            (cd "$dir" && 7z a "$GITHUB_WORKSPACE/dist/$name.zip" bale.exe)
+            archive="dist/$name.zip"
+          else
+            tar -C "$dir" -czf "dist/$name.tar.gz" bale
+            archive="dist/$name.tar.gz"
+          fi
+          (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+      - name: The binary runs
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: target/${{ matrix.target }}/release/bale --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes \
+            --verify-tag
+      - name: Write bale.rb to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          scripts/homebrew-formula.sh "${GITHUB_REF_NAME#v}" dist > bale.rb
+          ruby -c bale.rb
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/bmcreations/homebrew-tap.git" tap
+          cp bale.rb tap/bale.rb
+          cd tap
+          git config user.name "Brandon McAnsh"
+          git config user.email "git@bmcreations.dev"
+          git add bale.rb
+          git commit -m "bale ${GITHUB_REF_NAME#v}"
+          git push

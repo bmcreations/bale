@@ -30,3 +30,6 @@ jobs:
       - name: bale-core names no tool
         if: matrix.os == 'ubuntu-latest'
         run: scripts/check-core-agnostic.sh
+      - name: Plugin pins the workspace version
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/check-release-version.sh "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"

@@ -53,13 +53,47 @@ Freed bytes count each removal, so output that is rebuilt and removed again coun
 
 ## Quick start
 
+Pick one of these. Each gets you a prebuilt binary for macOS (Apple Silicon or Intel) or Linux (x86_64 or
+arm64).
+
+**Claude Code plugin.** The plugin downloads bale, installs the sweep and registers the Claude Code hooks,
+so there is nothing else to run:
+
+```
+/plugin marketplace add bmcreations/bale
+/plugin install bale@bale
+```
+
+bale downloads when the next session starts, into the plugin's data directory. A plugin's `WorktreeCreate`
+hook does not run for `claude --worktree --tmux`, so if you start sessions that way, use one of the other
+installs and `bale install --hooks claude` instead. Plugin hooks also run alongside hooks in
+`settings.json`: if you already ran `bale install --hooks claude`, remove those with
+`bale uninstall --hooks claude` before installing the plugin.
+
+**Homebrew:**
+
+```
+brew install bmcreations/tap/bale
+bale install                 # sweep every 5 minutes (launchd on macOS)
+bale install --hooks claude  # or codex, t3; git, conductor, cursor also take --repo <repo>
+```
+
+**Install script** (installs to `~/.local/bin`; set `BALE_INSTALL_DIR` to change that):
+
+```
+curl -fsSL https://raw.githubusercontent.com/bmcreations/bale/main/install.sh | sh
+bale install
+bale install --hooks claude
+```
+
+**From source:**
+
 ```
 cargo build --release -p bale-cli
 cp target/release/bale ~/.local/bin/
-bale install                 # sweep every 5 minutes (launchd on macOS)
-bale install --hooks claude  # or codex, t3; git, conductor, cursor also take --repo <repo>
-bale ls                      # registered trees and their levels
 ```
+
+Then `bale ls` lists the registered trees and their levels.
 
 `bale <command> --help` lists every command's flags. New worktrees register through the hooks. To bring
 in worktrees that already exist, run `bale migrate <repo>` to see the plan and `bale migrate <repo>
