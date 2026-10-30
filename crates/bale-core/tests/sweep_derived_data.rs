@@ -521,3 +521,34 @@ fn up_leaves_a_learned_root_inside_another_registered_tree() {
     up(&fx.home(), &id_a).unwrap();
     assert!(in_c.join("Build/Products/out").exists());
 }
+
+#[test]
+fn up_with_an_unreadable_record_leaves_derived_data_of_a_nested_checkout() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    let a = xcode_tree(&fx, "a");
+    let b = a.join(".claude/worktrees/b");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    let id_a = register(&fx.home(), &a).unwrap().id;
+    let id_b = register(&fx.home(), &b).unwrap().id;
+    // B's record no longer parses, so bale can't tell B is registered.
+    fs::write(
+        fx.home().0.join(format!("registry/{id_b}.json")),
+        "{ not json",
+    )
+    .unwrap();
+    let learned_b = learned(&fx, "dd-b", &b);
+    let global_b = dd(&root, "App-b", Some(&b.join("App.xcodeproj")));
+    let global_a = dd(&root, "App-a", Some(&a.join("App.xcodeproj")));
+
+    let out = up(&fx.home(), &id_a).unwrap();
+    assert!(matches!(out, Outcome::Done(Level::Baled)), "{out:?}");
+    assert!(learned_b.join("Build/Products/out").exists());
+    assert!(global_b.join("Build/Products/out").exists());
+    // A's own folder still goes.
+    assert!(!global_a.exists());
+}

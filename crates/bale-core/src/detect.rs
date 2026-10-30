@@ -1,7 +1,7 @@
 //! Build-system detection and the regenerable directories each one produces.
 
 use crate::config::Config;
-use crate::derived_data::{global_for, is_derived_data_root};
+use crate::derived_data::{global_owned, is_derived_data_root, Trees};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -117,6 +117,18 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
 /// folder in Xcode's shared DerivedData built from this tree comes last, as a
 /// canonical path outside `root`.
 pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<PathBuf> {
+    stash_dirs_owned(root, systems, cfg, &Trees::default())
+}
+
+/// [`stash_dirs`], taking from Xcode's shared DerivedData only the folders
+/// the tree owns given the registered `trees` (see
+/// [`crate::derived_data::DdDir::owned_by`]), as `up` does.
+pub(crate) fn stash_dirs_owned(
+    root: &Path,
+    systems: &[BuildSystem],
+    cfg: &Config,
+    trees: &Trees,
+) -> Vec<PathBuf> {
     let gradle = systems.contains(&BuildSystem::Gradle);
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     let mut out = Vec::new();
@@ -134,7 +146,7 @@ pub fn stash_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> Vec<Pat
         }
     }
     if cfg!(target_os = "macos") {
-        for dd in global_for(root) {
+        for dd in global_owned(root, trees) {
             let build = dd.join("Build");
             if !real_dir(&dd) || !real_dir(&build) {
                 continue;

@@ -462,13 +462,14 @@ fn logs_of(dd: &Path) -> Vec<BuildLog> {
 
 /// For each tree root (as [`workspace_key`]; `None` for a record that did
 /// not parse), the positions in `index` of the shared DerivedData folders
-/// built from it.
+/// it owns (see [`DdDir::owned_by`]), as `up` and `stash` see them.
 fn match_trees(index: &[DdDir], roots: &[Option<PathBuf>]) -> Vec<Vec<usize>> {
+    let trees = crate::derived_data::Trees::from_keys(roots);
     roots
         .iter()
         .map(|root| match root {
             Some(root) => (0..index.len())
-                .filter(|&i| index[i].built_from(root))
+                .filter(|&i| index[i].owned_by(root, &trees))
                 .collect(),
             None => Vec::new(),
         })
@@ -754,7 +755,7 @@ fn plan(home: &BaleHome, record: &Record) -> Result<(Action, Option<SystemTime>)
 /// removes those folders; elsewhere a `true` would re-run `up` on every sweep.
 #[cfg(target_os = "macos")]
 fn has_shared_derived_data(home: &BaleHome, root: &Path) -> bool {
-    let trees = crate::derived_data::registered_trees(home);
+    let trees = crate::derived_data::Trees::registered(home);
     !crate::derived_data::global_owned(root, &trees).is_empty()
         || !crate::derived_data::learned_for(home, root, &trees).is_empty()
 }
@@ -887,12 +888,12 @@ mod tests {
     }
 
     #[test]
-    fn a_global_dd_dir_is_walked_once_when_several_trees_resolve_to_it() {
+    fn a_global_dd_dir_counts_for_the_deepest_tree_only_and_is_walked_once() {
         let (_tmp, index, roots) = nested_trees();
         assert_eq!(index.len(), 3);
         let matches = match_trees(&index, &roots);
-        assert_eq!(matches[0], matches[1], "{matches:?}");
-        assert_eq!(matches[0].len(), 1, "{matches:?}");
+        assert!(matches[0].is_empty(), "{matches:?}");
+        assert_eq!(matches[1].len(), 1, "{matches:?}");
 
         let walks = std::sync::Mutex::new(Vec::new());
         let global = size_global_dd(&index, &matches, &[true, true], |dir, _| {
@@ -910,7 +911,24 @@ mod tests {
             bytes: 100,
             truncated: false,
         });
-        assert_eq!(global.per_tree, vec![shared, shared]);
+        let none = Some(DdBytes {
+            bytes: 0,
+            truncated: false,
+        });
+        assert_eq!(global.per_tree, vec![none, shared]);
+    }
+
+    #[test]
+    fn an_unparsed_record_leaves_dd_of_a_nested_checkout_unmatched() {
+        let (tmp, index, roots) = nested_trees();
+        let outer = roots[0].clone();
+        // The inner tree's record did not parse.
+        let roots = vec![outer.clone(), None];
+        assert_eq!(match_trees(&index, &roots)[0].len(), 1);
+        // Once `outer/sub` has a `.git` file, it is taken for that tree.
+        let base = crate::paths::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("outer/sub/.git"), "gitdir: x\n").unwrap();
+        assert!(match_trees(&index, &roots)[0].is_empty());
     }
 
     #[test]

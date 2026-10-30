@@ -256,3 +256,29 @@ fn commitment_changes_when_root_changes() {
         PathBuf::from("/tree/Build/a.bin")
     );
 }
+
+#[test]
+fn stash_leaves_global_dd_of_a_registered_tree_nested_inside() {
+    let t = setup("App-outer");
+    let home = t.fx.home();
+    let b = t.wt.join(".claude/worktrees/b");
+    support::git(
+        &t.fx.repo,
+        &["worktree", "add", "-q", "-b", "b", b.to_str().unwrap()],
+    );
+    fs::create_dir_all(b.join("App.xcodeproj")).unwrap();
+    register(&home, &b).unwrap();
+    let dd_b = user_home().join("Library/Developer/Xcode/DerivedData/App-nested");
+    write_plist(&dd_b, Some(&b.join("App.xcodeproj")));
+    fs::create_dir_all(dd_b.join("Build/Products")).unwrap();
+    fs::write(dd_b.join("Build/Products/b.bin"), noise(2 * MIB, 9)).unwrap();
+
+    let StashOutcome::Stashed(_) = stash(&home, &t.id, &[]).unwrap() else {
+        panic!("not stashed");
+    };
+    assert_eq!(len(&t.dd.join(G_REL)), 0);
+    assert_eq!(len(&dd_b.join("Build/Products/b.bin")), (2 * MIB) as u64);
+    let m = manifest(&home, &t.id);
+    let dd_b = fs::canonicalize(&dd_b).unwrap();
+    assert!(!m.roots.contains(&dd_b), "{:?}", m.roots);
+}

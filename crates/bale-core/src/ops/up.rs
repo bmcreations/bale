@@ -323,10 +323,7 @@ fn up_locked_report(home: &BaleHome, id: &str, ignore: &[u32]) -> Result<UpRepor
     let mut kept = Vec::new();
     // A DerivedData folder belongs to the deepest registered tree holding
     // its project, so `up` leaves those of a tree nested in this one.
-    #[cfg(target_os = "macos")]
-    let trees = crate::derived_data::registered_trees(home);
-    #[cfg(not(target_os = "macos"))]
-    let trees: Vec<PathBuf> = Vec::new();
+    let trees = crate::derived_data::Trees::registered(home);
     match record.level {
         Level::Cooling | Level::Cold => return skip(SkipCode::Cold, "cold"),
         Level::Opening => return skip(SkipCode::Opening, OPENING),
@@ -698,7 +695,7 @@ fn idle(dir: &Path, ignore: &[u32]) -> Result<(), String> {
 fn remove_learned(
     home: &BaleHome,
     root: &Path,
-    trees: &[PathBuf],
+    trees: &crate::derived_data::Trees,
     ignore: &[u32],
 ) -> (Vec<PathBuf>, Vec<String>) {
     let mut removed = Vec::new();
@@ -724,7 +721,7 @@ fn remove_learned(
 fn remove_derived_data(
     root: &Path,
     dd_root: &Path,
-    trees: &[PathBuf],
+    trees: &crate::derived_data::Trees,
     ignore: &[u32],
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -859,7 +856,13 @@ mod tests {
     #[test]
     fn missing_derived_data_root_is_not_a_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(remove_derived_data(tmp.path(), &tmp.path().join("nope"), &[], &[]).is_empty());
+        assert!(remove_derived_data(
+            tmp.path(),
+            &tmp.path().join("nope"),
+            &Default::default(),
+            &[],
+        )
+        .is_empty());
     }
 
     #[cfg(unix)]
@@ -883,7 +886,7 @@ mod tests {
         let locked = folder.join("Build/locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &[], &[]);
+        let failures = remove_derived_data(&ws, &tmp.path().join("dd"), &Default::default(), &[]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("App-abc"), "{failures:?}");
