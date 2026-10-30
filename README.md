@@ -1,9 +1,9 @@
-# bale
-
-bale keeps agent worktrees from filling your disk.
+<p align="center">
+  <img src="docs/images/hero.svg" alt="bale: keep agent worktrees from filling your disk" width="900">
+</p>
 
 Run four coding agents at once and you have a dozen worktrees, each with its own build output. One
-Flipcash iOS worktree's DerivedData is 9.4 GiB, so a dozen of them is over 100 GiB. Deleting worktrees
+iOS app's worktree holds 9.4 GiB of DerivedData, so a dozen of them is over 100 GiB. Deleting worktrees
 by hand loses uncommitted work, and deleting build output means waiting for a full rebuild the next
 time an agent picks the tree up.
 
@@ -17,7 +17,7 @@ baled tree fills back in when an agent uses it again; a cold one comes back with
 - **Stashes build output between prompts.** Ten minutes after a Claude Code session goes quiet, bale
   compresses the tree's large build files into a deduplicated zstd store and empties them in place. On
   the next prompt the hook writes them back into the same inodes before any tool runs, so Xcode sees
-  nothing changed. On a Flipcash iOS tree, a stash freed 5.0 GiB and stored 979 MiB, and the build after
+  nothing changed. On an iOS app's tree, a stash freed 5.0 GiB and stored 979 MiB, and the build after
   the restore compiled and linked nothing ([bench](docs/bench/2026-10-warm-tier.md)).
 - **Bales idle trees.** After 4 hours idle, bale deletes the tree's regenerable build output: Xcode
   DerivedData (including folders an agent pointed `-derivedDataPath` at), Gradle's `build`, `.gradle`,
@@ -27,7 +27,7 @@ baled tree fills back in when an agent uses it again; a cold one comes back with
   files and deletes the checkout. `bale open` puts it back at the same path. It refuses a tree that a
   process still holds.
 - **Shares Swift packages across worktrees.** Trees of the same repo link one `SourcePackages` copy,
-  which saved about 2.1 GiB per extra tree on Flipcash ([bench](docs/bench/2026-10-shared-packages.md)).
+  which saved about 2.1 GiB per extra tree on the same app ([bench](docs/bench/2026-10-shared-packages.md)).
 - **Cleans up after agents that are gone.** DerivedData left in a finished session's scratchpad is
   deleted once its project has been gone for an hour and nothing holds it.
 - **Stays out of the way.** A hook call on a tree that isn't stashed takes about 20 ms. Setup hooks never
