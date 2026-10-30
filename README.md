@@ -66,6 +66,7 @@ uses to ignore Conductor itself are a guess until then.
 
 | Command | What it does |
 |---|---|
+| `bale history [--days N] [--json] [--html FILE]` | Per UTC day over the last N days (default 7): sweeps run, the lowest free space they measured, and the bytes `up`, `cold`, `reap`, `spm_gc` and `gc` freed, read from the usage trace. `--html` also writes a chart. |
 | `bale ls [--json]` | Lists registered worktrees: id, level, last activity, branch, session and path. A `*` before the level marks a pinned tree. |
 | `bale show [TARGET]` | Shows one tree: level, pin, origin tool and session, title, and a git scope (branch and upstream, unpushed commits, last commit, uncommitted changes). |
 | `bale pin [TARGET]` / `bale unpin [TARGET]` | Pinned trees are skipped by `bale sweep`. |

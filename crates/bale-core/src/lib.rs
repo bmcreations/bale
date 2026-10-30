@@ -3,6 +3,7 @@ pub mod config;
 pub mod derived_data;
 pub mod detect;
 pub mod git;
+pub mod history;
 pub mod idle;
 pub mod lock;
 pub mod ops;

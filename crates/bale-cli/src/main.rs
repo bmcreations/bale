@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use bale_core::history::{utc_minute, History};
 use bale_core::ops::cold::cold_ignoring;
 use bale_core::ops::gc::{gc, GcReport};
 use bale_core::ops::meta::set_pinned;
@@ -166,6 +167,18 @@ enum Command {
         /// Print the records as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Free disk space and bytes freed per day, read from the usage trace.
+    History {
+        /// Days to cover, ending today (UTC).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..))]
+        days: u32,
+        /// Print the samples and freed bytes as JSON.
+        #[arg(long, conflicts_with = "html")]
+        json: bool,
+        /// Also write a chart of free space and freed bytes to this HTML file.
+        #[arg(long, value_name = "FILE")]
+        html: Option<PathBuf>,
     },
     /// The local usage trace bale records for benchmarking.
     Trace {
@@ -412,6 +425,9 @@ fn run(command: Command, home: BaleHome) -> Result<ExitCode> {
         Command::Unpin { target } => cmd_pin(&home, &target, false),
         Command::Show { target } => cmd_show(&home, &target).map(|()| ExitCode::SUCCESS),
         Command::Ls { json } => cmd_ls(&home, json).map(|()| ExitCode::SUCCESS),
+        Command::History { days, json, html } => {
+            cmd_history(&home, days, json, html.as_deref()).map(|()| ExitCode::SUCCESS)
+        }
         Command::Trace {
             command: TraceCommand::Path,
         } => {
@@ -722,6 +738,179 @@ fn plan_lines(rows: &[PlanRow]) -> Vec<String> {
     lines
 }
 
+fn cmd_history(home: &BaleHome, days: u32, json: bool, html: Option<&Path>) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let since_day = now.div_euclid(86_400) - i64::from(days) + 1;
+    let history = History::load(home, Some(since_day))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&history)?);
+        return Ok(());
+    }
+    for line in history_lines(&history) {
+        println!("{line}");
+    }
+    if let Some(path) = html {
+        std::fs::write(path, history_html(&history))
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("chart: {}", path.display());
+    }
+    Ok(())
+}
+
+/// The operations `bale history` gives a column, in column order.
+const FREED_OPS: [&str; 5] = ["up", "cold", "reap", "spm_gc", "gc"];
+
+/// `bale history`'s table: one row per UTC day, then the totals.
+fn history_lines(history: &History) -> Vec<String> {
+    let days = history.days();
+    if days.is_empty() {
+        return vec!["no sweeps or freed bytes in the trace for these days".to_string()];
+    }
+    let cell = |b: u64| if b == 0 { "-".to_string() } else { human(b) };
+    let mut lines = vec![format!(
+        "{:<10}  {:>6}  {:>21}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "DAY (UTC)", "SWEEPS", "LOWEST FREE", "UP", "COLD", "REAP", "SPM_GC", "GC"
+    )];
+    for d in &days {
+        let lowest = d.lowest.as_ref().map_or("-".to_string(), |s| {
+            format!("{} at {}", human(s.free_bytes), &utc_minute(s.at)[11..])
+        });
+        let freed = FREED_OPS.map(|op| cell(d.freed.get(op).copied().unwrap_or(0)));
+        lines.push(format!(
+            "{:<10}  {:>6}  {:>21}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            d.date, d.sweeps, lowest, freed[0], freed[1], freed[2], freed[3], freed[4]
+        ));
+    }
+    lines.push(String::new());
+    let by_op = history.freed_by_op();
+    let total: u64 = by_op.values().sum();
+    let parts: Vec<String> = by_op
+        .iter()
+        .map(|(op, b)| format!("{op} {}", human(*b)))
+        .collect();
+    lines.push(format!("freed {} ({})", human(total), parts.join(", ")));
+    if let Some(low) = history.lowest() {
+        lines.push(format!(
+            "lowest free {} at {} UTC",
+            human(low.free_bytes),
+            utc_minute(low.at)
+        ));
+    }
+    lines.push(
+        "Freed bytes count each removal, so output that is rebuilt and removed again counts twice."
+            .to_string(),
+    );
+    lines
+}
+
+/// A standalone page charting free space (line) and bytes freed per hour
+/// (bars) over the history, then the daily table.
+fn history_html(history: &History) -> String {
+    const W: f64 = 960.0;
+    const H: f64 = 320.0;
+    const PAD: f64 = 48.0;
+    const GIB: f64 = (1u64 << 30) as f64;
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let table = escape(&history_lines(history).join("\n"));
+    let first = history
+        .samples
+        .first()
+        .map(|s| s.at)
+        .into_iter()
+        .chain(history.freed.first().map(|f| f.at))
+        .min();
+    let last = history
+        .samples
+        .last()
+        .map(|s| s.at)
+        .into_iter()
+        .chain(history.freed.last().map(|f| f.at))
+        .max();
+    let mut svg = String::new();
+    if let (Some(t0), Some(t1)) = (first, last) {
+        let span = (t1 - t0).max(3600) as f64;
+        let mut hours: std::collections::BTreeMap<i64, u64> = Default::default();
+        for f in &history.freed {
+            *hours.entry(f.at.div_euclid(3600)).or_insert(0) += f.bytes;
+        }
+        let top = history
+            .samples
+            .iter()
+            .map(|s| s.free_bytes as f64 / GIB)
+            .chain(hours.values().map(|&b| b as f64 / GIB))
+            .fold(20.0_f64, f64::max)
+            * 1.1;
+        let x = |t: i64| PAD + (t - t0) as f64 / span * (W - 2.0 * PAD);
+        let y = |gib: f64| H - PAD - gib / top * (H - 2.0 * PAD);
+        let bar_w = (3600.0 / span * (W - 2.0 * PAD)).max(1.0);
+        svg.push_str(&format!(
+            "<svg viewBox=\"0 0 {W} {H}\" role=\"img\" aria-label=\"Free disk space and bytes freed over time\">\n"
+        ));
+        for i in 0..=4 {
+            let gib = top * f64::from(i) / 4.0;
+            svg.push_str(&format!(
+                "<line class=\"grid\" x1=\"{PAD}\" x2=\"{}\" y1=\"{y:.1}\" y2=\"{y:.1}\"/><text x=\"{}\" y=\"{:.1}\" text-anchor=\"end\">{gib:.0} GiB</text>\n",
+                W - PAD,
+                PAD - 6.0,
+                y(gib) + 4.0,
+                y = y(gib),
+            ));
+        }
+        for (&hour, &bytes) in &hours {
+            let top_y = y(bytes as f64 / GIB);
+            // The first and last hours can start before or end after the
+            // plot; clip them to it.
+            let left = x(hour * 3600).max(PAD);
+            let right = (x(hour * 3600) + bar_w).min(W - PAD);
+            svg.push_str(&format!(
+                "<rect class=\"freed\" x=\"{left:.1}\" y=\"{top_y:.1}\" width=\"{:.1}\" height=\"{:.1}\"><title>{} UTC: freed {}</title></rect>\n",
+                (right - left).max(1.0),
+                H - PAD - top_y,
+                utc_minute(hour * 3600),
+                human(bytes),
+            ));
+        }
+        let points: Vec<String> = history
+            .samples
+            .iter()
+            .map(|s| format!("{:.1},{:.1}", x(s.at), y(s.free_bytes as f64 / GIB)))
+            .collect();
+        svg.push_str(&format!(
+            "<polyline class=\"free\" points=\"{}\"/>\n",
+            points.join(" ")
+        ));
+        svg.push_str(&format!(
+            "<text x=\"{PAD}\" y=\"{}\">{} UTC</text><text x=\"{}\" y=\"{}\" text-anchor=\"end\">{} UTC</text>\n</svg>\n",
+            H - PAD + 18.0,
+            utc_minute(t0),
+            W - PAD,
+            H - PAD + 18.0,
+            utc_minute(t1),
+        ));
+    }
+    format!(
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>bale history</title>\n<style>\n\
+         body {{ font: 14px system-ui, sans-serif; margin: 24px; color: #1f2328; background: #fff; }}\n\
+         svg {{ width: 100%; max-width: 960px; }}\n\
+         svg text {{ font-size: 11px; fill: #59636e; }}\n\
+         .grid {{ stroke: #d1d9e0; stroke-width: 1; }}\n\
+         .free {{ fill: none; stroke: #0969da; stroke-width: 2; }}\n\
+         .freed {{ fill: #bf8700; opacity: .7; }}\n\
+         .key span {{ display: inline-block; width: 12px; height: 12px; margin: 0 4px 0 12px; vertical-align: -1px; }}\n\
+         pre {{ font: 12px ui-monospace, monospace; }}\n\
+         @media (prefers-color-scheme: dark) {{ body {{ color: #e6edf3; background: #0d1117; }} svg text {{ fill: #9198a1; }} .grid {{ stroke: #30363d; }} .free {{ stroke: #4493f8; }} }}\n\
+         </style></head><body>\n<h1>bale history</h1>\n\
+         <p class=\"key\"><span style=\"background:#0969da\"></span>free space on the tightest volume, per sweep<span style=\"background:#bf8700\"></span>bytes freed per hour</p>\n\
+         {svg}<pre>{table}</pre>\n</body></html>\n"
+    )
+}
+
 /// Bytes in binary units with one decimal, e.g. `1.5 GiB`.
 fn human(bytes: u64) -> String {
     bale_core::human_bytes(bytes)
@@ -1003,6 +1192,50 @@ mod tests {
         let lines = sweep_lines("abc", &Action::Up, "error: boom");
         assert_eq!(count(&lines, "boom"), 1, "{lines:?}");
         assert!(lines.iter().all(|(err, _)| *err), "{lines:?}");
+    }
+
+    #[test]
+    fn history_table_and_chart() {
+        use bale_core::history::{Freed, Sample};
+        const GIB: u64 = 1 << 30;
+        let empty = History::default();
+        assert_eq!(
+            history_lines(&empty),
+            ["no sweeps or freed bytes in the trace for these days"]
+        );
+        assert!(!history_html(&empty).contains("<svg"));
+
+        // 2026-10-28 10:00 and 11:00 UTC.
+        let h = History {
+            samples: vec![
+                Sample {
+                    at: 1_793_181_600,
+                    free_bytes: 30 * GIB,
+                    total_bytes: 100 * GIB,
+                },
+                Sample {
+                    at: 1_793_185_200,
+                    free_bytes: 25 * GIB,
+                    total_bytes: 100 * GIB,
+                },
+            ],
+            freed: vec![Freed {
+                at: 1_793_183_400,
+                op: "reap".into(),
+                bytes: 4 * GIB,
+            }],
+        };
+        let lines = history_lines(&h);
+        assert!(lines[1].starts_with("2026-10-28"), "{lines:?}");
+        assert!(lines[1].contains("25.0 GiB at 11:00"), "{lines:?}");
+        assert!(lines[1].contains("4.0 GiB"), "{lines:?}");
+        assert!(lines.contains(&"freed 4.0 GiB (reap 4.0 GiB)".to_string()));
+        assert!(lines.contains(&"lowest free 25.0 GiB at 2026-10-28 11:00 UTC".to_string()));
+
+        let html = history_html(&h);
+        assert_eq!(html.matches("<rect class=\"freed\"").count(), 1);
+        assert!(html.contains("2026-10-28 10:00 UTC: freed 4.0 GiB"));
+        assert_eq!(html.matches("<polyline").count(), 1);
     }
 
     #[test]
