@@ -776,6 +776,60 @@ fn learn_dd_roots(home: &BaleHome, payload: &Value, cwd: &Path) {
     }
 }
 
+/// Names the folder that holds Claude Code's per-user temp folders, in place
+/// of `/tmp`. Tests point it away from the real one.
+const TMP_ENV: &str = "BALE_CLAUDE_TMP";
+
+/// Claude Code's session scratchpads, where agents put the build folders
+/// they name with `-derivedDataPath`:
+/// `/tmp/claude-<uid>/<project>/<session>/scratchpad`, with `/tmp` resolved
+/// (`/private/tmp` on macOS) or replaced by `$BALE_CLAUDE_TMP`. Empty
+/// off macOS, where bale reaps no Xcode builds.
+pub fn scratchpads() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = match std::env::var_os(TMP_ENV) {
+            Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
+            _ => bale_core::paths::canonicalize("/tmp").ok(),
+        };
+        tmp.map(|t| scratchpads_in(&t)).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = TMP_ENV;
+        Vec::new()
+    }
+}
+
+/// The scratchpads under `tmp/claude-<uid>`, reached through no symlink.
+#[cfg(target_os = "macos")]
+fn scratchpads_in(tmp: &Path) -> Vec<PathBuf> {
+    let base = tmp.join(format!("claude-{}", bale_core::paths::uid()));
+    let mut pads = Vec::new();
+    for project in plain_subdirs(&base) {
+        for session in plain_subdirs(&project) {
+            let pad = session.join("scratchpad");
+            if fs::symlink_metadata(&pad).is_ok_and(|m| m.is_dir()) {
+                pads.push(pad);
+            }
+        }
+    }
+    pads
+}
+
+/// The subfolders of `dir` that are not symlinks; none when it can't be read.
+#[cfg(target_os = "macos")]
+fn plain_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
 const DD_FLAG: &str = "-derivedDataPath";
 
 /// The argument after each `-derivedDataPath` in `command`, as an absolute
@@ -1321,6 +1375,25 @@ pub fn uninstall_plan(home: &Path, backups: &Path) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn scratchpads_lists_this_users_session_scratchpads() {
+        let t = tempfile::tempdir().unwrap();
+        let mine = t.path().join(format!("claude-{}", bale_core::paths::uid()));
+        let pad = mine.join("-Users-me-proj/session-1/scratchpad");
+        fs::create_dir_all(&pad).unwrap();
+        // A session without a scratchpad, another user's, and a linked session.
+        fs::create_dir_all(mine.join("-Users-me-proj/session-2")).unwrap();
+        fs::create_dir_all(t.path().join("claude-0/p/s/scratchpad")).unwrap();
+        std::os::unix::fs::symlink(
+            mine.join("-Users-me-proj/session-1"),
+            mine.join("-Users-me-proj/session-3"),
+        )
+        .unwrap();
+        assert_eq!(scratchpads_in(t.path()), vec![pad]);
+        assert!(scratchpads_in(&t.path().join("missing")).is_empty());
+    }
 
     #[test]
     fn sh_quote_escapes_a_single_quote() {

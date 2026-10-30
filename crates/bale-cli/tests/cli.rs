@@ -50,6 +50,8 @@ impl Env {
         cmd.env("HOME", self.home())
             .env("USERPROFILE", self.home())
             .env("BALE_HOME", self.bale_home())
+            // Never the real `/tmp/claude-<uid>`: sweep would reap its build folders.
+            .env("BALE_CLAUDE_TMP", self.tmp.path().join("tmp"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.home().join(".gitconfig"))
             .env("LC_ALL", "C")
@@ -3667,6 +3669,43 @@ fn sweep_reaps_a_derived_data_root_the_hook_learned() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("reap  reaped"), "{}", stdout(&out));
     assert!(!dd.exists());
+}
+
+/// A build folder in a Claude Code scratchpad that no hook saw is found by
+/// sweep and reaped once its project is gone; the scratchpad's other files stay.
+#[cfg(target_os = "macos")]
+#[test]
+fn sweep_reaps_a_gone_projects_build_folder_in_a_claude_scratchpad() {
+    let env = Env::new();
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    let pad = env.tmp.path().join(format!(
+        "tmp/claude-{}/-proj/session/scratchpad",
+        uid.trim()
+    ));
+    let dd = pad.join("wt-ios/.dd");
+    fs::create_dir_all(dd.join("Build/Products")).unwrap();
+    fs::write(dd.join("Build/Products/out"), vec![0u8; 4096]).unwrap();
+    let missing = env.home().join("deleted-wt/App.xcodeproj");
+    fs::write(
+        dd.join("info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>{}</string></dict></plist>\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+    fs::write(pad.join("notes.md"), "keep").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [dd.clone(), dd.join("info.plist"), dd.join("Build")] {
+        fs::File::open(p).unwrap().set_modified(old).unwrap();
+    }
+
+    let out = env.bale(&env.repo, &["sweep"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("reap  reaped"), "{}", stdout(&out));
+    assert!(!dd.exists());
+    assert!(pad.join("notes.md").exists() && pad.join("wt-ios").is_dir());
 }
 
 #[cfg(unix)]

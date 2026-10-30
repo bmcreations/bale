@@ -4,7 +4,7 @@
 
 mod support;
 
-use bale_core::ops::sweep::{sweep, Action};
+use bale_core::ops::sweep::{sweep, sweep_with, Action};
 use bale_core::ops::up::register;
 use bale_core::registry::{Level, Registry};
 use std::fs;
@@ -206,6 +206,40 @@ fn learned_roots_are_reaped_by_the_same_rule() {
     assert_eq!(reap_rows(&rows).len(), 1, "{rows:?}");
     assert!(!orphan.exists());
     assert!(live.exists() && not_root.exists());
+}
+
+#[test]
+fn scratch_build_folders_whose_project_is_gone_are_reaped() {
+    let fx = Fixture::new();
+    let (_g, _root) = user_home(&fx);
+    let pad = fx
+        .repo
+        .parent()
+        .unwrap()
+        .join("scratch/proj/session/scratchpad");
+    let orphan = dd(&pad, "dd-a", Some(&gone(&fx, "wt-gone/App.xcodeproj")));
+    let nested = dd(
+        &pad.join("wt-b"),
+        ".dd",
+        Some(&gone(&fx, "wt-gone-b/App.xcodeproj")),
+    );
+    // A build folder still inside the grace period, and an agent's notes.
+    let fresh = dd(&pad, "dd-fresh", Some(&gone(&fx, "wt-gone/App.xcodeproj")));
+    let notes = pad.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("plan.md"), "keep me").unwrap();
+    for d in [&orphan, &nested] {
+        age(d, 2);
+    }
+
+    let rows = sweep_with(&fx.home(), false, std::slice::from_ref(&pad)).unwrap();
+    assert_eq!(reap_rows(&rows).len(), 2, "{rows:?}");
+    assert!(!orphan.exists() && !nested.exists());
+    assert!(fresh.exists() && notes.join("plan.md").exists());
+    assert!(pad.join("wt-b").is_dir());
+    // Learned, so a later sweep reaps `dd-fresh` once its grace is up.
+    let learned = bale_core::derived_data::learned_roots(&fx.home());
+    assert!(learned.contains(&fresh), "{learned:?}");
 }
 
 #[test]

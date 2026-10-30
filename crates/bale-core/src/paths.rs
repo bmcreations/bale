@@ -29,6 +29,13 @@ pub fn home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
+/// The real user id of this process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@ use bale_core::ops::migrate::{apply, plan, PlanRow, BALE};
 use bale_core::ops::new::new_workspace;
 use bale_core::ops::open::open;
 use bale_core::ops::stash::{stash, StashOutcome};
-use bale_core::ops::sweep::{sweep, Action};
+use bale_core::ops::sweep::{sweep_with, Action};
 use bale_core::ops::unstash::{unstash, write_failure_marker, UnstashReport};
 use bale_core::ops::up::{register, resolve, up_report, Outcome};
 use bale_core::par::par_map;
@@ -545,8 +545,11 @@ fn busy_report(id: &str, holders: &[bale_core::busy::Holder], during_cold: bool)
 }
 
 /// One line per workspace: on stdout, or on stderr when it needs attention.
+/// Build folders in Claude Code's scratchpads are reaped like any learned
+/// `-derivedDataPath` root.
 fn cmd_sweep(home: &BaleHome, dry_run: bool) -> Result<()> {
-    for (id, action, result) in sweep(home, dry_run)? {
+    let scratch = bale_hooks::claude::scratchpads();
+    for (id, action, result) in sweep_with(home, dry_run, &scratch)? {
         for (to_stderr, line) in sweep_lines(&id, &action, &result) {
             if to_stderr {
                 eprintln!("{line}");

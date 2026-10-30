@@ -139,6 +139,46 @@ pub fn learned_roots(home: &BaleHome) -> Vec<PathBuf> {
     roots
 }
 
+/// The DerivedData roots among the plain folders at most two levels under
+/// each of `dirs`: `dir/<a>` or, when `<a>` is not a root, `dir/<a>/<b>`. A
+/// root is not looked inside, and no symlink is followed, `dirs` themselves
+/// included. Listing stops at `deadline`, keeping what it found so far.
+#[cfg(target_os = "macos")]
+pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for dir in dirs {
+        if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for child in plain_subdirs(dir, deadline) {
+            if is_derived_data_root(&child) {
+                roots.push(child);
+                continue;
+            }
+            for grandchild in plain_subdirs(&child, deadline) {
+                if is_derived_data_root(&grandchild) {
+                    roots.push(grandchild);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// The subfolders of `dir` that are not symlinks, listed until `deadline`.
+#[cfg(target_os = "macos")]
+fn plain_subdirs(dir: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .take_while(|_| std::time::Instant::now() < deadline)
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
 pub(crate) fn global_root() -> Option<PathBuf> {
     crate::paths::home_dir().map(|h| h.join("Library/Developer/Xcode/DerivedData"))
@@ -325,5 +365,80 @@ mod tests {
             learned_roots(&home),
             vec![PathBuf::from("/x"), PathBuf::from("/y")]
         );
+    }
+
+    /// A DerivedData root at `dir`: an `info.plist` naming `/gone/App.xcodeproj`, plus `Build/`.
+    #[cfg(target_os = "macos")]
+    fn fake_root(dir: &Path) {
+        fs::create_dir_all(dir.join("Build")).unwrap();
+        fs::write(
+            dir.join("info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+             <key>WorkspacePath</key><string>/gone/App.xcodeproj</string></dict></plist>\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_finds_roots_one_and_two_levels_down() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd-ios"));
+        fake_root(&pad.join("wt-ios/.dd"));
+        fs::create_dir_all(pad.join("notes")).unwrap();
+        // Three levels down is past the walk.
+        fake_root(&pad.join("a/b/dd"));
+        let mut found = roots_in(
+            std::slice::from_ref(&pad),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        found.sort();
+        assert_eq!(found, vec![pad.join("dd-ios"), pad.join("wt-ios/.dd")]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_does_not_descend_into_a_root() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd"));
+        fake_root(&pad.join("dd/inner"));
+        let found = roots_in(
+            std::slice::from_ref(&pad),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(found, vec![pad.join("dd")]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_follows_no_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        fake_root(&elsewhere.join("dd"));
+        let pad = t.path().join("scratchpad");
+        fs::create_dir_all(&pad).unwrap();
+        // A link to a root, and a link to a folder holding one.
+        std::os::unix::fs::symlink(elsewhere.join("dd"), pad.join("dd-link")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, pad.join("wt-link")).unwrap();
+        // A scratchpad that is itself a link is not walked either.
+        let linked_pad = t.path().join("linked-pad");
+        std::os::unix::fs::symlink(&elsewhere, &linked_pad).unwrap();
+        let found = roots_in(
+            &[pad, linked_pad],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn roots_in_stops_at_the_deadline() {
+        let t = tempfile::tempdir().unwrap();
+        let pad = t.path().join("scratchpad");
+        fake_root(&pad.join("dd"));
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(roots_in(&[pad], past).is_empty());
     }
 }
