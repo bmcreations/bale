@@ -72,7 +72,13 @@ fn new_untraced(home: &BaleHome, repo: &Path, name: &str, branch: Option<&str>) 
         if exists {
             args.push(branch);
         }
-        g.run(&args)?;
+        g.run(&args).inspect_err(|_| {
+            // Git removes a tree whose checkout failed but keeps a branch
+            // it made for it.
+            if !exists {
+                let _ = g.run(&["branch", "-D", "--", branch]);
+            }
+        })?;
         if !fill {
             return Ok(());
         }

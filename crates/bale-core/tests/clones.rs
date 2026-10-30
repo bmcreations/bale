@@ -476,6 +476,18 @@ fn share_skips_a_tree_with_sharing_disabled() {
 }
 
 fn age_file(path: &Path, by: std::time::Duration) {
+    // Store files are read-only; Windows needs write-attributes access to
+    // set a time, which a read-only file still grants.
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
+            .unwrap()
+    };
+    #[cfg(not(windows))]
     let f = std::fs::File::open(path).unwrap();
     f.set_modified(std::time::SystemTime::now() - by).unwrap();
 }
