@@ -363,7 +363,7 @@ fn share_skips_locked_tree() {
 }
 
 fn age_file(path: &Path, by: std::time::Duration) {
-    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let f = std::fs::File::open(path).unwrap();
     f.set_modified(std::time::SystemTime::now() - by).unwrap();
 }
 
@@ -450,4 +450,54 @@ fn gc_does_not_create_a_missing_store() {
     let report = bale_core::ops::gc::gc(&home, false).unwrap();
     assert_eq!(report.clones_bytes_freed, 0);
     assert!(!home.clones_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_keeps_a_shared_file_while_its_tree_exists_then_frees_it() {
+    use bale_core::clones::share::share;
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let trees = shared_fixture(&fx, &["w1"], false);
+    let home = fx.home();
+    let r = share(&home, &trees[0].1).unwrap();
+    assert_eq!(r.reason, None, "{r:?}");
+    let store = bale_core::clones::store::CloneStore::open(&home).unwrap();
+    let files: Vec<_> = walkdir::WalkDir::new(store.root())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    age_file(&files[0], HOUR2);
+
+    let report = bale_core::ops::gc::gc(&home, false).unwrap();
+    assert_eq!(report.clones_bytes_freed, 0, "{report:?}");
+    assert!(files[0].exists());
+
+    std::fs::remove_dir_all(&trees[0].0).unwrap();
+    let report = bale_core::ops::gc::gc(&home, false).unwrap();
+    assert_eq!(report.clones_bytes_freed, 2 << 20, "{report:?}");
+    assert!(!files[0].exists());
+}
+
+#[test]
+fn gc_removes_nothing_when_a_record_is_unreadable() {
+    use bale_core::clones::store::CloneStore;
+    let fx = Fixture::new();
+    let home = fx.home();
+    let store = CloneStore::open(&home).unwrap();
+    let p = put_store_file(&store, &Key::Git("ab".repeat(20)), b"data", HOUR2);
+    std::fs::create_dir_all(home.records_dir()).unwrap();
+    std::fs::write(home.records_dir().join("0123456789ab.json"), b"{not json").unwrap();
+    let report = bale_core::ops::gc::gc(&home, false).unwrap();
+    assert_eq!(report.clones_bytes_freed, 0, "{report:?}");
+    assert!(
+        report.errors.iter().any(|(k, _)| k == "clones"),
+        "{report:?}"
+    );
+    assert!(p.exists());
 }

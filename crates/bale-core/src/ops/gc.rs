@@ -108,8 +108,12 @@ fn collect_clones(home: &BaleHome, registry: &Registry, dry_run: bool, report: &
         let mut live = HashSet::new();
         for (stem, read) in registry.all_lenient()? {
             let record = read.with_context(|| format!("record {stem} is unreadable"))?;
-            if fs::symlink_metadata(&record.path).is_err() {
-                continue;
+            match fs::symlink_metadata(&record.path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("checking {}", record.path.display()))
+                }
             }
             let cfg = load_config(home, Some(&record.path))?;
             let found = clones_tracked::candidates(&record.path, cfg.clone_min_bytes)
