@@ -895,7 +895,6 @@ fn sweep_shares_again_after_head_moves() {
     .unwrap();
     git(&wt, &["add", "more.bin"]);
     git(&wt, &["commit", "-m", "more"]);
-    set_level(&fx, &id, Level::Baled);
     let head = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
 
     let rows = sweep(&fx.home(), false).unwrap();
