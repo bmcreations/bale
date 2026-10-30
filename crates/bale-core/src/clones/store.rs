@@ -90,7 +90,9 @@ impl CloneStore {
     pub fn supports_clones(&self) -> io::Result<bool> {
         let src = temp_name(&self.root.join(".probe"));
         let dst = temp_name(&self.root.join(".probe"));
-        std::fs::write(&src, b"bale")?;
+        // A block-sized file: btrfs stores tiny files inline, and some
+        // kernels refuse to clone inline extents.
+        std::fs::write(&src, [0u8; 4096])?;
         let _src = TempGuard(&src, true);
         match clone_file(&src, &dst) {
             Ok(()) => {
