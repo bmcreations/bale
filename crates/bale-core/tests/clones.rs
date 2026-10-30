@@ -126,3 +126,78 @@ fn candidates_key_lfs_files_on_pointer() {
         .collect();
     assert_eq!(c[0].key, Key::Lfs(sha));
 }
+
+fn clones_work(fx: &Fixture) -> bool {
+    let a = fx.repo.join("probe-src");
+    std::fs::write(&a, b"x").unwrap();
+    let r = bale_core::clones::reflink::clone_file(&a, &fx.repo.join("probe-dst"));
+    !matches!(r, Err(e) if e.kind() == std::io::ErrorKind::Unsupported)
+}
+
+#[cfg(unix)]
+#[test]
+fn adopt_then_place_round_trips() {
+    use bale_core::clones::store::CloneStore;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let data = big(1 << 20, 9);
+    let src = fx.repo.join("src.bin");
+    std::fs::write(&src, &data).unwrap();
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let key = Key::Git("ab".to_string() + &"c".repeat(38));
+    assert!(!store.has(&key));
+    assert!(store.adopt(&key, &src).unwrap());
+    assert!(store.has(&key));
+    assert!(!store.adopt(&key, &src).unwrap());
+    assert!(store
+        .path(&key)
+        .ends_with(format!("git/ab/ab{}", "c".repeat(38))));
+    let mode = std::fs::metadata(store.path(&key))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o444);
+
+    let dst = fx.repo.join("sub/dst.bin");
+    let t = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    store.place(&key, &dst, 0o755, Some(t)).unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), data);
+    let md = std::fs::metadata(&dst).unwrap();
+    assert_eq!(md.permissions().mode() & 0o777, 0o755);
+    assert_eq!(md.modified().unwrap(), t);
+}
+
+#[cfg(unix)]
+#[test]
+fn place_over_existing_file_leaves_no_temp() {
+    use bale_core::clones::store::CloneStore;
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let data = big(1 << 20, 10);
+    let src = fx.repo.join("src.bin");
+    std::fs::write(&src, &data).unwrap();
+    let store = CloneStore::open(&fx.home()).unwrap();
+    let key = Key::Lfs("de".to_string() + &"f".repeat(62));
+    store.adopt(&key, &src).unwrap();
+    assert!(store
+        .path(&key)
+        .ends_with(format!("lfs/de/{}", "de".to_string() + &"f".repeat(62))));
+
+    let dst = fx.repo.join("dst.bin");
+    std::fs::write(&dst, b"old").unwrap();
+    store.place(&key, &dst, 0o644, None).unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), data);
+    let leftovers: Vec<_> = std::fs::read_dir(&fx.repo)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".bale-share"))
+        .collect();
+    assert!(leftovers.is_empty());
+}

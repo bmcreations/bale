@@ -1,6 +1,7 @@
 //! Sharing large tracked files between worktrees through file clones.
 
 pub mod reflink;
+pub mod store;
 pub mod tracked;
 
 use std::path::PathBuf;

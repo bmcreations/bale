@@ -75,6 +75,11 @@ impl BaleHome {
         self.0.join("spm")
     }
 
+    /// Read-only copies of large tracked files, shared between worktrees.
+    pub fn clones_dir(&self) -> PathBuf {
+        self.0.join("clones")
+    }
+
     /// Where the local usage trace is kept (see [`trace`]).
     pub fn trace_dir(&self) -> PathBuf {
         self.0.join("trace")
