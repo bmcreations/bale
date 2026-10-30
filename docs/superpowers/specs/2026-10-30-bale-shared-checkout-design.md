@@ -104,6 +104,18 @@ stop and report.
 Expected result on this Mac: about 11.6 GiB back now (13 of 14 copies), and about 0.9 GiB for each new
 Android checkout. The iOS checkouts hold 0.14 GiB of source each, so they gain little.
 
+### Result (2026-10-30)
+
+All five passed; details in `docs/bench/2026-10-shared-checkout.md`.
+
+1. Sharing `vendor/opencv` across two fresh worktrees freed 1,778 MiB by `df`, two copies of 889 MiB.
+2. `git status` was clean in every tree, 0.02 to 0.03 s on the second call.
+3. The Gradle build after sharing ran the same 30 tasks as a no-change build and rewrote no output file.
+4. Android trees would free 11.89 GiB and iOS trees 1.23 GiB (7 large blobs repeated across 13 trees), more
+   than the estimate above. No other repo here has a large tracked file in two trees.
+5. Sharing a 1 GiB LFS file between two worktrees freed 2,062 MiB, with `git status`, `git lfs status` and
+   the SHA-256 clean in both.
+
 ## The other items, in order
 
 | Item | Evidence on 2026-10-30 | Next step |
