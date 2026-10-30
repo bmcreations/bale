@@ -50,14 +50,19 @@ struct Entry {
 pub fn candidates(tree: &Path, min_bytes: u64) -> Result<Vec<Candidate>> {
     let git = Git::at(tree);
     if let Ok(v) = git.run(&["config", "--get", "core.autocrlf"]) {
+        // Git's bool spellings: true/yes/on, any nonzero integer, and a
+        // valueless key (empty line). `input` also converts on add.
         let v = v.trim().to_ascii_lowercase();
-        if v == "true" || v == "input" {
+        let truthy = matches!(v.as_str(), "" | "true" | "yes" | "on" | "input")
+            || v.parse::<i64>().is_ok_and(|n| n != 0);
+        if truthy {
             return Ok(Vec::new());
         }
     }
 
     let listing = git.run(&["ls-files", "-s", "-z"])?;
     let mut entries = Vec::new();
+    // Non-UTF8 paths are converted lossily, so they name no file and fail safe.
     for rec in listing.split('\0').filter(|r| !r.is_empty()) {
         let Some((meta, path)) = rec.split_once('\t') else {
             continue;

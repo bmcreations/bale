@@ -77,7 +77,7 @@ fn candidates_empty_when_autocrlf_converts() {
     git(&fx.repo, &["add", "."]);
     git(&fx.repo, &["commit", "-m", "files"]);
     assert_eq!(candidates(&fx.repo, 1 << 20).unwrap().len(), 1);
-    for v in ["true", "input"] {
+    for v in ["true", "input", "yes", "on", "1"] {
         git(&fx.repo, &["config", "core.autocrlf", v]);
         assert!(candidates(&fx.repo, 1 << 20).unwrap().is_empty());
     }
