@@ -874,6 +874,39 @@ fn sweep_shares_baled_tree_once() {
     assert!(share_row(&rows, &id).is_none(), "{rows:?}");
 }
 
+/// A commit moves `HEAD` without touching the record's `head`; the next
+/// sweep shares the tree again.
+#[test]
+fn sweep_shares_again_after_head_moves() {
+    let fx = Fixture::new();
+    if !clones_work(&fx) {
+        return;
+    }
+    let (wt, id) = baled_big(&fx, "w1");
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(share_row(&rows, &id).is_some(), "{rows:?}");
+
+    fs::write(
+        wt.join("more.bin"),
+        (0..2usize << 20)
+            .map(|i| (i as u8) ^ 0x5a)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    git(&wt, &["add", "more.bin"]);
+    git(&wt, &["commit", "-m", "more"]);
+    set_level(&fx, &id, Level::Baled);
+    let head = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    let r = share_row(&rows, &id).unwrap_or_else(|| panic!("no share row: {rows:?}"));
+    assert!(r.2.starts_with("shared "), "{r:?}");
+    assert!(r.2.ends_with("stored 1"), "{r:?}");
+    let rec = Registry::open(fx.home()).get(&id).unwrap().unwrap();
+    assert_eq!(rec.shared_head.as_deref(), Some(head.as_str()));
+    assert_ne!(rec.head, head);
+}
+
 #[test]
 fn sweep_does_not_share_hot_tree() {
     let fx = Fixture::new();

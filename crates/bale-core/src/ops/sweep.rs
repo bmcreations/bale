@@ -230,15 +230,20 @@ fn sweep_traced(
 }
 
 /// Shares the large tracked files of each idle (`Baled`, unpinned) tree whose
-/// `head` is not the one it was last shared at. One `share` row each; on
+/// live `HEAD` is not the one it was last shared at. One `share` row each; on
 /// `dry_run` nothing is shared. An error becomes the row's text. A tree that
 /// had nothing to share, or that was skipped as "disabled", "other volume" or
 /// "clones unsupported", gets no row.
 fn share_rows(home: &BaleHome, records: &[Record], dry_run: bool) -> Vec<(String, Action, String)> {
     let mut rows = Vec::new();
     for r in records {
-        if r.level != Level::Baled || r.pinned || r.shared_head.as_deref() == Some(r.head.as_str())
-        {
+        if r.level != Level::Baled || r.pinned {
+            continue;
+        }
+        // The record's `head` is refreshed only by register, so ask git. A
+        // tree git can't read falls through to `share`, which reports why.
+        let head = crate::git::Git::at(&r.path).run(&["rev-parse", "HEAD"]);
+        if matches!((&head, &r.shared_head), (Ok(h), Some(s)) if h.trim() == s) {
             continue;
         }
         let text = if dry_run {

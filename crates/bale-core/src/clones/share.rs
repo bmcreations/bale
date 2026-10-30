@@ -77,8 +77,8 @@ const ODD_PATH: &str = "unsupported path";
 
 /// Shares the large tracked files of the registered tree `id` through the
 /// clone store. Takes the tree's lock without waiting and skips a busy tree.
-/// Sets the record's `shared_head` when every file was shared or left alone
-/// for being modified or missing.
+/// Sets the record's `shared_head` to the `HEAD` it read under the lock when
+/// every file was shared or left alone for being modified or missing.
 pub fn share(home: &BaleHome, id: &str) -> Result<ShareReport> {
     crate::trace::op(home, "share", Some(id), || share_untraced(home, id))
 }
@@ -112,6 +112,13 @@ fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
     {
         return Ok(ShareReport::skipped("clones unsupported"));
     }
+    let git = Git::at(&root);
+    // Read under the lock; a commit after this makes the next sweep share again.
+    let head = git
+        .run(&["rev-parse", "HEAD"])
+        .with_context(|| format!("reading HEAD of {}", root.display()))?
+        .trim()
+        .to_string();
 
     let mut report = ShareReport::default();
     let matched = verify(&root, candidates(&root, cfg.clone_min_bytes)?, &mut report)?;
@@ -132,7 +139,6 @@ fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
         }
     }
 
-    let git = Git::at(&root);
     if report.files > 0 {
         // Placed files have a new inode and ctime; refresh the index's stat
         // data so `git status` doesn't rehash them. Their bytes are right
@@ -141,7 +147,7 @@ fn share_untraced(home: &BaleHome, id: &str) -> Result<ShareReport> {
     }
     if report.reason.is_none() && !report.had_errors() {
         if let Some(mut now) = registry.get(id)? {
-            now.shared_head = Some(now.head.clone());
+            now.shared_head = Some(head);
             registry.put(&now)?;
         }
     }
