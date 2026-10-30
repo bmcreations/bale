@@ -112,9 +112,13 @@ pub(crate) fn belongs_to_tree(dir: &Path, root: &Path) -> bool {
 
 /// Appends `root` to `<bale home>/dd-roots` unless a line already names it.
 /// Each line is a DerivedData root itself, the folder holding `info.plist`.
+/// A `root` that exists is stored canonical, and a line that resolves to it
+/// counts as naming it, so `/tmp/x` and `/private/tmp/x` make one line.
 pub fn learn_root(home: &BaleHome, root: &Path) -> io::Result<()> {
+    let root = crate::paths::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let line = root.to_string_lossy();
-    if line.contains('\n') || learned_roots(home).iter().any(|r| r == root) {
+    let named = |r: &PathBuf| *r == root || crate::paths::canonicalize(r).is_ok_and(|c| c == root);
+    if line.contains('\n') || learned_roots(home).iter().any(named) {
         return Ok(());
     }
     fs::create_dir_all(&home.0)?;
@@ -150,12 +154,12 @@ pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> 
         if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        for child in plain_subdirs(dir, deadline) {
+        for child in crate::paths::plain_subdirs(dir, deadline) {
             if is_derived_data_root(&child) {
                 roots.push(child);
                 continue;
             }
-            for grandchild in plain_subdirs(&child, deadline) {
+            for grandchild in crate::paths::plain_subdirs(&child, deadline) {
                 if is_derived_data_root(&grandchild) {
                     roots.push(grandchild);
                 }
@@ -163,20 +167,6 @@ pub fn roots_in(dirs: &[PathBuf], deadline: std::time::Instant) -> Vec<PathBuf> 
         }
     }
     roots
-}
-
-/// The subfolders of `dir` that are not symlinks, listed until `deadline`.
-#[cfg(target_os = "macos")]
-fn plain_subdirs(dir: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .take_while(|_| std::time::Instant::now() < deadline)
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.path())
-        .collect()
 }
 
 /// Xcode's shared DerivedData dir, `~/Library/Developer/Xcode/DerivedData`.
@@ -354,6 +344,23 @@ mod tests {
             "/tmp/a-dd\n/tmp/b-dd\n"
         );
         assert_eq!(learned_roots(&home).len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn learn_root_stores_one_line_for_aliases_of_a_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let home = BaleHome(t.path().join("bale"));
+        let dir = t.path().join("dd");
+        fs::create_dir_all(&dir).unwrap();
+        let link = t.path().join("dd-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let canonical = crate::paths::canonicalize(&dir).unwrap();
+        // As typed (`/var/..` on macOS), through a link, then canonical.
+        learn_root(&home, &dir).unwrap();
+        learn_root(&home, &link).unwrap();
+        learn_root(&home, &canonical).unwrap();
+        assert_eq!(learned_roots(&home), vec![canonical]);
     }
 
     #[test]

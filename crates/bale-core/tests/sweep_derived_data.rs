@@ -232,13 +232,14 @@ fn scratch_build_folders_whose_project_is_gone_are_reaped() {
         age(d, 2);
     }
 
-    let rows = sweep_with(&fx.home(), false, std::slice::from_ref(&pad)).unwrap();
+    let rows = sweep_with(&fx.home(), false, |_| vec![pad.clone()]).unwrap();
     assert_eq!(reap_rows(&rows).len(), 2, "{rows:?}");
     assert!(!orphan.exists() && !nested.exists());
     assert!(fresh.exists() && notes.join("plan.md").exists());
     assert!(pad.join("wt-b").is_dir());
     // Learned, so a later sweep reaps `dd-fresh` once its grace is up.
     let learned = bale_core::derived_data::learned_roots(&fx.home());
+    let fresh = bale_core::paths::canonicalize(&fresh).unwrap();
     assert!(learned.contains(&fresh), "{learned:?}");
 }
 

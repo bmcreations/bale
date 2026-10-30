@@ -783,31 +783,33 @@ const TMP_ENV: &str = "BALE_CLAUDE_TMP";
 /// Claude Code's session scratchpads, where agents put the build folders
 /// they name with `-derivedDataPath`:
 /// `/tmp/claude-<uid>/<project>/<session>/scratchpad`, with `/tmp` resolved
-/// (`/private/tmp` on macOS) or replaced by `$BALE_CLAUDE_TMP`. Empty
-/// off macOS, where bale reaps no Xcode builds.
-pub fn scratchpads() -> Vec<PathBuf> {
+/// (`/private/tmp` on macOS) or replaced by `$BALE_CLAUDE_TMP`, listed
+/// until `deadline`. Empty off macOS, where bale reaps no Xcode builds.
+pub fn scratchpads(deadline: std::time::Instant) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let tmp = match std::env::var_os(TMP_ENV) {
             Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
             _ => bale_core::paths::canonicalize("/tmp").ok(),
         };
-        tmp.map(|t| scratchpads_in(&t)).unwrap_or_default()
+        tmp.map(|t| scratchpads_in(&t, deadline))
+            .unwrap_or_default()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = TMP_ENV;
+        let _ = (TMP_ENV, deadline);
         Vec::new()
     }
 }
 
-/// The scratchpads under `tmp/claude-<uid>`, reached through no symlink.
+/// The scratchpads under `tmp/claude-<uid>`, reached through no symlink and
+/// listed until `deadline`.
 #[cfg(target_os = "macos")]
-fn scratchpads_in(tmp: &Path) -> Vec<PathBuf> {
+fn scratchpads_in(tmp: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
     let base = tmp.join(format!("claude-{}", bale_core::paths::uid()));
     let mut pads = Vec::new();
-    for project in plain_subdirs(&base) {
-        for session in plain_subdirs(&project) {
+    for project in bale_core::paths::plain_subdirs(&base, deadline) {
+        for session in bale_core::paths::plain_subdirs(&project, deadline) {
             let pad = session.join("scratchpad");
             if fs::symlink_metadata(&pad).is_ok_and(|m| m.is_dir()) {
                 pads.push(pad);
@@ -815,19 +817,6 @@ fn scratchpads_in(tmp: &Path) -> Vec<PathBuf> {
         }
     }
     pads
-}
-
-/// The subfolders of `dir` that are not symlinks; none when it can't be read.
-#[cfg(target_os = "macos")]
-fn plain_subdirs(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.path())
-        .collect()
 }
 
 const DD_FLAG: &str = "-derivedDataPath";
@@ -1391,8 +1380,12 @@ mod tests {
             mine.join("-Users-me-proj/session-3"),
         )
         .unwrap();
-        assert_eq!(scratchpads_in(t.path()), vec![pad]);
-        assert!(scratchpads_in(&t.path().join("missing")).is_empty());
+        let later = std::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(scratchpads_in(t.path(), later), vec![pad]);
+        assert!(scratchpads_in(&t.path().join("missing"), later).is_empty());
+        // Listing stops at the deadline.
+        let past = std::time::Instant::now() - Duration::from_millis(1);
+        assert!(scratchpads_in(t.path(), past).is_empty());
     }
 
     #[test]

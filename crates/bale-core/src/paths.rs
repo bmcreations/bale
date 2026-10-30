@@ -36,6 +36,20 @@ pub fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The subfolders of `dir` that are not symlinks, listed until `deadline`;
+/// none when `dir` can't be read.
+pub fn plain_subdirs(dir: &Path, deadline: std::time::Instant) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .take_while(|_| std::time::Instant::now() < deadline)
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -548,8 +548,7 @@ fn busy_report(id: &str, holders: &[bale_core::busy::Holder], during_cold: bool)
 /// Build folders in Claude Code's scratchpads are reaped like any learned
 /// `-derivedDataPath` root.
 fn cmd_sweep(home: &BaleHome, dry_run: bool) -> Result<()> {
-    let scratch = bale_hooks::claude::scratchpads();
-    for (id, action, result) in sweep_with(home, dry_run, &scratch)? {
+    for (id, action, result) in sweep_with(home, dry_run, bale_hooks::claude::scratchpads)? {
         for (to_stderr, line) in sweep_lines(&id, &action, &result) {
             if to_stderr {
                 eprintln!("{line}");

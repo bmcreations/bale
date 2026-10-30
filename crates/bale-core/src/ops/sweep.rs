@@ -87,26 +87,27 @@ pub fn decide(
 /// `sweep` line; then prunes old trace files. Sizes and build logs are read
 /// before any tree is changed.
 pub fn sweep(home: &BaleHome, dry_run: bool) -> Result<Vec<(String, Action, String)>> {
-    sweep_with(home, dry_run, &[])
+    sweep_with(home, dry_run, |_| Vec::new())
 }
 
 /// [`sweep`], first learning the Xcode DerivedData roots at most two levels
-/// under each of `build_dirs` (see [`crate::derived_data::roots_in`]), so
-/// that reaping covers build folders no hook saw made. Learning is
-/// bookkeeping and happens on `dry_run` too, so its report lists the reaps
-/// a real sweep would make.
+/// under each folder `build_dirs` lists (see
+/// [`crate::derived_data::roots_in`]), so that reaping covers build folders
+/// no hook saw made. `build_dirs` gets the deadline that also bounds the
+/// walk, and should stop listing at it. Learning is bookkeeping and happens
+/// on `dry_run` too, so its report lists the reaps a real sweep would make.
 pub fn sweep_with(
     home: &BaleHome,
     dry_run: bool,
-    build_dirs: &[PathBuf],
+    build_dirs: impl Fn(Instant) -> Vec<PathBuf>,
 ) -> Result<Vec<(String, Action, String)>> {
-    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run, build_dirs))
+    crate::trace::with_trigger("sweep", || sweep_traced(home, dry_run, &build_dirs))
 }
 
 fn sweep_traced(
     home: &BaleHome,
     dry_run: bool,
-    build_dirs: &[PathBuf],
+    build_dirs: &dyn Fn(Instant) -> Vec<PathBuf>,
 ) -> Result<Vec<(String, Action, String)>> {
     let start = Instant::now();
     let mut records = Registry::open(home.clone()).all_lenient()?;
@@ -257,17 +258,17 @@ fn adopt_missed(
     (rows, mains)
 }
 
-/// Walking `build_dirs` for DerivedData roots stops after this long.
+/// Listing and walking `build_dirs` for DerivedData roots stops after this long.
 #[cfg(target_os = "macos")]
 const BUILD_DIRS_LIMIT: Duration = Duration::from_secs(10);
 
-/// Learns the DerivedData roots in `build_dirs`, giving up on the walk
-/// after [`BUILD_DIRS_LIMIT`]. A root that fails to be written is found
-/// again by the next sweep.
+/// Learns the DerivedData roots in the folders `build_dirs` lists, giving
+/// up on both after [`BUILD_DIRS_LIMIT`]. A root that fails to be written
+/// is found again by the next sweep.
 #[cfg(target_os = "macos")]
-fn learn_build_dirs(home: &BaleHome, build_dirs: &[PathBuf]) {
+fn learn_build_dirs(home: &BaleHome, build_dirs: &dyn Fn(Instant) -> Vec<PathBuf>) {
     let deadline = Instant::now() + BUILD_DIRS_LIMIT;
-    for root in crate::derived_data::roots_in(build_dirs, deadline) {
+    for root in crate::derived_data::roots_in(&build_dirs(deadline), deadline) {
         let _ = crate::derived_data::learn_root(home, &root);
     }
 }

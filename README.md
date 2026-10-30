@@ -88,6 +88,7 @@ Codex and T3 Code trees record the tool as their origin with no session or title
 By default `bale sweep` bales a tree idle for 4 hours and takes one idle for 7 days cold. Set
 `idle_baled_hours` and `idle_cold_days` in `$BALE_HOME/config.toml`, or per repo in `<repo>/.bale.toml`.
 The sweep's stash step only stashes trees where Claude Code's restore hook (`prompt` or `pre-tool`) has run, because no other tool restores stashed files; `bale stash` by hand works on any tree.
+On macOS the sweep also checks Claude Code's session scratchpads (`/tmp/claude-<uid>/<project>/<session>/scratchpad`) for Xcode DerivedData folders at most two levels deep, and deletes one once its project has been gone for an hour and no process holds it. Set `BALE_CLAUDE_TMP` to look under another folder instead of `/tmp`.
 
 Known limitations:
 
