@@ -226,7 +226,10 @@ A tree is busy when any process other than bale (and the hook that called it) ha
 open file inside it. `up` and `cold` refuse a busy tree; stash skips it and tries again next sweep.
 
 Reap deletes a DerivedData folder only when its project path is missing, no live record holds it, and
-nothing in it changed within `reap_grace`.
+nothing in it changed within `reap_grace`. A shared folder with no `info.plist`, such as one a package resolve
+left, takes its project path from its name: reap hashes each known tree (registered, or named in the last 60
+days of trace) joined with the project paths other folders record, the way Xcode names the folder. A folder
+that matches no known tree is kept.
 
 ## Not built
 
