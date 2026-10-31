@@ -39,6 +39,7 @@ Everything lives under `BALE_HOME`, which defaults to `~/.bale`:
 | `store/objects/`, `store/manifests/`, `store/index/` | Stashed file contents, one manifest per stash, and a stat index per tree. |
 | `clones/git/<hh>/<oid>`, `clones/lfs/<hh>/<sha256>` | One read-only copy of each large tracked file, shared by every repo. See "Shared checkouts". |
 | `<id>/` | A cold tree's saved uncommitted work and ignored files. |
+| `keep/<id>/` | The keep-list: copies of small ignored files (mirrored paths) that survive the tree being deleted and recreated. Separate from `<id>/`, which only a cold tree has. |
 | `dd-roots` | DerivedData roots learned from `-derivedDataPath` and Claude scratchpads. |
 | `spm/<key>` | Shared Swift package checkouts. |
 | `trace/<date>.jsonl` | The usage trace, one file per UTC day, kept 60 days. See `docs/usage-trace.md`. |
@@ -101,9 +102,9 @@ record). The other tools register trees and mark activity; their trees go straig
 | Claude Code event | `bale hook claude …` | Does |
 |---|---|---|
 | `WorktreeCreate` | `create` | `bale new` on branch `worktree-<name>` and prints the path. Falls back to plain `git worktree add`. |
-| `UserPromptSubmit` | `prompt` | Reports an earlier failed restore. If the tree is stashed, bumps its lock so a running stash stops, starts `bale unstash --background` and returns. |
+| `UserPromptSubmit` | `prompt` | Reports an earlier failed restore. Restores kept files the tree lacks. If the tree is stashed, bumps its lock so a running stash stops, starts `bale unstash --background` and returns. |
 | `PreToolUse` | `pre-tool` | Waits up to 60 s for the restore of the working tree and of any tree the command names (`cd`, `git -C`, `-project`, `-workspace`, `-derivedDataPath`, a file path). Learns DerivedData roots and relinks Swift packages. |
-| `Stop` | `stop` | Marks activity. |
+| `Stop` | `stop` | Marks activity and saves the keep-list. |
 | `WorktreeRemove` | `remove` | `cold`, ignoring the hook's own process tree. |
 
 The prompt hook does not wait because a restore can take seconds, and the user would feel that on every
@@ -116,6 +117,25 @@ The other adapters, one file each in `crates/bale-hooks/src/`:
 - T3 Code's `settle` marks activity; it never ups or colds.
 - Conductor's `setup` registers and its `archive` colds the tree.
 - The git `post-checkout` hook registers a new linked worktree.
+
+## The keep-list
+
+Hosts such as T3 Code sometimes delete a worktree directory and make it again with `git worktree add`, so
+small ignored files an agent wrote there (handoff notes, plans) vanish. The path hashes to the same id, so
+the record re-attaches and the keep-list can put them back.
+
+`bale-core/src/keep.rs` is generic: given a `KeepSpec` (relative paths, a per-file cap of 1 MiB and a
+per-tree cap of 10 MiB) it copies files into `keep/<id>/` (`save`) and copies back the ones the tree lacks
+(`restore`). It never follows a symlink, never replaces an existing file (`persist_noclobber`), takes the
+tree lock without waiting, and writes temp file, fsync, rename. Removed files stay in the store; `gc` drops
+the store of an id with no record after 30 days. Config keys `keep_paths`, `keep_max_file_bytes` and
+`keep_max_total_bytes` come through `config.rs`; `keep_paths` is `None` unless set, because the tool paths
+(`.claude/state/`, `.claude/plans/`) are `DEFAULT_KEEP_PATHS` in `bale-hooks`, which core must not name.
+
+`bale-hooks` calls it from Claude Code's `prompt` (restore) and `stop` (restore, then save), and from T3
+Code's `settle`. A restore that copies files writes a `restore-kept` op line with `files`. `bale cold` is
+unaffected: it saves ignored files under `<id>/` as before, and `bale open` brings them back; the keep store
+is a separate copy and also makes a missing file reappear on the next prompt.
 
 ## Stash and the store
 

@@ -333,6 +333,10 @@ pub(crate) trait Traced {
     /// `(outcome, reason code)`. The code is one of a fixed set, never
     /// text from the operation, which can name paths inside the tree.
     fn traced_outcome(&self) -> (&'static str, Option<&'static str>);
+    /// Extra fields for the `op` line, such as a file count.
+    fn traced_fields(&self) -> Map<String, Value> {
+        Map::new()
+    }
 }
 
 impl Traced for Outcome {
@@ -430,6 +434,9 @@ pub(crate) fn op<T: Traced>(
 
     let mut fields = Map::new();
     fields.insert("op".into(), op.into());
+    if let Ok(r) = &result {
+        fields.extend(r.traced_fields());
+    }
     let (outcome, reason, id) = match &result {
         Ok(r) => {
             let (o, why) = r.traced_outcome();

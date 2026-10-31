@@ -185,6 +185,15 @@ The sweep's stash step only stashes trees where Claude Code's restore hook (`pro
 On macOS the sweep also checks Claude Code's session scratchpads (`/tmp/claude-<uid>/<project>/<session>/scratchpad`) for Xcode DerivedData folders at most two levels deep, and deletes one once its project has been gone for an hour and no process holds it. Set `BALE_CLAUDE_TMP` to look under another folder instead of `/tmp`.
 `bale up` on macOS also removes the tree's `-derivedDataPath` folders that bale has learned (from a hook or a scratchpad) and that no process holds, then links each one back to the tree's shared Swift packages.
 
+Small notes the agent keeps in a tree and git ignores (`.claude/state/` handoff notes and `.claude/plans/` by
+default) are copied to `$BALE_HOME/keep/<id>/` by Claude Code's `stop` hook and T3 Code's settle script. When a
+host deletes a worktree and makes it again at the same path, the next Claude Code prompt puts back each kept
+file the tree lacks; it never overwrites a file, and it writes a `restore-kept` line to the trace. Files over
+`keep_max_file_bytes` (1 MiB) are skipped and a tree's store stops growing at `keep_max_total_bytes` (10 MiB).
+Set `keep_paths = [...]` (relative to the tree) in `config.toml` or `.bale.toml` to change the list, or
+`keep_paths = []` to turn it off. Files you delete on purpose stay in the store, so a later restore can bring
+them back; `bale gc` removes the store of a forgotten tree after 30 days.
+
 Known limitations:
 
 - Removing Xcode DerivedData that lives inside a worktree also removes its `SourcePackages/checkouts`.
