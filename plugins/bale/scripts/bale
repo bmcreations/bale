@@ -8,7 +8,7 @@
 # WorktreeCreate, which fails so Claude Code reports it.
 set -eu
 
-BALE_VERSION="0.1.0"
+BALE_VERSION="0.2.0"
 repo="bmcreations/bale"
 data="${CLAUDE_PLUGIN_DATA:?bale: CLAUDE_PLUGIN_DATA is not set}"
 bin="$data/bin/bale"
