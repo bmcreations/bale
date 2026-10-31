@@ -76,6 +76,11 @@ pub fn settle(home: &BaleHome) -> ExitCode {
             }
             Touch::Touched | Touch::Locked => Ok(()),
         });
+        if let (true, Ok(path)) = (result.is_ok(), worktree_path()) {
+            let canonical = bale_core::paths::canonicalize(&path).unwrap_or(path);
+            let id = bale_core::registry::workspace_id(&canonical);
+            crate::keep_tree(home, &canonical, &id, crate::Keep::Sync);
+        }
         if let Err(e) = result {
             eprintln!("bale: t3 settle: {e:#}");
         }

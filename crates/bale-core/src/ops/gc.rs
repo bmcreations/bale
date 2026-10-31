@@ -67,6 +67,12 @@ fn gc_untraced(home: &BaleHome, dry_run: bool) -> Result<GcReport> {
         }
     }
     collect_store(home, &registry, dry_run, &mut report);
+    if !dry_run {
+        if let Ok(all) = registry.all_lenient() {
+            let ids: Vec<String> = all.into_iter().map(|(stem, _)| stem).collect();
+            crate::keep::prune_orphans(home, &ids, std::time::Duration::from_secs(30 * 86400));
+        }
+    }
     collect_clones(home, &registry, dry_run, &mut report);
     Ok(report)
 }
