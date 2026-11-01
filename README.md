@@ -3,9 +3,10 @@
 </p>
 
 Run four coding agents at once and you have a dozen worktrees, each with its own build output. One
-iOS app's worktree holds 9.4 GiB of DerivedData, so a dozen of them is over 100 GiB. Deleting worktrees
-by hand loses uncommitted work, and deleting build output means waiting for a full rebuild the next
-time an agent picks the tree up.
+iOS app's worktree holds about 5.8 GiB of DerivedData after one simulator build, and up to 14 GiB once it
+has built device and TSan variants too ([bench](docs/bench/2026-11-agent-dd-size.md)), so a dozen of them
+is 70 to 170 GiB. Deleting worktrees by hand loses uncommitted work, and deleting build output means
+waiting for a full rebuild the next time an agent picks the tree up.
 
 bale hooks into the agent tools, notices which trees are idle, and shrinks them in steps. A stashed or
 baled tree fills back in when an agent uses it again; a cold one comes back with `bale open`.
