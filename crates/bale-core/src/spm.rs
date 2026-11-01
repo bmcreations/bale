@@ -5,7 +5,7 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use crate::derived_data::is_derived_data_root;
-use crate::detect::{GRADLE_DIRS, SWIFT_DIRS};
+use crate::detect::is_any_regenerable_name;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ pub(crate) fn resolved_files(tree: &Path) -> Vec<Resolved> {
             entry.path().join("xcshareddata/swiftpm/Package.resolved")
         } else {
             let skip = name == ".git"
-                || GRADLE_DIRS.iter().chain(SWIFT_DIRS).any(|n| *n == name)
+                || is_any_regenerable_name(&name)
                 || is_derived_data_root(entry.path());
             if skip {
                 it.skip_current_dir();

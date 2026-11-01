@@ -20,7 +20,7 @@ The main modules in `bale-core/src`:
 - `lock`: a per-tree file lock. Operations try it without waiting and skip a tree that is locked.
 - `busy`: which processes hold a tree (lsof on macOS, `/proc` on Linux; Windows reports none).
 - `idle`: the newest source mtime in a tree, skipping `.git` and build output.
-- `detect`: build-system markers, and which directories count as build output.
+- `build_systems`, `detect`: the build systems bale knows, their markers, and which directories count as build output.
 - `derived_data`, `spm`, `spm_link`, `spm_lock`: Xcode DerivedData ownership and the shared Swift package folder.
 - `store`: the content-addressed store (`blob`, `codec`, `manifest`, `index`, `gc`).
 - `clones`: shared checkouts: file clones (`reflink`), the clone store (`store`), which tracked files can be
@@ -78,10 +78,24 @@ Pinned trees are never upped or colded. Defaults live at the top of `crates/bale
 
 ## What counts as build output
 
-`detect` finds build systems by marker at the root or one level down (`settings.gradle(.kts)`,
-`Package.swift`, `*.xcodeproj`, `*.xcworkspace`). For those, `build`, `.gradle`, `.kotlin`, `.cxx`,
-`.externalNativeBuild` and `.build` are regenerable, as is any directory that is itself a DerivedData root.
-`regenerable` in config adds names. Rust `target/` and `node_modules` are not on the list.
+Each build system is a type in `crates/bale-core/src/build_systems/` that implements `BuildSystem`: the
+marker names that show it is in use, the directory names its build recreates (`regenerable`), the subset of
+those whose large files stash may stub (`stash`), and whether Xcode DerivedData roots count. `ALL` lists them.
+`detect` looks for markers at the root or one level down, and every operation reads the systems it finds.
+`regenerable` in config adds names. Rust `target/` and `node_modules` are not covered.
+
+To add a build system:
+
+1. Add a module under `build_systems/` with a type that implements `BuildSystem`, and list it in `ALL`.
+2. Keep the default empty `stash` unless a stash and restore of a real build has been measured to rebuild
+   nothing. A build that reads an emptied input builds the wrong thing rather than failing.
+3. Add a `crates/bale-core/tests/detect.rs` case that detects the system from its marker and lists its
+   regenerable directories.
+4. Add the system to the README's "Bales idle trees" list.
+
+Xcode needs more than its type: DerivedData ownership (`derived_data`), the shared Swift package folder
+(`spm*`), unstash's `Build/Products/` twin rule, and the sweep's reap of shared DerivedData are their own
+modules.
 
 `up` keeps a matching directory that holds tracked or unignored files, or that sits inside a nested repo or
 submodule, because deleting it would lose something git cannot bring back.
