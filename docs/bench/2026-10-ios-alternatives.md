@@ -28,7 +28,7 @@ Five checks on a Flipcash iOS build, to see whether anything beats stashing buil
 
 The two full builds ran the same tasks but differed by 80 s, so wall time for a full build on this machine depends on the load more than on anything in the tree. The warm-tier figure of 15-17 s for a no-op holds when load is under about 10; the first no-op after a full build copied 67 files and took 29 s.
 
-For bale: a fresh worktree of this project costs 6.5-8 minutes and 11 GiB, and the comparison figures below are against these two builds.
+For bale: a fresh worktree of this project costs 6.5-8 minutes and 11 GiB with this build, and the comparison figures below are against these two builds. The generic destination builds arm64 and x86_64; an agent's one-architecture build holds about 3.3 GiB plus its Swift packages ([agent-dd-size](2026-11-agent-dd-size.md)).
 
 ## 2. In-place APFS compression instead of stash
 
@@ -121,7 +121,7 @@ For bale: the 919 MiB (954 MiB here) that Task 10 hoped to save by cloning can b
 
 The switch-and-build ran about a quarter to a third of the wall time of a full build and 43% of the Swift compile tasks, with no C compiles. The older commit has fewer files, and the load and the direction differ between the runs, so the 80 and 110 s are not a clean pair. A diff of 213 files cost 2,756 `SwiftCompile` tasks, so the work is module-level recompilation, not one task per changed file.
 
-For bale: a recycled tree needs no new 11 GiB, and git only touched 213 of 3,346 files. Whether that beats a clone of a warm base depends on how far the new commit is from the tree's last build, which this run varied only once.
+For bale: a recycled tree needs no new DerivedData (11 GiB in this two-architecture build), and git only touched 213 of 3,346 files. Whether that beats a clone of a warm base depends on how far the new commit is from the tree's last build, which this run varied only once.
 
 ## 5. Clone of a warm base, and the compilation cache
 

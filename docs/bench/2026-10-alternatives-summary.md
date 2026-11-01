@@ -5,6 +5,9 @@ checkouts leave on the table. Each measured result has its own file; this one ra
 evidence. Every timing is one run on a shared, loaded machine (load 4 to 128, 30 GiB of swap), so compare
 timings only within a file, and only where that file says the load was similar.
 
+The iOS builds here used the generic simulator destination, which builds two architectures, so their GiB per
+tree are about 1.9 times what an agent's one-architecture tree holds with its own Swift packages ([agent-dd-size](2026-11-agent-dd-size.md)).
+
 | File | Covers |
 |---|---|
 | [ios-alternatives](2026-10-ios-alternatives.md) | APFS in-place compression, duplicate appex dylibs, recycling a tree, `cp -c -R` warm base, Xcode compilation cache |
