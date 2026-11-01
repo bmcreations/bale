@@ -1,3 +1,4 @@
+pub mod build_systems;
 pub mod busy;
 pub mod clones;
 pub mod config;
@@ -6,6 +7,7 @@ pub mod detect;
 pub mod git;
 pub mod history;
 pub mod idle;
+pub mod keep;
 pub mod lock;
 pub mod ops;
 pub mod par;

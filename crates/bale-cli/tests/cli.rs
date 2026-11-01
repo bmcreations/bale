@@ -4294,3 +4294,132 @@ fn share_command_shares_or_says_why_not() {
     );
     assert_eq!(fs::read(wt.join("big.bin")).unwrap(), noise(2 * MIB, 4));
 }
+
+// Keep-list: small ignored notes outlive a tree deleted and made again.
+
+fn keep_tree_setup(env: &Env) -> PathBuf {
+    let wt = env.add_worktree("keeper");
+    let out = env.bale(&env.repo, &["adopt", wt.to_str().unwrap()], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    wt
+}
+
+fn hook_claude(env: &Env, wt: &Path, sub: &str, event: &str) -> Output {
+    let out = env.bale(
+        &env.repo,
+        &["hook", "claude", sub],
+        Some(&hook_json(wt, event)),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    out
+}
+
+fn restore_kept_lines(env: &Env) -> Vec<Value> {
+    trace_lines(env)
+        .into_iter()
+        .filter(|l| l["kind"] == "op" && l["op"] == "restore-kept")
+        .collect()
+}
+
+#[test]
+fn stop_hook_saves_the_keep_list() {
+    let env = Env::new();
+    let wt = keep_tree_setup(&env);
+    fs::create_dir_all(wt.join(".claude/state")).unwrap();
+    fs::write(wt.join(".claude/state/handoff.md"), "next: x\n").unwrap();
+    fs::write(wt.join("other.txt"), "not kept\n").unwrap();
+    hook_claude(&env, &wt, "stop", "Stop");
+    let kept = env
+        .bale_home()
+        .join("keep")
+        .join(tree_id(&wt))
+        .join(".claude/state/handoff.md");
+    assert_eq!(fs::read_to_string(kept).unwrap(), "next: x\n");
+    assert!(!env
+        .bale_home()
+        .join("keep")
+        .join(tree_id(&wt))
+        .join("other.txt")
+        .exists());
+}
+
+#[test]
+fn recreated_tree_gets_kept_files_back_and_traces_it() {
+    let env = Env::new();
+    let wt = keep_tree_setup(&env);
+    fs::create_dir_all(wt.join(".claude/plans")).unwrap();
+    fs::write(wt.join(".claude/plans/p.md"), "plan\n").unwrap();
+    hook_claude(&env, &wt, "stop", "Stop");
+
+    // The host deletes the directory, prunes and adds it again.
+    fs::remove_dir_all(&wt).unwrap();
+    env.git(&env.repo, &["worktree", "prune"]);
+    env.git(
+        &env.repo,
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    assert!(!wt.join(".claude/plans/p.md").exists());
+
+    hook_claude(&env, &wt, "prompt", "UserPromptSubmit");
+    assert_eq!(
+        fs::read_to_string(wt.join(".claude/plans/p.md")).unwrap(),
+        "plan\n"
+    );
+    let lines = restore_kept_lines(&env);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["files"], 1);
+    assert_eq!(lines[0]["outcome"], "ok");
+    assert_eq!(lines[0]["id"], tree_id(&wt));
+
+    // Nothing absent now: no second line.
+    hook_claude(&env, &wt, "stop", "Stop");
+    assert_eq!(restore_kept_lines(&env).len(), 1);
+}
+
+#[test]
+fn restore_never_overwrites_an_existing_file() {
+    let env = Env::new();
+    let wt = keep_tree_setup(&env);
+    fs::create_dir_all(wt.join(".claude/state")).unwrap();
+    fs::write(wt.join(".claude/state/a.md"), "old a\n").unwrap();
+    fs::write(wt.join(".claude/state/b.md"), "old b\n").unwrap();
+    hook_claude(&env, &wt, "stop", "Stop");
+    fs::write(wt.join(".claude/state/a.md"), "new a\n").unwrap();
+    fs::remove_file(wt.join(".claude/state/b.md")).unwrap();
+
+    hook_claude(&env, &wt, "prompt", "UserPromptSubmit");
+    assert_eq!(
+        fs::read_to_string(wt.join(".claude/state/a.md")).unwrap(),
+        "new a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join(".claude/state/b.md")).unwrap(),
+        "old b\n"
+    );
+    assert_eq!(restore_kept_lines(&env)[0]["files"], 1);
+}
+
+#[test]
+fn keep_list_respects_the_size_caps_and_config() {
+    let env = Env::new();
+    let wt = keep_tree_setup(&env);
+    fs::write(env.bale_home().parent().unwrap().join("x"), "").unwrap();
+    fs::create_dir_all(env.bale_home()).unwrap();
+    fs::write(
+        env.bale_home().join("config.toml"),
+        "keep_paths = [\"notes/\"]\nkeep_max_file_bytes = 10\nkeep_max_total_bytes = 15\n",
+    )
+    .unwrap();
+    fs::create_dir_all(wt.join("notes")).unwrap();
+    fs::create_dir_all(wt.join(".claude/state")).unwrap();
+    fs::write(wt.join("notes/a.txt"), "12345678").unwrap(); // 8
+    fs::write(wt.join("notes/b.txt"), "12345678").unwrap(); // would pass 15 total
+    fs::write(wt.join("notes/big.txt"), "123456789012").unwrap(); // over 10
+    fs::write(wt.join(".claude/state/x.md"), "x").unwrap(); // not in config
+    hook_claude(&env, &wt, "stop", "Stop");
+    let dir = env.bale_home().join("keep").join(tree_id(&wt));
+    assert!(dir.join("notes/a.txt").exists());
+    assert!(!dir.join("notes/b.txt").exists());
+    assert!(!dir.join("notes/big.txt").exists());
+    assert!(!dir.join(".claude").exists());
+}

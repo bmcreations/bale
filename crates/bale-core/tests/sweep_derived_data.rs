@@ -632,3 +632,99 @@ fn derived_data_of_a_cold_record_with_a_missing_path_is_kept() {
     assert!(reap_rows(&rows).is_empty(), "{rows:?}");
     assert!(owned.exists());
 }
+
+/// A shared DerivedData folder with no `info.plist`, named as Xcode names
+/// the folder for `project`, holding what a package resolve leaves, every
+/// entry backdated two hours.
+fn resolve_only(root: &Path, project: &Path) -> PathBuf {
+    let dir = root.join(bale_core::derived_data::folder_name(project));
+    for sub in ["Logs/Package", "SourcePackages/checkouts"] {
+        fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    fs::write(dir.join("SourcePackages/checkouts/pkg"), vec![0u8; 8192]).unwrap();
+    let t = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+    );
+    for p in [dir.join("Logs"), dir.join("SourcePackages"), dir.clone()] {
+        filetime::set_file_mtime(p, t).unwrap();
+    }
+    dir
+}
+
+/// Appends a `tree` line naming `path` to today's trace file.
+fn trace_tree(fx: &Fixture, path: &Path) {
+    let dir = fx.home().trace_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let day = bale_core::trace::utc_date(std::time::SystemTime::now());
+    let line = serde_json::json!({"v": 1, "kind": "tree", "id": "x", "path": path});
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{day}.jsonl")))
+        .unwrap();
+    use std::io::Write;
+    writeln!(f, "{line}").unwrap();
+}
+
+#[test]
+fn plistless_derived_data_of_a_gone_tree_is_reaped_by_its_name() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    // A built folder of a live tree gives the project's path in a tree.
+    let wt = fx.add_worktree("wt-live", "wt-live");
+    register(&fx.home(), &wt).unwrap();
+    let live = dd(&root, "App-live", Some(&wt.join("App.xcodeproj")));
+    age(&live, 2);
+    // The deleted tree is known only from the trace.
+    let deleted = gone(&fx, "wt-deleted");
+    trace_tree(&fx, &deleted);
+    let orphan = resolve_only(&root, &deleted.join("App.xcodeproj"));
+    let cache = root.join("ModuleCache.noindex");
+    fs::create_dir_all(cache.join("abc")).unwrap();
+    fs::write(fx.home().0.join("config.toml"), "reap_grace_minutes = 60\n").unwrap();
+
+    let rows = sweep(&fx.home(), true).unwrap();
+    let reaped = reap_rows(&rows);
+    assert_eq!(reaped.len(), 1, "{rows:?}");
+    assert_eq!(reaped[0].0, orphan.display().to_string(), "{rows:?}");
+    assert!(
+        reaped[0].2.starts_with("would reap") && reaped[0].2.contains("name matches"),
+        "{rows:?}"
+    );
+    assert!(orphan.exists());
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert_eq!(reap_rows(&rows).len(), 1, "{rows:?}");
+    assert!(!orphan.exists());
+    assert!(live.exists() && cache.exists());
+}
+
+#[test]
+fn plistless_derived_data_is_kept_while_its_tree_or_folder_is_live() {
+    let fx = Fixture::new();
+    let (_g, root) = user_home(&fx);
+    // A registered tree that exists, whose project file does not (yet).
+    let wt = fx.add_worktree("wt-live", "wt-live");
+    register(&fx.home(), &wt).unwrap();
+    let live = dd(&root, "App-live", Some(&wt.join("App.xcodeproj")));
+    age(&live, 2);
+    let held = resolve_only(&root, &wt.join("App.xcodeproj"));
+    // A gone tree whose folder just gained an entry.
+    let deleted = gone(&fx, "wt-deleted");
+    trace_tree(&fx, &deleted);
+    let fresh = resolve_only(&root, &deleted.join("App.xcodeproj"));
+    fs::create_dir_all(fresh.join("Index.noindex")).unwrap();
+    filetime::set_file_mtime(
+        &fresh,
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+        ),
+    )
+    .unwrap();
+    // A gone tree no record or trace line names.
+    let unknown = resolve_only(&root, &gone(&fx, "never-seen").join("App.xcodeproj"));
+
+    let rows = sweep(&fx.home(), false).unwrap();
+    assert!(reap_rows(&rows).is_empty(), "{rows:?}");
+    assert!(held.exists() && fresh.exists() && unknown.exists());
+}

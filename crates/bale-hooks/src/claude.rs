@@ -370,6 +370,9 @@ pub fn prompt(home: &BaleHome) -> ExitCode {
         if let Err(e) = touch_restoring(home, &path) {
             eprintln!("bale: not recorded as activity: {e:#}");
         }
+        // A tree made again at this path gets its notes back before the
+        // agent reads them.
+        crate::keep_tree(home, &path, &id, crate::Keep::Restore);
         if !pending {
             return ExitCode::SUCCESS;
         }
@@ -966,18 +969,20 @@ fn disinherit_std_handles() {
     }
 }
 
-/// Stop: records the turn's end as the tree's last activity. No hashing and
-/// no store access; it never blocks Claude Code, so failures only print.
+/// Stop: records the turn's end as the tree's last activity and copies the
+/// tree's keep-list (small notes, capped; see `bale_core::keep`) into bale's
+/// keep store. No hashing and no blob-store access; it never blocks Claude Code, so failures only print.
 pub fn stop(home: &BaleHome) -> ExitCode {
     crate::as_hook(Tool::Claude, || {
         let Some(cwd) = hook_cwd("stop") else {
             return ExitCode::SUCCESS;
         };
         match tree_containing(home, &cwd) {
-            Ok(Some((path, _))) => {
+            Ok(Some((path, id))) => {
                 if let Err(e) = touch(home, &path) {
                     eprintln!("bale: not recorded as activity: {e:#}");
                 }
+                crate::keep_tree(home, &path, &id, crate::Keep::Sync);
             }
             Ok(None) => {}
             Err(e) => eprintln!("bale: {e:#}"),

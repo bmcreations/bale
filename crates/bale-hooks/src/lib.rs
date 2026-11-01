@@ -332,3 +332,45 @@ mod tests {
         assert!(text.contains("pid 7 gradle /w/t"), "{text}");
     }
 }
+
+/// Paths a tool's agent writes small, git-ignored notes to, kept by default
+/// across the tree being deleted and recreated: Claude Code handoff notes
+/// and plans. Config `keep_paths` replaces the list; `[]` turns it off.
+pub const DEFAULT_KEEP_PATHS: [&str; 2] = [".claude/state/", ".claude/plans/"];
+
+/// What a hook turn does with the keep-list (see `bale_core::keep`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// Put back kept files the tree lacks.
+    Restore,
+    /// Restore, then copy the tree's kept files into the store.
+    Sync,
+}
+
+/// Runs [`Keep`] for the live tree `path` (record `id`). Best-effort: a
+/// failure prints one line to stderr and never fails the hook.
+pub(crate) fn keep_tree(home: &BaleHome, path: &Path, id: &str, what: Keep) {
+    let result = (|| -> Result<()> {
+        let cfg = bale_core::config::load_config(home, Some(path))?;
+        let paths = match cfg.keep_paths {
+            Some(p) => p,
+            None => DEFAULT_KEEP_PATHS.iter().map(|s| s.to_string()).collect(),
+        };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let spec = bale_core::keep::KeepSpec {
+            paths,
+            max_file_bytes: cfg.keep_max_file_bytes,
+            max_total_bytes: cfg.keep_max_total_bytes,
+        };
+        bale_core::keep::restore(home, id, path, &spec)?;
+        if what == Keep::Sync {
+            bale_core::keep::save(home, id, path, &spec)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("bale: kept files: {e:#}");
+    }
+}

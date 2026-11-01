@@ -20,7 +20,7 @@ The main modules in `bale-core/src`:
 - `lock`: a per-tree file lock. Operations try it without waiting and skip a tree that is locked.
 - `busy`: which processes hold a tree (lsof on macOS, `/proc` on Linux; Windows reports none).
 - `idle`: the newest source mtime in a tree, skipping `.git` and build output.
-- `detect`: build-system markers, and which directories count as build output.
+- `build_systems`, `detect`: the build systems bale knows, their markers, and which directories count as build output.
 - `derived_data`, `spm`, `spm_link`, `spm_lock`: Xcode DerivedData ownership and the shared Swift package folder.
 - `store`: the content-addressed store (`blob`, `codec`, `manifest`, `index`, `gc`).
 - `clones`: shared checkouts: file clones (`reflink`), the clone store (`store`), which tracked files can be
@@ -39,6 +39,7 @@ Everything lives under `BALE_HOME`, which defaults to `~/.bale`:
 | `store/objects/`, `store/manifests/`, `store/index/` | Stashed file contents, one manifest per stash, and a stat index per tree. |
 | `clones/git/<hh>/<oid>`, `clones/lfs/<hh>/<sha256>` | One read-only copy of each large tracked file, shared by every repo. See "Shared checkouts". |
 | `<id>/` | A cold tree's saved uncommitted work and ignored files. |
+| `keep/<id>/` | The keep-list: copies of small ignored files (mirrored paths) that survive the tree being deleted and recreated. Separate from `<id>/`, which only a cold tree has. |
 | `dd-roots` | DerivedData roots learned from `-derivedDataPath` and Claude scratchpads. |
 | `spm/<key>` | Shared Swift package checkouts. |
 | `trace/<date>.jsonl` | The usage trace, one file per UTC day, kept 60 days. See `docs/usage-trace.md`. |
@@ -77,10 +78,24 @@ Pinned trees are never upped or colded. Defaults live at the top of `crates/bale
 
 ## What counts as build output
 
-`detect` finds build systems by marker at the root or one level down (`settings.gradle(.kts)`,
-`Package.swift`, `*.xcodeproj`, `*.xcworkspace`). For those, `build`, `.gradle`, `.kotlin`, `.cxx`,
-`.externalNativeBuild` and `.build` are regenerable, as is any directory that is itself a DerivedData root.
-`regenerable` in config adds names. Rust `target/` and `node_modules` are not on the list.
+Each build system is a type in `crates/bale-core/src/build_systems/` that implements `BuildSystem`: the
+marker names that show it is in use, the directory names its build recreates (`regenerable`), the subset of
+those whose large files stash may stub (`stash`), and whether Xcode DerivedData roots count. `ALL` lists them.
+`detect` looks for markers at the root or one level down, and every operation reads the systems it finds.
+`regenerable` in config adds names. Rust `target/` and `node_modules` are not covered.
+
+To add a build system:
+
+1. Add a module under `build_systems/` with a type that implements `BuildSystem`, and list it in `ALL`.
+2. Keep the default empty `stash` unless a stash and restore of a real build has been measured to rebuild
+   nothing. A build that reads an emptied input builds the wrong thing rather than failing.
+3. Add a `crates/bale-core/tests/detect.rs` case that detects the system from its marker and lists its
+   regenerable directories.
+4. Add the system to the README's "Bales idle trees" list.
+
+Xcode needs more than its type: DerivedData ownership (`derived_data`), the shared Swift package folder
+(`spm*`), unstash's `Build/Products/` twin rule, and the sweep's reap of shared DerivedData are their own
+modules.
 
 `up` keeps a matching directory that holds tracked or unignored files, or that sits inside a nested repo or
 submodule, because deleting it would lose something git cannot bring back.
@@ -101,9 +116,9 @@ record). The other tools register trees and mark activity; their trees go straig
 | Claude Code event | `bale hook claude …` | Does |
 |---|---|---|
 | `WorktreeCreate` | `create` | `bale new` on branch `worktree-<name>` and prints the path. Falls back to plain `git worktree add`. |
-| `UserPromptSubmit` | `prompt` | Reports an earlier failed restore. If the tree is stashed, bumps its lock so a running stash stops, starts `bale unstash --background` and returns. |
+| `UserPromptSubmit` | `prompt` | Reports an earlier failed restore. Restores kept files the tree lacks. If the tree is stashed, bumps its lock so a running stash stops, starts `bale unstash --background` and returns. |
 | `PreToolUse` | `pre-tool` | Waits up to 60 s for the restore of the working tree and of any tree the command names (`cd`, `git -C`, `-project`, `-workspace`, `-derivedDataPath`, a file path). Learns DerivedData roots and relinks Swift packages. |
-| `Stop` | `stop` | Marks activity. |
+| `Stop` | `stop` | Marks activity and saves the keep-list. |
 | `WorktreeRemove` | `remove` | `cold`, ignoring the hook's own process tree. |
 
 The prompt hook does not wait because a restore can take seconds, and the user would feel that on every
@@ -116,6 +131,25 @@ The other adapters, one file each in `crates/bale-hooks/src/`:
 - T3 Code's `settle` marks activity; it never ups or colds.
 - Conductor's `setup` registers and its `archive` colds the tree.
 - The git `post-checkout` hook registers a new linked worktree.
+
+## The keep-list
+
+Hosts such as T3 Code sometimes delete a worktree directory and make it again with `git worktree add`, so
+small ignored files an agent wrote there (handoff notes, plans) vanish. The path hashes to the same id, so
+the record re-attaches and the keep-list can put them back.
+
+`bale-core/src/keep.rs` is generic: given a `KeepSpec` (relative paths, a per-file cap of 1 MiB and a
+per-tree cap of 10 MiB) it copies files into `keep/<id>/` (`save`) and copies back the ones the tree lacks
+(`restore`). It never follows a symlink, never replaces an existing file (`persist_noclobber`), takes the
+tree lock without waiting, and writes temp file, fsync, rename. Removed files stay in the store; `gc` drops
+the store of an id with no record after 30 days. Config keys `keep_paths`, `keep_max_file_bytes` and
+`keep_max_total_bytes` come through `config.rs`; `keep_paths` is `None` unless set, because the tool paths
+(`.claude/state/`, `.claude/plans/`) are `DEFAULT_KEEP_PATHS` in `bale-hooks`, which core must not name.
+
+`bale-hooks` calls it from Claude Code's `prompt` (restore) and `stop` (restore, then save), and from T3
+Code's `settle`. A restore that copies files writes a `restore-kept` op line with `files`. `bale cold` is
+unaffected: it saves ignored files under `<id>/` as before, and `bale open` brings them back; the keep store
+is a separate copy and also makes a missing file reappear on the next prompt.
 
 ## Stash and the store
 
@@ -226,7 +260,10 @@ A tree is busy when any process other than bale (and the hook that called it) ha
 open file inside it. `up` and `cold` refuse a busy tree; stash skips it and tries again next sweep.
 
 Reap deletes a DerivedData folder only when its project path is missing, no live record holds it, and
-nothing in it changed within `reap_grace`.
+nothing in it changed within `reap_grace`. A shared folder with no `info.plist`, such as one a package resolve
+left, takes its project path from its name: reap hashes each known tree (registered, or named in the last 60
+days of trace) joined with the project paths other folders record, the way Xcode names the folder. A folder
+that matches no known tree is kept.
 
 ## Not built
 

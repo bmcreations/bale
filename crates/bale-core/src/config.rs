@@ -11,6 +11,8 @@ const DEFAULT_REAP_GRACE_MINUTES: u64 = 60;
 const DEFAULT_STASH_MIN_BYTES: u64 = 1 << 20;
 const DEFAULT_PATCH_MAX_DEPTH: u32 = 4;
 const DEFAULT_CLONE_MIN_BYTES: u64 = 1 << 20;
+const DEFAULT_KEEP_MAX_FILE_BYTES: u64 = 1 << 20;
+const DEFAULT_KEEP_MAX_TOTAL_BYTES: u64 = 10 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -28,6 +30,14 @@ pub struct Config {
     pub share_checkouts: bool,
     /// Tracked files this size or larger are shared.
     pub clone_min_bytes: u64,
+    /// Paths (relative to a tree) a hook keeps across the tree being deleted
+    /// and recreated. `None` leaves the choice to the tool's adapter; an
+    /// empty list turns keeping off.
+    pub keep_paths: Option<Vec<String>>,
+    /// Kept files above this size are skipped.
+    pub keep_max_file_bytes: u64,
+    /// A tree's kept files stop being added past this total.
+    pub keep_max_total_bytes: u64,
     pub regenerable_extra: Vec<String>,
     pub ignored_denylist_extra: Vec<String>,
     pub worktree_root: Option<PathBuf>,
@@ -45,6 +55,9 @@ struct RawConfig {
     patch_max_depth: Option<u32>,
     share_checkouts: Option<bool>,
     clone_min_bytes: Option<u64>,
+    keep_paths: Option<Vec<String>>,
+    keep_max_file_bytes: Option<u64>,
+    keep_max_total_bytes: Option<u64>,
     regenerable: Option<Vec<String>>,
     ignored_denylist: Option<Vec<String>>,
     worktree_root: Option<PathBuf>,
@@ -105,6 +118,15 @@ pub fn load_config(home: &BaleHome, repo_root: Option<&Path>) -> Result<Config> 
             .clone_min_bytes
             .or(machine.clone_min_bytes)
             .unwrap_or(DEFAULT_CLONE_MIN_BYTES),
+        keep_paths: repo.keep_paths.or(machine.keep_paths),
+        keep_max_file_bytes: repo
+            .keep_max_file_bytes
+            .or(machine.keep_max_file_bytes)
+            .unwrap_or(DEFAULT_KEEP_MAX_FILE_BYTES),
+        keep_max_total_bytes: repo
+            .keep_max_total_bytes
+            .or(machine.keep_max_total_bytes)
+            .unwrap_or(DEFAULT_KEEP_MAX_TOTAL_BYTES),
         regenerable_extra: repo.regenerable.or(machine.regenerable).unwrap_or_default(),
         ignored_denylist_extra: repo
             .ignored_denylist

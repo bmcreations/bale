@@ -333,6 +333,10 @@ pub(crate) trait Traced {
     /// `(outcome, reason code)`. The code is one of a fixed set, never
     /// text from the operation, which can name paths inside the tree.
     fn traced_outcome(&self) -> (&'static str, Option<&'static str>);
+    /// Extra fields for the `op` line, such as a file count.
+    fn traced_fields(&self) -> Map<String, Value> {
+        Map::new()
+    }
 }
 
 impl Traced for Outcome {
@@ -430,6 +434,9 @@ pub(crate) fn op<T: Traced>(
 
     let mut fields = Map::new();
     fields.insert("op".into(), op.into());
+    if let Ok(r) = &result {
+        fields.extend(r.traced_fields());
+    }
     let (outcome, reason, id) = match &result {
         Ok(r) => {
             let (o, why) = r.traced_outcome();
@@ -553,6 +560,34 @@ pub fn missing(home: &BaleHome, op: &str, path: &Path) {
     fields.insert("duration_ms".into(), 0.into());
     insert_context(&mut fields);
     emit(home, "op", fields);
+}
+
+/// The distinct `path` of every `tree` line in the kept trace files, sorted,
+/// so a tree whose record is gone can still be named for up to [`KEEP_DAYS`].
+/// Unreadable files and lines are skipped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn tree_paths(home: &BaleHome) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    let Ok(entries) = fs::read_dir(home.trace_dir()) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines().filter(|l| l.contains(r#""kind":"tree""#)) {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let (Some("tree"), Some(path)) = (v["kind"].as_str(), v["path"].as_str()) {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    paths.into_iter().collect()
 }
 
 /// An existing dir on the volume of `id`'s tree that outlives `cold`: the
