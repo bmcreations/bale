@@ -5,6 +5,9 @@ use crate::derived_data::{global_owned, is_derived_data_root, Trees};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// A build system bale knows. Each one's knowledge is its [`Spec`]; to add a
+/// system, add a variant here, list it in [`BuildSystem::ALL`] and give it a
+/// spec in [`BuildSystem::spec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildSystem {
     Gradle,
@@ -12,22 +15,104 @@ pub enum BuildSystem {
     SwiftPm,
 }
 
-pub(crate) const GRADLE_DIRS: &[&str] = &[
-    "build",
-    ".gradle",
-    ".kotlin",
-    ".cxx",
-    ".externalNativeBuild",
-];
-pub(crate) const SWIFT_DIRS: &[&str] = &[".build"];
+/// A file or directory name that shows a build system is in use.
+#[derive(Debug, Clone, Copy)]
+pub enum Marker {
+    /// The whole name, such as `settings.gradle`.
+    Name(&'static str),
+    /// A name ending, such as `.xcodeproj`.
+    Suffix(&'static str),
+}
+
+impl Marker {
+    fn matches(self, name: &str) -> bool {
+        match self {
+            Marker::Name(n) => name == n,
+            Marker::Suffix(s) => name.ends_with(s),
+        }
+    }
+}
+
+/// What bale knows about one build system's output in a tree.
+#[derive(Debug)]
+pub struct Spec {
+    /// Names that mark a tree as using this system, at its root or one level
+    /// down.
+    pub markers: &'static [Marker],
+    /// Directory names, anywhere in the tree, that the build recreates. `up`
+    /// deletes them (unless they hold tracked or unignored files), and idle
+    /// time ignores changes inside them.
+    pub regenerable: &'static [&'static str],
+    /// The names in `regenerable` whose large files `stash` may replace with
+    /// empty stubs. Only list a directory that holds nothing but the build's
+    /// own output: a build that reads an emptied input builds the wrong thing
+    /// rather than failing. Leave it empty until a stash and restore of a real
+    /// build has been measured.
+    pub stash: &'static [&'static str],
+    /// Whether an Xcode DerivedData root, by any name, counts as regenerable,
+    /// with its `Build/` stashable.
+    pub derived_data: bool,
+}
+
+const GRADLE: Spec = Spec {
+    markers: &[
+        Marker::Name("settings.gradle"),
+        Marker::Name("settings.gradle.kts"),
+    ],
+    regenerable: &[
+        "build",
+        ".gradle",
+        ".kotlin",
+        ".cxx",
+        ".externalNativeBuild",
+    ],
+    stash: &["build"],
+    derived_data: false,
+};
+
+const XCODE: Spec = Spec {
+    markers: &[Marker::Suffix(".xcodeproj"), Marker::Suffix(".xcworkspace")],
+    regenerable: &[".build"],
+    stash: &[],
+    derived_data: true,
+};
+
+const SWIFT_PM: Spec = Spec {
+    markers: &[Marker::Name("Package.swift")],
+    regenerable: &[".build"],
+    stash: &[],
+    derived_data: true,
+};
+
+impl BuildSystem {
+    /// Every system, in the order `detect` checks markers.
+    pub const ALL: &'static [BuildSystem] = &[
+        BuildSystem::Gradle,
+        BuildSystem::Xcode,
+        BuildSystem::SwiftPm,
+    ];
+
+    pub fn spec(self) -> &'static Spec {
+        match self {
+            BuildSystem::Gradle => &GRADLE,
+            BuildSystem::Xcode => &XCODE,
+            BuildSystem::SwiftPm => &SWIFT_PM,
+        }
+    }
+}
+
+/// Whether `name` is a regenerable directory name of any system.
+pub(crate) fn is_any_regenerable_name(name: &str) -> bool {
+    BuildSystem::ALL
+        .iter()
+        .any(|s| s.spec().regenerable.contains(&name))
+}
 
 fn marker_system(name: &str) -> Option<BuildSystem> {
-    match name {
-        "settings.gradle" | "settings.gradle.kts" => Some(BuildSystem::Gradle),
-        "Package.swift" => Some(BuildSystem::SwiftPm),
-        n if n.ends_with(".xcodeproj") || n.ends_with(".xcworkspace") => Some(BuildSystem::Xcode),
-        _ => None,
-    }
+    BuildSystem::ALL
+        .iter()
+        .copied()
+        .find(|s| s.spec().markers.iter().any(|m| m.matches(name)))
 }
 
 fn scan_markers(dir: &Path, found: &mut Vec<BuildSystem>) {
@@ -69,15 +154,10 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
     }
     let mut names: Vec<&str> = Vec::new();
     for sys in systems {
-        match sys {
-            BuildSystem::Gradle => names.extend(GRADLE_DIRS),
-            BuildSystem::Xcode | BuildSystem::SwiftPm => names.extend(SWIFT_DIRS),
-        }
+        names.extend(sys.spec().regenerable);
     }
     names.extend(cfg.regenerable_extra.iter().map(String::as_str));
-    let xcode = systems
-        .iter()
-        .any(|s| matches!(s, BuildSystem::Xcode | BuildSystem::SwiftPm));
+    let derived_data = systems.iter().any(|s| s.spec().derived_data);
 
     let mut out = Vec::new();
     let mut it = WalkDir::new(root).follow_links(false).into_iter();
@@ -95,8 +175,8 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
             it.skip_current_dir();
             continue;
         }
-        let derived_data = xcode && ft.is_dir() && is_derived_data_root(entry.path());
-        if derived_data || names.iter().any(|n| *n == name) {
+        let dd_root = derived_data && ft.is_dir() && is_derived_data_root(entry.path());
+        if dd_root || names.iter().any(|n| *n == name) {
             out.push(entry.into_path());
             if ft.is_dir() {
                 it.skip_current_dir();
@@ -110,8 +190,9 @@ pub fn regenerable_dirs(root: &Path, systems: &[BuildSystem], cfg: &Config) -> V
 /// of [`regenerable_dirs`] holding only what the build treats as its own
 /// output, since a build that reads an empty input builds the wrong thing
 /// rather than failing. For Xcode that is `Build/` inside each DerivedData
-/// root (not `SourcePackages/` or the module caches, which hold inputs); for
-/// Gradle each `build/` dir (not `.gradle/`, `.kotlin/` or `.cxx/`).
+/// root (not `SourcePackages/` or the module caches, which hold inputs);
+/// otherwise the dirs named in each system's [`Spec::stash`], which for
+/// Gradle is each `build/` dir (not `.gradle/`, `.kotlin/` or `.cxx/`).
 /// `regenerable_extra` dirs are left out: bale can't tell what they hold.
 /// Symlinked dirs are left out too. On macOS the `Build/` of each DerivedData
 /// folder in Xcode's shared DerivedData built from this tree comes last, as a
@@ -126,7 +207,11 @@ pub(crate) fn stash_dirs(
     cfg: &Config,
     trees: &Trees,
 ) -> Vec<PathBuf> {
-    let gradle = systems.contains(&BuildSystem::Gradle);
+    let names: Vec<&str> = systems
+        .iter()
+        .flat_map(|s| s.spec().stash)
+        .copied()
+        .collect();
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     let mut out = Vec::new();
     for dir in regenerable_dirs(root, systems, cfg) {
@@ -138,7 +223,11 @@ pub(crate) fn stash_dirs(
             if real_dir(&build) {
                 out.push(build);
             }
-        } else if gradle && dir.file_name().is_some_and(|n| n == "build") {
+        } else if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| names.contains(&n))
+        {
             out.push(dir);
         }
     }
@@ -251,6 +340,20 @@ mod tests {
             got,
             set(vec![r.join("app/build"), r.join("lib/feature/build")])
         );
+    }
+
+    #[test]
+    fn every_spec_is_complete() {
+        for sys in BuildSystem::ALL {
+            let spec = sys.spec();
+            assert!(!spec.markers.is_empty(), "{sys:?} has no markers");
+            for name in spec.stash {
+                assert!(
+                    spec.regenerable.contains(name),
+                    "{sys:?} stashes {name}, which is not regenerable"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

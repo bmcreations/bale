@@ -78,10 +78,31 @@ Pinned trees are never upped or colded. Defaults live at the top of `crates/bale
 
 ## What counts as build output
 
-`detect` finds build systems by marker at the root or one level down (`settings.gradle(.kts)`,
-`Package.swift`, `*.xcodeproj`, `*.xcworkspace`). For those, `build`, `.gradle`, `.kotlin`, `.cxx`,
-`.externalNativeBuild` and `.build` are regenerable, as is any directory that is itself a DerivedData root.
+Each build system is a `BuildSystem` variant in `crates/bale-core/src/detect.rs` with a `Spec`: the marker
+names that show it is in use, the directory names its build recreates (`regenerable`), the subset of those
+whose large files stash may stub (`stash`), and whether Xcode DerivedData roots count. `detect` looks for
+markers at the root or one level down, and every operation reads the specs of the systems it finds.
+
+| System | Markers | Regenerable | Stash |
+|---|---|---|---|
+| Gradle | `settings.gradle`, `settings.gradle.kts` | `build`, `.gradle`, `.kotlin`, `.cxx`, `.externalNativeBuild` | `build` |
+| Xcode | `*.xcodeproj`, `*.xcworkspace` | `.build`, DerivedData roots | DerivedData `Build/` |
+| SwiftPM | `Package.swift` | `.build`, DerivedData roots | DerivedData `Build/` |
+
 `regenerable` in config adds names. Rust `target/` and `node_modules` are not on the list.
+
+To add a build system:
+
+1. Add a variant to `BuildSystem`, list it in `BuildSystem::ALL`, and give it a `Spec` in `BuildSystem::spec`.
+2. Leave `stash` empty unless a stash and restore of a real build has been measured to rebuild nothing. A
+   build that reads an emptied input builds the wrong thing rather than failing.
+3. Add a `crates/bale-core/tests/detect.rs` case that detects the system from its marker and lists its
+   regenerable directories.
+4. Add the system to the table above and to the README's "Bales idle trees" list.
+
+Xcode needs more than its spec: DerivedData ownership (`derived_data`), the shared Swift package folder
+(`spm*`), unstash's `Build/Products/` twin rule, and the sweep's reap of shared DerivedData are their own
+modules.
 
 `up` keeps a matching directory that holds tracked or unignored files, or that sits inside a nested repo or
 submodule, because deleting it would lose something git cannot bring back.
