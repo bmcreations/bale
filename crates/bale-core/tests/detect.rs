@@ -1,12 +1,16 @@
 mod support;
 
 use bale_core::config::Config;
-use bale_core::detect::{detect, regenerable_dirs, BuildSystem};
+use bale_core::detect::{detect, regenerable_dirs, System};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use support::{write_plist, write_plist_binary};
+
+fn names(sys: &[System]) -> Vec<&'static str> {
+    sys.iter().map(|s| s.name()).collect()
+}
 
 fn cfg(extra: &[&str]) -> Config {
     Config {
@@ -52,7 +56,7 @@ fn gradle_tree() {
         touch(r, f);
     }
     let sys = detect(r);
-    assert_eq!(sys, vec![BuildSystem::Gradle]);
+    assert_eq!(names(&sys), ["gradle"]);
     let got = set(regenerable_dirs(r, &sys, &cfg(&[])));
     let want = set(vec![
         r.join("app/build"),
@@ -79,7 +83,7 @@ fn xcode_in_subfolder() {
     fs::create_dir_all(r.join("Ios/App.xcodeproj")).unwrap();
     touch(r, ".build/f");
     let sys = detect(r);
-    assert!(sys.contains(&BuildSystem::Xcode));
+    assert!(names(&sys).contains(&"xcode"));
     assert_eq!(regenerable_dirs(r, &sys, &cfg(&[])), vec![r.join(".build")]);
 }
 
