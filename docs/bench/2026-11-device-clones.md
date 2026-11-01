@@ -38,17 +38,42 @@ under 0.01 GiB, so the device deltas below are usable; the build-phase numbers a
   in full once it has been booted long enough.
 - **The app install clones from DerivedData.** `Containers/Bundle` was 901 MiB on both devices, and the
   install on the second clone cost 0.04 GiB of free space.
-- **The second role's cost isn't settled.** Clone, boot
-  and a first install (of `FlipcashUITests-Runner.app`, by mistake) used 1.33 GiB of free space at load 95,
-  then installing `Flipcash.app` used 0.04 GiB. The runner install, the boot's own writes and other
-  processes aren't separated in that 1.33 GiB. Today's `test.sh` devices hold 2–3.5 GiB each.
+- **A second role costs about 0.1 GiB, not 1.33.** At load 95, clone, boot and a first install (of
+  `FlipcashUITests-Runner.app`, by mistake) used 1.33 GiB of free space, with other processes' writes
+  mixed in. The low-load rerun below puts a booted role at 0.07–0.1 GiB.
 - **`test.sh` and `-destination id=` work on a clone** the same as on a created device: both runs passed
   7 tests (`test.sh` took 60 s, the control 49 s without the build step).
 - **Loupe works on a clone:** claim, boot, screenshot, shutdown and release all returned 2xx. The
   screenshot showed the boot logo, since loupe's boot returned before the clone finished booting at
   load 95.
 - **Deleting a shut-down clone after loupe used it** left loupe answering and CoreSimulator listing
-  devices. A device open in a loupe viewer wasn't tested.
+  devices. Deleting one with a viewer open is covered below.
+
+## iOS: a second role at low load, and delete with a viewer open
+
+Measured 2026-11-01 18:24–18:33, load average 3–5 except where noted. A new base (`bale-bench base`,
+iPhone 17, iOS 27.0) was created, booted through loupe (20 s), and shut down; it held 372 MiB. Each role
+was cloned from it, booted through loupe until `simctl bootstatus` returned, left idle for 60 s, given
+`Flipcash.app` (899 MiB, from DerivedData) with `simctl install`, and shut down. Free space is the median
+of three `df` samples after each step.
+
+| Step | Role 1 | Role 2 |
+|---|---|---|
+| `simctl clone` | 0 | 0 (free space rose 78 MiB) |
+| Boot, then 60 s idle | 68 MiB | 97 MiB |
+| Install `Flipcash.app` | 6 MiB | 18 MiB |
+| Shutdown | frees 33 MiB | frees 25 MiB |
+| Boot time | 3 s | 4 s |
+| Load at the end | 4.9 | 13.8 |
+
+`du` reported 1.2 GiB for each role, all but tens of MiB of it cloned from the base and DerivedData.
+
+To check deleting a device with a viewer open, role 2 was booted again and `wtprobe` opened a loupe
+WebTransport stream of it for 40 s. 12 s in, the claim was released, `simctl shutdown` took 4 s and
+`simctl delete` took under 1 s. Frames stopped at the shutdown: the 120 frames the probe received span
+about 11 s. loupe didn't close the stream; the probe ran to its 40 s and exited cleanly. `/api/targets`
+answered in 14 ms after the delete and kept listing the device as `missing`, `available: false`, the
+same rule loupe applies to an adb device that disappears. CoreSimulator kept listing devices normally.
 
 ## Android: copy an AVD folder vs create one
 
@@ -85,14 +110,36 @@ returned; `sys.boot_completed` was 1 when read afterwards, but the time it turne
 - **loupe refuses the copy's boot.** It answered 502 `emulator-5554 is running bale-bench-base37, not
   bale-bench-copy37`: the guest property `ro.boot.qemu.avd_name` comes back from the restored RAM with the
   base's name, while `adb emu avd name` reports the copy. The emulator kept running, and loupe's shutdown
-  and delete of the copy both worked. For copies to work through loupe, it has to match on
-  `adb emu avd name`, or the copy has to drop the snapshot and cold boot, which writes a new one. That
-  cold boot wasn't measured.
+  and delete of the copy both worked. The second run below used a loupe that asks the console first.
 - Deleting both AVDs freed 6.6 GiB against the 6.0 GiB the base used. The 0.6 GiB gap is within the
   drift from other processes during the run, so the copy's own cost after use isn't settled.
 
+### Second run: loupe naming fix, and a copy without its snapshot
+
+Measured 2026-11-01 18:19–18:24, load average 2.5–4.5. A second loupe was built with two fixes (the
+emulator's name from `adb emu avd name` before `getprop`, and dropping a device's claims when it's
+deleted) and run on its own port and config, so the real loupe and its claims were untouched. The base
+was created and cold-booted the same way (loupe returned after 21 s; the folder held 4.9 GiB after
+shutdown).
+
+| AVD | Free space used | Boot |
+|---|---|---|
+| Copy with `loupe-warm`, booted | 154 MiB | loupe returned 200 after 5 s |
+| Copy with `snapshots/` removed, right after `cp -c -R` | 44 KiB | |
+| That copy, cold-booted | 2.5 GiB | loupe returned after 11 s |
+
+- **With the fix, loupe boots the copy.** The guest's `ro.boot.qemu.avd_name` still said
+  `bale-bench-base37`. `sys.boot_completed` was 1 and a screenshot returned 200.
+- **The fix lets loupe's delete drop the claim.** After deleting the copy through loupe, only the
+  base's claim was still listed.
+- **A copy without the snapshot pays for its own.** The cold boot wrote a 2.3 GiB `loupe-warm`
+  (`ram.bin` 2.5 GB, against the base's 4.0 GB) and grew `userdata-qemu.img.qcow2` to 1.2 GiB in `du`.
+  It had 257 packages, the same as the base. Keeping the snapshot is the cheaper copy.
+- Deleting the base and the cold copy freed 7.1 GiB. Afterwards the five existing AVDs were the same size
+  as before the run.
+
 ## Not measured
 
-- An Android copy with its snapshot removed (cold boot), and a copy's cost after a test run.
+- An Android copy's cost after a test run.
 - How much a clone grows over days of use. These numbers cover one test run.
 - Whether the base needs refreshing after a runtime update.

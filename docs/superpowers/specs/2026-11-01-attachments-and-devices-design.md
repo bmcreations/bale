@@ -1,7 +1,7 @@
 # Attachments, and simulators that belong to a workspace
 
 Status: draft for review. Replaces "Later: devices for mobile projects" in `2026-10-27-bale-design.md`.
-The device measurements are in `docs/bench/2026-11-device-clones.md`. An Android AVD copied with `cp -c -R` boots from the base's snapshot at no cost, but loupe refuses to boot it; the bench note gives two ways around that.
+The device measurements are in `docs/bench/2026-11-device-clones.md`. All five items under "To measure before building" are measured there. An Android AVD copied with `cp -c -R` boots from the base's snapshot at no cost once loupe reads the emulator's name from its console; a second iOS role costs about 0.1 GiB booted.
 
 ## Problem
 
