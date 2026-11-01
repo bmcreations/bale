@@ -66,13 +66,16 @@ attachments: [
   unique within a tree; attaching the same pair again replaces the entry.
 - `bale detach TARGET --kind K --id ID` removes one without running its release.
 - `bale show --json` (new) and `bale ls --json` list them, so a caller can find what a tree owns.
-- `bale up`, `bale cold`, removal through a tool's hook, and `bale gc` run each release command, under the
-  tree's lock and after the busy check, as every delete path does. This is a new side effect of `bale up`
-  run by hand: it releases the tree's devices too, and the README's `up` row has to say so.
+- The sweep's bale step, `bale cold`, removal through a tool's hook, and `bale gc` run each release command,
+  under the tree's lock and after the busy check, as every delete path does.
+- `bale up` run by hand keeps attachments unless given `--attachments`, so clearing build output doesn't
+  also delete the devices a tree is testing on. The sweep passes the same option to the operation when it
+  bales a tree. The README's `up` row documents the flag.
 - The sweep gets a step: for each record whose path is gone, take its lock and run its releases. There is no
   busy check, since there is no directory to hold. The sweep still doesn't forget the record; it only clears
-  attachments, so a gone tree's device is deleted on the next sweep rather than on the next manual `gc`. Exit 0 removes the entry. Any other exit
-  keeps it, and the sweep retries it. A release has 30 s.
+  attachments, so a gone tree's device is deleted on the next sweep rather than on the next manual `gc`.
+- A release that exits 0 removes the entry. Any other exit keeps it, and the sweep retries it. A release
+  has 30 s.
 - `bale gc` releases a gone tree's attachments before it forgets the record, and keeps the record while any
   release still fails, so a device can't outlive the only record of it.
 - Each release is a trace line: kind, outcome, duration, and the free space it gained.
@@ -165,13 +168,14 @@ devices each will hit memory and swap before disk.
 5. Check that deleting a shut-down device that loupe has open in a viewer doesn't wedge loupe or
    CoreSimulator.
 
+## Decided
+
+- Flipcash's `test.sh` calls `bale-devices clone` when it's on `PATH` and falls back to `simctl create`.
+- Role names are free text.
+- `max_devices` defaults to 4.
+- bale-devices never deletes runtimes. The unused iOS 18.0 and 18.1 runtimes stay installed.
+
 ## Open questions
 
-- Whether `test.sh` should call `bale-devices clone`, or rely on `adopt` by name. Adopting needs no change in
-  the Flipcash repo, but its devices don't share with a base, and any device made between `adopt` runs is
-  released by nothing.
-- Whether role names should be free text or a fixed set (`default`, `sender`, `receiver`). Free text is
-  simpler; a fixed set keeps names consistent across repos.
-- Whether `max_devices = 4` is the right default.
 - Whether the daily devices should get a step that clears `PRBPosterExtensionDataStore` while shut down.
   Deleting that folder isn't tested, so this design only reports it.
