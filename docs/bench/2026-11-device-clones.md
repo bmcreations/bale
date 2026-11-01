@@ -50,8 +50,49 @@ under 0.01 GiB, so the device deltas below are usable; the build-phase numbers a
 - **Deleting a shut-down clone after loupe used it** left loupe answering and CoreSimulator listing
   devices. A device open in a loupe viewer wasn't tested.
 
+## Android: copy an AVD folder vs create one
+
+Measured 2026-11-01 17:44–17:58, the same Mac, load average between 3 and 14, nine simulators booted.
+Android 17 (`android-37.0;google_apis_playstore_ps16k`), Pixel 9 Pro XL, emulator started by loupe. One
+run of each case. Free space is the median of three `df` samples. Boot times are when loupe's call
+returned; `sys.boot_completed` was 1 when read afterwards, but the time it turned 1 wasn't recorded.
+
+1. Created `bale-bench-base37` with loupe's New device (`POST /api/devices`), booted it through loupe and
+   shut it down. A newly created AVD goes through this same first boot, so the base also stands in for
+   the create case.
+2. Copied the shut-down base with `cp -c -R` to `bale-bench-copy37`, wrote its `.ini`, and replaced the
+   base's name in `config.ini`, `hardware-qemu.ini`, `emu-launch-params.txt`,
+   `snapshots/loupe-warm/hardware.ini` and `snapshots/loupe-warm/snapshot.pb`. `snapshot.pb` is binary
+   protobuf, so the copy's name has the same length as the base's and the bytes were swapped in place.
+   The qcow2 overlays name their backing files relative to the AVD folder and needed no change.
+3. Booted the copy through loupe, checked it, shut it down, and deleted both AVDs through loupe.
+
+| AVD | `du` | Free space used | Boot |
+|---|---|---|---|
+| Base, created, not booted | 4 KiB (`config.ini`) | 0 | |
+| Base, first boot | 5.9 GiB | 6.0 GiB | cold; loupe's boot returned after 23 s |
+| Copy, right after `cp -c -R` (0.03 s) | 5.9 GiB | 0 | |
+| Copy, booted | | 0.02 GiB | from the copied `loupe-warm`; loupe answered after 5 s |
+
+- **A created AVD costs 6 GiB on its first boot**, mostly loupe's warm snapshot: 3.8 GiB in
+  `snapshots/loupe-warm` (`ram.bin` alone 3.8 GiB) and 2.1 GiB in `userdata-qemu.img.qcow2`. loupe's docs
+  give 1.7–2 GB for the snapshot; the Pixel 9 Pro XL profile gives the AVD 4 GiB of RAM
+  (`hw.ramSize=4G` in `invites_android_37`, the same profile and image), so `ram.bin` is about twice that.
+- **The copy boots from the base's snapshot.** The emulator had only the copy's files open, including its
+  `loupe-warm/ram.bin`, and loupe starts it with `-no-snapshot-save`. The base's file mtimes didn't change.
+  In the guest, `sys.boot_completed` was 1, a file written to `/sdcard/Download` read back, and 257
+  packages were installed.
+- **loupe refuses the copy's boot.** It answered 502 `emulator-5554 is running bale-bench-base37, not
+  bale-bench-copy37`: the guest property `ro.boot.qemu.avd_name` comes back from the restored RAM with the
+  base's name, while `adb emu avd name` reports the copy. The emulator kept running, and loupe's shutdown
+  and delete of the copy both worked. For copies to work through loupe, it has to match on
+  `adb emu avd name`, or the copy has to drop the snapshot and cold boot, which writes a new one. That
+  cold boot wasn't measured.
+- Deleting both AVDs freed 6.6 GiB against the 6.0 GiB the base used. The 0.6 GiB gap is within the
+  drift from other processes during the run, so the copy's own cost after use isn't settled.
+
 ## Not measured
 
-- Android (spec step 4). Load reached 95 during the iOS runs, so booting AVDs was left for another run.
+- An Android copy with its snapshot removed (cold boot), and a copy's cost after a test run.
 - How much a clone grows over days of use. These numbers cover one test run.
 - Whether the base needs refreshing after a runtime update.
