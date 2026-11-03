@@ -267,7 +267,10 @@ pub(crate) fn seed(home: &crate::BaleHome, key: &str, from: &Path) -> io::Result
             format!("invalid key {key:?}"),
         ));
     }
-    seed_checked(home, key, from)
+    let dest = seed_checked(home, key, from)?;
+    // A clone keeps `from`'s artifact paths, which run through `from`.
+    let _ = crate::spm_artifacts::repair_artifact_paths(&dest);
+    Ok(dest)
 }
 
 /// The existing `dest` if it is a real directory, `None` if absent; anything

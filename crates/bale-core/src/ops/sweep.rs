@@ -211,6 +211,11 @@ fn sweep_traced(
         learn_build_dirs(home, build_dirs);
         rows.extend(reap_rows(home, &global, &held, &known, dry_run));
         rows.extend(spm_gc_rows(home, dry_run));
+        // After the reap: a folder it removed may be the one SwiftPM spelled
+        // a shared folder's artifact paths through.
+        if !dry_run {
+            crate::spm_artifacts::repair_all(&home.spm_dir());
+        }
     }
     let now = SystemTime::now();
     crate::trace::record_builds(home, &builds, now);

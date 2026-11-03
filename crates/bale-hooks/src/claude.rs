@@ -720,7 +720,9 @@ fn is_linked_gitfile(path: &Path) -> bool {
 }
 
 /// Keeps shared Swift packages links current before a tool runs: relinks
-/// the cwd tree `cwd_id` when a `Package.resolved` changed, and links the
+/// the cwd tree `cwd_id` when a `Package.resolved` changed, repairs the
+/// binary-artifact paths of tree `target`'s shared folders before an
+/// `xcodebuild`, and links the
 /// folder a Bash command's `-derivedDataPath` names to the packages of tree
 /// `target` (the tree the command builds in; see [`command_tree`]).
 /// Best-effort and silent; the unchanged case is one record read and one
@@ -743,6 +745,9 @@ fn share_packages(
     let Some(command) = payload["tool_input"]["command"].as_str() else {
         return;
     };
+    if command.contains("xcodebuild") {
+        bale_core::spm_link::repair_tree(home, target);
+    }
     if !command.contains(DD_FLAG) {
         return;
     }

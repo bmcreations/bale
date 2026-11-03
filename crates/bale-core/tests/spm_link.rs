@@ -8,7 +8,7 @@ use bale_core::derived_data::folder_name;
 use bale_core::ops::cold::cold;
 use bale_core::ops::sweep::sweep;
 use bale_core::ops::up::{register, up};
-use bale_core::spm_link::{link_derived_data_path, relink_tree};
+use bale_core::spm_link::{link_derived_data_path, relink_tree, repair_tree};
 use bale_core::BaleHome;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -825,4 +825,90 @@ fn relink_does_nothing_while_gc_holds_the_lock_and_retries_later() {
     drop(lock);
     relink_tree(&h, &id);
     assert_eq!(record(&h, &id).spm[0].key, key_of(RESOLVED2));
+}
+
+/// `STATE` plus one binary artifact of package `a` at `path`, as SwiftPM
+/// formats it.
+fn state_with_artifact(path: &Path) -> String {
+    format!(
+        "{{\n  \"object\" : {{\n    \"artifacts\" : [\n      {{\n        \"packageRef\" : {{\n          \"identity\" : \"a\",\n          \"kind\" : \"remoteSourceControl\"\n        }},\n        \"path\" : \"{}\"\n      }}\n    ],\n    \"dependencies\" : [\n      {{\n        \"packageRef\" : {{\n          \"identity\" : \"a\"\n        }},\n        \"state\" : {{\n          \"checkoutState\" : {{\n            \"revision\" : \"r1\"\n          }}\n        }}\n      }}\n    ]\n  }},\n  \"version\" : 7\n}}",
+        path.display()
+    )
+}
+
+const ARTIFACT: &str = "artifacts/a/A/A.xcframework";
+
+/// The one artifact path in `shared`'s `workspace-state.json`.
+fn artifact_path(shared: &Path) -> PathBuf {
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(shared.join("workspace-state.json")).unwrap())
+            .unwrap();
+    PathBuf::from(v["object"]["artifacts"][0]["path"].as_str().unwrap())
+}
+
+/// Puts `A.xcframework` in `shared` and a state file whose artifact path runs
+/// through the `SourcePackages` of a DerivedData folder that no longer exists,
+/// as SwiftPM leaves it when another tree resolved and was then deleted.
+fn stale_state(e: &Env, shared: &Path) -> PathBuf {
+    fs::create_dir_all(shared.join(ARTIFACT)).unwrap();
+    let gone = e.dd.join("App-gone/SourcePackages").join(ARTIFACT);
+    fs::write(
+        shared.join("workspace-state.json"),
+        state_with_artifact(&gone),
+    )
+    .unwrap();
+    gone
+}
+
+#[test]
+fn register_repairs_an_artifact_path_into_a_deleted_derived_data_folder() {
+    let e = env();
+    let h = e.fx.home();
+    make_shared(&h);
+    let gone = stale_state(&e, &shared(&h));
+    assert_eq!(artifact_path(&shared(&h)), gone);
+    let wt = e.fx.add_worktree("wt", "f");
+    project(&wt);
+    register(&h, &wt).unwrap();
+    assert_eq!(artifact_path(&shared(&h)), shared(&h).join(ARTIFACT));
+}
+
+#[test]
+fn a_folder_seeded_from_a_sibling_points_its_artifacts_at_itself() {
+    let e = env();
+    let h = e.fx.home();
+    let main = project(&e.fx.repo);
+    let main_sp = real_packages(&dd_of(&e, &main));
+    fs::create_dir_all(main_sp.join(ARTIFACT)).unwrap();
+    fs::write(
+        main_sp.join("workspace-state.json"),
+        state_with_artifact(&main_sp.join(ARTIFACT)),
+    )
+    .unwrap();
+    let wt = e.fx.add_worktree("wt", "f");
+    project(&wt);
+    register(&h, &wt).unwrap();
+    assert_eq!(artifact_path(&shared(&h)), shared(&h).join(ARTIFACT));
+    // The sibling's own folder is not touched.
+    assert_eq!(artifact_path(&main_sp), main_sp.join(ARTIFACT));
+}
+
+#[test]
+fn sweep_repairs_stale_artifact_paths_in_shared_folders() {
+    let e = env();
+    let h = e.fx.home();
+    let (_id, _proj, _folder) = linked_tree(&e);
+    stale_state(&e, &shared(&h));
+    sweep(&h, false).unwrap();
+    assert_eq!(artifact_path(&shared(&h)), shared(&h).join(ARTIFACT));
+}
+
+#[test]
+fn repair_tree_repairs_the_shared_folders_a_tree_links_to() {
+    let e = env();
+    let h = e.fx.home();
+    let (id, _proj, _folder) = linked_tree(&e);
+    stale_state(&e, &shared(&h));
+    repair_tree(&h, &id);
+    assert_eq!(artifact_path(&shared(&h)), shared(&h).join(ARTIFACT));
 }

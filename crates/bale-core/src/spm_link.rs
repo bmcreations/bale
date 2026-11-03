@@ -17,6 +17,7 @@ use crate::derived_data::folder_name;
 use crate::lock::WorkspaceLock;
 use crate::registry::{Record, Registry, SpmLink};
 use crate::spm::{finished, key, resolved_files, seed, xcode_build, Resolved};
+use crate::spm_artifacts::repair_artifact_paths;
 use crate::spm_lock::{try_lock, Mode};
 use crate::BaleHome;
 
@@ -110,6 +111,7 @@ pub(crate) fn link_tree(
             continue;
         }
         if make_link(&shared, &folder) {
+            let _ = repair_artifact_paths(&shared);
             made.push(SpmLink {
                 project: r.project,
                 resolved: r.resolved,
@@ -229,6 +231,7 @@ fn relink_one(home: &BaleHome, l: &mut SpmLink, build: &str) -> bool {
             // the next edit or sweep instead of retrying every call.
             if let Some(target) = target {
                 if repoint(&sp, &target).is_ok() {
+                    let _ = repair_artifact_paths(&target);
                     l.key = k2;
                 }
             }
@@ -315,7 +318,27 @@ pub fn link_derived_data_path(home: &BaleHome, id: &str, root: &Path) {
         return;
     };
     let made_root = !root.exists() && fs::create_dir_all(root).is_ok();
-    if std::os::unix::fs::symlink(&shared, &sp).is_err() && made_root {
+    if std::os::unix::fs::symlink(&shared, &sp).is_ok() {
+        let _ = repair_artifact_paths(&shared);
+    } else if made_root {
         let _ = fs::remove_dir(root);
+    }
+}
+
+/// Pre-tool hook, for a Bash command that builds: repairs the binary-artifact
+/// paths of each shared folder tree `id` links to (see
+/// [`crate::spm_artifacts`]), so a path SwiftPM wrote through another tree's
+/// DerivedData folder, since deleted, doesn't fail this build. The common
+/// case is one record read and one read of each `workspace-state.json`, with
+/// no parse and no write. Every failure is swallowed.
+pub fn repair_tree(home: &BaleHome, id: &str) {
+    let Ok(Some(record)) = Registry::open(home.clone()).get(id) else {
+        return;
+    };
+    let mut keys: Vec<&str> = record.spm.iter().map(|l| l.key.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for k in keys {
+        let _ = repair_artifact_paths(&home.spm_dir().join(k));
     }
 }
