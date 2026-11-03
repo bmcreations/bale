@@ -14,6 +14,7 @@ pub mod par;
 pub mod paths;
 pub mod registry;
 pub mod spm;
+pub(crate) mod spm_artifacts;
 #[cfg(target_os = "macos")]
 pub mod spm_link;
 pub(crate) mod spm_lock;

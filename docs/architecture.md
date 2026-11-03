@@ -21,7 +21,8 @@ The main modules in `bale-core/src`:
 - `busy`: which processes hold a tree (lsof on macOS, `/proc` on Linux; Windows reports none).
 - `idle`: the newest source mtime in a tree, skipping `.git` and build output.
 - `build_systems`, `detect`: the build systems bale knows, their markers, and which directories count as build output.
-- `derived_data`, `spm`, `spm_link`, `spm_lock`: Xcode DerivedData ownership and the shared Swift package folder.
+- `derived_data`, `spm`, `spm_link`, `spm_lock`, `spm_artifacts`: Xcode DerivedData ownership and the shared
+  Swift package folder.
 - `store`: the content-addressed store (`blob`, `codec`, `manifest`, `index`, `gc`).
 - `clones`: shared checkouts: file clones (`reflink`), the clone store (`store`), which tracked files can be
   shared (`tracked`), `share` and `materialize` (`share`), and the store's `gc`.
@@ -117,7 +118,7 @@ record). The other tools register trees and mark activity; their trees go straig
 |---|---|---|
 | `WorktreeCreate` | `create` | `bale new` on branch `worktree-<name>` and prints the path. Falls back to plain `git worktree add`. |
 | `UserPromptSubmit` | `prompt` | Reports an earlier failed restore. Restores kept files the tree lacks. If the tree is stashed, bumps its lock so a running stash stops, starts `bale unstash --background` and returns. |
-| `PreToolUse` | `pre-tool` | Waits up to 60 s for the restore of the working tree and of any tree the command names (`cd`, `git -C`, `-project`, `-workspace`, `-derivedDataPath`, a file path). Learns DerivedData roots and relinks Swift packages. |
+| `PreToolUse` | `pre-tool` | Waits up to 60 s for the restore of the working tree and of any tree the command names (`cd`, `git -C`, `-project`, `-workspace`, `-derivedDataPath`, a file path). Learns DerivedData roots and relinks Swift packages. Before an `xcodebuild`, repairs the tree's shared package folders' artifact paths. |
 | `Stop` | `stop` | Marks activity and saves the keep-list. |
 | `WorktreeRemove` | `remove` | `cold`, ignoring the hook's own process tree. |
 
@@ -249,8 +250,8 @@ tree once the store held them, and a `bale new` tree took 62 MiB where `git work
 4. Index shared DerivedData and measure each tree, in parallel (8 threads, 120 s limit).
 5. For each record: decide, then `up`, `cold` or `stash`. Each writes a trace line.
 6. Share the large tracked files of baled, unpinned trees whose `HEAD` moved since their last share.
-7. macOS: learn DerivedData roots from Claude scratchpads, reap DerivedData whose project is gone, and
-   delete unused shared Swift packages.
+7. macOS: learn DerivedData roots from Claude scratchpads, reap DerivedData whose project is gone, delete
+   unused shared Swift packages, and repair artifact paths in the ones left.
 8. Write the sweep's trace line and prune old trace files.
 
 There is no global sweep lock. Each operation takes the tree's lock without waiting and skips a locked tree,
@@ -264,6 +265,16 @@ nothing in it changed within `reap_grace`. A shared folder with no `info.plist`,
 left, takes its project path from its name: reap hashes each known tree (registered, or named in the last 60
 days of trace) joined with the project paths other folders record, the way Xcode names the folder. A folder
 that matches no known tree is kept.
+
+SwiftPM records each binary target's absolute path in `workspace-state.json`, spelled through the
+`SourcePackages` it resolved in. In `spm/<key>` that is some tree's `<DerivedData>/<folder>/SourcePackages`
+link, or, for a folder seeded from a real `SourcePackages`, the folder it was cloned from. Every tree sharing
+the folder reads that path, so deleting the DerivedData folder in it breaks all their builds with "There is no
+XCFramework found". bale can't change what SwiftPM writes, so `spm_artifacts` rewrites each such
+`object.artifacts[].path` to `spm/<key>/artifacts/...` when that target exists, leaving local (`fileSystem`)
+packages and the rest of the file as they are. It runs after a seed, when a tree is linked or relinked, in
+the pre-tool hook before an `xcodebuild`, and at the end of each sweep. A file with no path through a
+`SourcePackages` is read but not parsed.
 
 ## Not built
 

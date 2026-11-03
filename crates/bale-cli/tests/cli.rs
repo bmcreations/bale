@@ -4209,6 +4209,51 @@ fn pre_tool_registers_the_worktree_a_command_cds_into() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn pre_tool_repairs_a_stale_artifact_path_before_xcodebuild() {
+    let env = Env::new();
+    let xcode = fake_xcode(&env);
+    let a = env.add_worktree("tree-a");
+    let (_project, shared) = spm_project(
+        &env,
+        &a,
+        r#"{"pins":[{"identity":"a","state":{"revision":"ra"}}],"version":3}"#,
+    );
+    let out = env.bale_env(
+        &env.repo,
+        &["adopt", a.to_str().unwrap()],
+        &[("DEVELOPER_DIR", &xcode)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Another tree resolved through its own DerivedData link, then was deleted.
+    let rel = "artifacts/a/A/A.xcframework";
+    fs::create_dir_all(shared.join(rel)).unwrap();
+    let gone = env
+        .home()
+        .join("Library/Developer/Xcode/DerivedData/App-gone/SourcePackages")
+        .join(rel);
+    let state = |path: &Path| {
+        serde_json::json!({"object": {"artifacts": [{"path": path}], "dependencies": []}, "version": 7})
+            .to_string()
+    };
+    fs::write(shared.join("workspace-state.json"), state(&gone)).unwrap();
+
+    let out = pre_tool_command(&env, &a, "grep -rn foo .", &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let read = || fs::read_to_string(shared.join("workspace-state.json")).unwrap();
+    assert_eq!(read(), state(&gone), "only a build repairs");
+
+    let out = pre_tool_command(&env, &a, "xcodebuild -scheme App build", &xcode);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(read(), state(&shared.join(rel)));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn pre_tool_does_not_register_a_main_checkout_or_a_shell_variable() {
     let env = Env::new();
     let xcode = fake_xcode(&env);
