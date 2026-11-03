@@ -145,7 +145,9 @@ pub(crate) fn repair_all(spm_dir: &Path) {
     }
 }
 
-#[cfg(test)]
+// SwiftPM writes POSIX paths, and the fixtures put temp paths into JSON
+// unescaped, which a Windows path breaks.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
