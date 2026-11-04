@@ -232,3 +232,8 @@ and duration, and the Xcode builds found in DerivedData build logs. No file cont
 The trace stays on your machine; bale does not send it anywhere. `bale trace path` prints the directory,
 files older than 60 days are deleted at the end of each sweep, and `rm -r "$(bale trace path)"` deletes
 it. The fields, the sizing limits and the exact meaning of each line are in `docs/usage-trace.md`.
+
+## License
+
+bale is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
