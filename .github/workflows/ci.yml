@@ -33,3 +33,19 @@ jobs:
       - name: Plugin pins the workspace version
         if: matrix.os == 'ubuntu-latest'
         run: scripts/check-release-version.sh "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+
+  install-script-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.ps1 installs the latest release
+        shell: pwsh
+        env:
+          BALE_INSTALL_DIR: ${{ runner.temp }}\bale-bin
+          BALE_NO_MODIFY_PATH: 1
+        run: |
+          ./install.ps1
+          & "$env:BALE_INSTALL_DIR\bale.exe" --version
+          # A second run replaces the existing binary.
+          ./install.ps1
+          & "$env:BALE_INSTALL_DIR\bale.exe" --version
