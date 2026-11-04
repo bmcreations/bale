@@ -55,7 +55,7 @@ Freed bytes count each removal, so output that is rebuilt and removed again coun
 ## Quick start
 
 Pick one of these. Each gets you a prebuilt binary for macOS (Apple Silicon or Intel) or Linux (x86_64 or
-arm64).
+arm64); the PowerShell script installs the Windows (x86_64) build.
 
 **Claude Code plugin.** The plugin downloads bale, installs the sweep and registers the Claude Code hooks,
 so there is nothing else to run:
@@ -84,6 +84,15 @@ bale install --hooks claude  # or codex, t3; git, conductor, cursor also take --
 
 ```
 curl -fsSL https://raw.githubusercontent.com/bmcreations/bale/main/install.sh | sh
+bale install
+bale install --hooks claude
+```
+
+**Windows** (PowerShell; installs to `%LOCALAPPDATA%\bale\bin` and adds it to your user PATH; set
+`BALE_INSTALL_DIR` to change the directory and `BALE_NO_MODIFY_PATH=1` to leave PATH alone):
+
+```
+irm https://raw.githubusercontent.com/bmcreations/bale/main/install.ps1 | iex
 bale install
 bale install --hooks claude
 ```
@@ -207,7 +216,7 @@ Known limitations:
 - After a tree goes cold, `git worktree add` at the same path fails with "missing but locked worktree",
   so a tool's own unarchive or re-create at that path may fail. Use `bale open <path>` to bring the tree
   back instead.
-- Nothing has run on Windows yet; the Windows code is only checked by clippy.
+- Nothing has run on Windows outside CI yet; CI runs the tests and the install script there.
 
 ## For agents
 
